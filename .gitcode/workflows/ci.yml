@@ -23,8 +23,8 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: "1"
-  MINIO_IMAGE: minio/minio:RELEASE.2025-04-22T22-12-26Z
-  MINIO_MC_IMAGE: minio/mc:RELEASE.2025-04-16T18-13-26Z
+  S3_IMAGE: rustfs/rustfs:1.0.0
+  S3_MC_IMAGE: minio/mc:RELEASE.2025-04-16T18-13-26Z
   KUSTOMIZE_VERSION: "5.7.1"
   KUBECONFORM_VERSION: "0.8.0"
   KUBERNETES_SCHEMA_VERSION: "1.31.0"
@@ -308,8 +308,8 @@ jobs:
       - name: Test JetStream redelivery and database lease takeover
         run: bash script/test-distributed-jobs-e2e.sh
 
-  minio-backup-e2e:
-    name: MinIO backup and restore E2E
+  object-backup-e2e:
+    name: Object storage backup and restore E2E
     runs-on: [ubuntu-24, x64, small]
     timeout-minutes: 30
     steps:
@@ -321,5 +321,5 @@ jobs:
           jq --version
       - name: Test consistent backup coordination
         run: bash script/test-consistent-backup.sh
-      - name: Run MinIO backup and restore E2E
-        run: bash script/test-minio-backup.sh
+      - name: Run object storage backup and restore E2E
+        run: bash script/test-s3-backup.sh

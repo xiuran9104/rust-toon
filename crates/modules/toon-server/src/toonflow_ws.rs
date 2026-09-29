@@ -1,13 +1,14 @@
-use crate::{ToonState, toonflow_agent_history, toonflow_agents};
+use crate::{ToonState, shared::require, toonflow_agent_history, toonflow_agents};
 use axum::{
     extract::{
-        Path, Query, State,
+        Extension, Path, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     response::IntoResponse,
 };
 use futures_util::{SinkExt, StreamExt};
 use rust_toon_framework_web::AppError;
+use rust_toon_framework_security::{AuthenticatedSession, CurrentUser};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::watch;
@@ -18,7 +19,6 @@ use tracing::warn;
 // ---------------------------------------------------------------------------
 #[derive(Deserialize)]
 pub(crate) struct WsParams {
-    token: String,
     #[serde(rename = "isolationKey")]
     isolation_key: String,
     #[serde(rename = "projectId")]
@@ -337,29 +337,24 @@ pub(crate) struct AgentPath {
 }
 
 pub async fn ws_handler(
+    user: CurrentUser,
+    Extension(session): Extension<AuthenticatedSession>,
     ws: WebSocketUpgrade,
     State(state): State<ToonState>,
     Path(path): Path<AgentPath>,
     Query(params): Query<WsParams>,
 ) -> Result<impl IntoResponse, AppError> {
-    // Verify JWT token
-    let claims = state
-        .tokens
-        .verify_access_token(&params.token)
-        .map_err(|_| AppError::unauthorized("invalid token"))?;
-
-    let agent_type = match path.agent.as_str() {
-        "productionAgent" => "productionAgent",
-        _ => "scriptAgent",
-    };
+    let agent_type = path.agent.as_str();
 
     // Validate agent type
     let _ = toonflow_agents::agent_key_for(agent_type).map_err(|e| AppError::bad_request(&e))?;
 
-    let user_id = claims.user.user_id;
+    require(&user, "toon:project:read")?;
+    toonflow_agents::authorize_context(&state, &user, agent_type, &params.isolation_key, params.project_id, params.script_id).await?;
+    let agent_type = agent_type.to_owned();
 
     Ok(ws.on_upgrade(move |socket| {
-        handle_socket(socket, state, params, agent_type.to_string(), user_id)
+        handle_socket(socket, state, params, agent_type, session)
     }))
 }
 
@@ -368,7 +363,7 @@ async fn handle_socket(
     state: ToonState,
     mut params: WsParams,
     agent_type: String,
-    _user_id: String,
+    session: AuthenticatedSession,
 ) {
     let (mut ws_tx, mut ws_rx) = socket.split();
     let socket_io = params.eio.is_some() || params.transport.as_deref() == Some("websocket");
@@ -508,13 +503,25 @@ async fn handle_socket(
         emitter.update_message(&greeting_id, "complete", None);
     }
 
-    // Main message loop
+    // Revalidate idle connections too; each command also checks current access.
+    let mut session_check = tokio::time::interval(std::time::Duration::from_secs(15));
+    session_check.tick().await;
+    let mut last_message = tokio::time::Instant::now();
     loop {
-        let msg_result =
-            match tokio::time::timeout(std::time::Duration::from_secs(90), ws_rx.next()).await {
-                Ok(Some(result)) => result,
-                Ok(None) | Err(_) => break,
-            };
+        let msg_result = tokio::select! {
+            _ = session_check.tick() => {
+                let Ok(user) = session.validate().await else { break; };
+                if require(&user, "toon:project:read").is_err()
+                    || (active_task.as_ref().is_some_and(|task| !task.is_finished()) && require(&user, "toon:project:update").is_err())
+                    || toonflow_agents::authorize_context(&state, &user, &agent_type, &params.isolation_key, params.project_id, params.script_id).await.is_err() {
+                    break;
+                }
+                continue;
+            },
+            _ = tokio::time::sleep_until(last_message + std::time::Duration::from_secs(90)) => break,
+            message = ws_rx.next() => match message { Some(result) => result, None => break },
+        };
+        last_message = tokio::time::Instant::now();
         let msg = match msg_result {
             Ok(m) => m,
             Err(_) => break,
@@ -553,11 +560,19 @@ async fn handle_socket(
         let client_msg: ClientMessage = match serde_json::from_str(&text) {
             Ok(m) => m,
             Err(_) => {
-                warn!("invalid client ws message: {text}");
+                warn!("invalid client ws message");
                 continue;
             }
         };
 
+        let Ok(user) = session.validate().await else { break; };
+        let permission = if matches!(&client_msg, ClientMessage::Chat { .. } | ClientMessage::Stop) {
+            "toon:project:update"
+        } else { "toon:project:read" };
+        if require(&user, permission).is_err()
+            || toonflow_agents::authorize_context(&state, &user, &agent_type, &params.isolation_key, params.project_id, params.script_id).await.is_err() {
+            break;
+        }
         match client_msg {
             ClientMessage::Chat { content } => {
                 if content.trim().is_empty() {
@@ -700,6 +715,13 @@ async fn handle_socket(
                 project_id,
                 script_id,
             } => {
+                if toonflow_agents::authorize_context(&state, &user, &agent_type, &isolation_key, project_id, script_id).await.is_err() {
+                    emitter.send_json(&json!({"event":"updateContext:ack","data":{"success":false,"message":"无权访问该 Agent 上下文"}}));
+                    continue;
+                }
+                let _ = abort_tx.send(true);
+                if let Some(task) = active_task.take() { task.abort(); }
+                active_message = None;
                 params.isolation_key = isolation_key;
                 params.project_id = project_id;
                 params.script_id = script_id;
@@ -709,6 +731,8 @@ async fn handle_socket(
     }
 
     // Cleanup
+    let _ = abort_tx.send(true);
+    if let Some(task) = active_task { task.abort(); }
     forward_handle.abort();
     heartbeat_handle.abort();
 }

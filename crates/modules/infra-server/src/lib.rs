@@ -32,6 +32,22 @@ mod monitor;
 mod object_storage;
 
 const DEFAULT_UPLOAD_MAX_BYTES: usize = 20 * 1024 * 1024;
+
+/// Read an existing application upload without making an HTTP request back to
+/// the Gateway. Only the fixed `infra/` object namespace can be addressed.
+pub async fn read_uploaded_file(pool: &PgPool, path: &str, max_bytes: usize) -> Result<Vec<u8>, AppError> {
+    let path = path.strip_prefix("/api").unwrap_or(path);
+    let relative = path.strip_prefix("/upload/")
+        .filter(|value| !value.is_empty() && !value.contains(['?', '#', '%', '\\'])
+            && value.split('/').all(|part| !matches!(part, "" | "." | "..")))
+        .ok_or_else(|| AppError::bad_request("无效的上传文件路径"))?;
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM infra_file WHERE path=$1 AND deleted=0)")
+        .bind(path).fetch_one(pool).await
+        .map_err(|_| AppError::internal("读取上传文件记录失败"))?;
+    if !exists { return Err(AppError::not_found("上传文件不存在")); }
+    object_storage::get_bounded(&format!("infra/{relative}"), max_bytes).await
+        .map_err(AppError::bad_request)
+}
 const MAX_CONFIGURABLE_UPLOAD_BYTES: usize = 100 * 1024 * 1024;
 // `DefaultBodyLimit` applies to the complete multipart envelope, while the
 // configured limit describes the file itself. Keep a small, bounded allowance
@@ -774,7 +790,7 @@ async fn file_upload(
     let object_key = format!("infra/{relative_path}");
     object_storage::put(&object_key, bytes.clone())
         .await
-        .map_err(|_| AppError::internal("failed to save upload file to MinIO"))?;
+        .map_err(|_| AppError::internal("failed to save upload file to object storage"))?;
     let path = format!("/upload/{relative_path}");
     let size = i32::try_from(bytes.len()).unwrap_or(i32::MAX);
     let id = sqlx::query_scalar::<_, i64>("INSERT INTO infra_file (id, name, path, url, type, size) VALUES (nextval('infra_file_seq'),$1,$2,$3,$4,$5) RETURNING id")

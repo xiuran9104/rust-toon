@@ -27,7 +27,7 @@ pub struct ReadinessState {
     redis: Option<RedisClient>,
     redis_required: bool,
     object_storage_configured: bool,
-    minio_required: bool,
+    object_storage_required: bool,
     ffmpeg_required: bool,
     drain: DrainHandle,
 }
@@ -58,13 +58,16 @@ impl ReadinessState {
         let production = env::var("RUST_ENV")
             .map(|value| value.eq_ignore_ascii_case("production"))
             .unwrap_or(false);
-        let minio_configured = env::var_os("MINIO_ENDPOINT").is_some();
+        let object_storage_configured = env::var_os("S3_ENDPOINT").is_some();
         Self {
             database,
             redis,
             redis_required: env_bool("READINESS_REQUIRE_REDIS", redis_configured),
-            object_storage_configured: minio_configured,
-            minio_required: env_bool("READINESS_REQUIRE_MINIO", production || minio_configured),
+            object_storage_configured,
+            object_storage_required: env_bool(
+                "READINESS_REQUIRE_OBJECT_STORAGE",
+                production || object_storage_configured,
+            ),
             ffmpeg_required: env_bool("READINESS_REQUIRE_FFMPEG", false),
             drain: DrainHandle::new(),
         }
@@ -144,14 +147,15 @@ async fn ready(State(state): State<ReadinessState>) -> Response {
     let traffic = check_traffic(&state);
     let database = check_database(&state);
     let redis = check_redis(&state);
-    let minio = check_minio(&state);
+    let object_storage = check_object_storage(&state);
     let ffmpeg = check_ffmpeg(state.ffmpeg_required);
-    let (database, redis, minio, ffmpeg) = tokio::join!(database, redis, minio, ffmpeg);
+    let (database, redis, object_storage, ffmpeg) =
+        tokio::join!(database, redis, object_storage, ffmpeg);
 
     let mut checks = BTreeMap::new();
     checks.insert("database", database);
     checks.insert("ffmpeg", ffmpeg);
-    checks.insert("minio", minio);
+    checks.insert("objectStorage", object_storage);
     checks.insert("redis", redis);
     checks.insert("traffic", traffic);
     let ready = !checks.values().any(Check::blocks_readiness);
@@ -203,8 +207,8 @@ async fn check_redis(state: &ReadinessState) -> Check {
     }
 }
 
-async fn check_minio(state: &ReadinessState) -> Check {
-    if !state.minio_required && !state.object_storage_configured {
+async fn check_object_storage(state: &ReadinessState) -> Check {
+    if !state.object_storage_required && !state.object_storage_configured {
         return Check::skipped();
     }
     match tokio::time::timeout(
@@ -213,9 +217,9 @@ async fn check_minio(state: &ReadinessState) -> Check {
     )
     .await
     {
-        Ok(Ok(())) => Check::ok(state.minio_required),
-        Ok(Err(error)) => Check::failed(state.minio_required, error),
-        Err(_) => Check::failed(state.minio_required, "object storage check timed out"),
+        Ok(Ok(())) => Check::ok(state.object_storage_required),
+        Ok(Err(error)) => Check::failed(state.object_storage_required, error),
+        Err(_) => Check::failed(state.object_storage_required, "object storage check timed out"),
     }
 }
 

@@ -87,12 +87,6 @@ async fn project_content_storyboard_and_video_export_form_a_complete_pipeline() 
         )
         .expect("security config"),
     );
-    let owner_media_token = tokens
-        .issue_access_token(scoped_user("00000000-0000-0000-0000-000000000001"))
-        .expect("owner media token");
-    let outsider_media_token = tokens
-        .issue_access_token(scoped_user("00000000-0000-0000-0000-000000000002"))
-        .expect("outsider media token");
     let state = ToonState::new(pool.clone(), tokens);
 
     let project = toonflow_project_crud::create_project(
@@ -632,11 +626,9 @@ async fn project_content_storyboard_and_video_export_form_a_complete_pipeline() 
     let mut range_headers = HeaderMap::new();
     range_headers.insert(header::RANGE, HeaderValue::from_static("bytes=0-1023"));
     let media_response = toonflow_storage::serve_image(
+        scoped_user("00000000-0000-0000-0000-000000000001"),
         State(state.clone()),
         Path(media_key.clone()),
-        Query(toonflow_storage::AssetAccessQuery {
-            token: owner_media_token,
-        }),
         range_headers,
     )
     .await
@@ -656,11 +648,9 @@ async fn project_content_storyboard_and_video_export_form_a_complete_pipeline() 
     assert!(!media_chunk.is_empty());
     assert!(media_chunk.len() <= 1024);
     let outsider_media_error = toonflow_storage::serve_image(
+        scoped_user("00000000-0000-0000-0000-000000000002"),
         State(state.clone()),
         Path(media_key),
-        Query(toonflow_storage::AssetAccessQuery {
-            token: outsider_media_token,
-        }),
         HeaderMap::new(),
     )
     .await

@@ -32,7 +32,7 @@ const readiness = await request('/readyz');
 assert.equal(readiness.status, 'ok');
 assert.equal(readiness.checks.database.status, 'ok');
 assert.equal(readiness.checks.redis.status, 'ok');
-assert.equal(readiness.checks.minio.status, 'ok');
+assert.equal(readiness.checks.objectStorage.status, 'ok');
 
 await request('/toonflow/projects', {}, 401);
 await request('/infra/config/page', {}, 401);

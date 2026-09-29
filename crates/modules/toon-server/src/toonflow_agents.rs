@@ -1,4 +1,5 @@
 use crate::toonflow_agent_events::record as record_run_event;
+use crate::toonflow_episode_renders::{ensure_project_access, ensure_script_in_project};
 use crate::{
     ToonState, ai_client, shared::require, toonflow_agent_runtime, toonflow_agent_tools,
     toonflow_ws::WsEmitter,
@@ -134,6 +135,63 @@ fn validate_agent(value: &str) -> Result<&'static str, AppError> {
             "agentType 仅支持 scriptAgent 或 productionAgent",
         )),
     }
+}
+
+fn session_scope(agent_type: &str, isolation_key: &str) -> Result<(i64, Option<i64>), AppError> {
+    validate_agent(agent_type)?;
+    let parts = isolation_key.split(':').collect::<Vec<_>>();
+    if !(2..=3).contains(&parts.len()) || parts[0] != agent_type {
+        return Err(AppError::bad_request("invalid agent isolation key"));
+    }
+    let parse_id = |text: &str| text.parse::<i64>().ok()
+        .filter(|id| *id > 0 && id.to_string() == text)
+        .ok_or_else(|| AppError::bad_request("invalid agent scope id"));
+    let project_id = parse_id(parts[1])?;
+    let script_id = match parts.get(2).copied() {
+        None => None,
+        Some("project") if agent_type == "scriptAgent" => None,
+        Some("none") if agent_type == "productionAgent" => None,
+        Some(value) if agent_type == "productionAgent" => Some(parse_id(value)?),
+        _ => return Err(AppError::bad_request("invalid agent isolation key")),
+    };
+    Ok((project_id, script_id))
+}
+
+pub(crate) async fn authorize_session(
+    state: &ToonState, user: &CurrentUser, agent_type: &str, isolation_key: &str,
+) -> Result<(i64, Option<i64>), AppError> {
+    let (project_id, script_id) = session_scope(agent_type, isolation_key)?;
+    ensure_project_access(&state.pool, user, project_id).await?;
+    if let Some(script_id) = script_id {
+        ensure_script_in_project(&state.pool, project_id, script_id).await?;
+    }
+    Ok((project_id, script_id))
+}
+
+pub(crate) async fn authorize_context(
+    state: &ToonState, user: &CurrentUser, agent_type: &str,
+    isolation_key: &str, project_id: i64, script_id: Option<i64>,
+) -> Result<(), AppError> {
+    let scope = session_scope(agent_type, isolation_key)?;
+    if scope.0 != project_id || (agent_type == "productionAgent" && scope.1 != script_id) {
+        return Err(AppError::bad_request("agent context does not match isolation key"));
+    }
+    authorize_session(state, user, agent_type, isolation_key).await?;
+    if let Some(script_id) = script_id {
+        ensure_script_in_project(&state.pool, project_id, script_id).await?;
+    }
+    Ok(())
+}
+
+async fn authorize_run(state: &ToonState, user: &CurrentUser, run_id: i64) -> Result<(), AppError> {
+    let (project_id, script_id): (i64, Option<i64>) = sqlx::query_as(
+        "SELECT project_id,script_id FROM toonflow.agent_runs WHERE id=$1"
+    ).bind(run_id).fetch_optional(&state.pool).await
+        .map_err(|_| AppError::internal("failed to authorize agent run"))?
+        .ok_or_else(|| AppError::not_found("agent run not found"))?;
+    ensure_project_access(&state.pool, user, project_id).await?;
+    if let Some(script_id) = script_id { ensure_script_in_project(&state.pool, project_id, script_id).await?; }
+    Ok(())
 }
 
 /// Public version used by the WebSocket handler.
@@ -1340,6 +1398,7 @@ pub async fn start(
     Json(request): Json<ChatRequest>,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
     require(&user, "toon:project:update")?;
+    authorize_context(&state, &user, &request.agent_type, &request.isolation_key, request.project_id, request.script_id).await?;
     recover_stale(&state).await;
     let run_id = create_run(&state, &request).await?;
     let task_state = state.clone();
@@ -1365,6 +1424,7 @@ pub async fn run_state(
     Json(request): Json<RunIdRequest>,
 ) -> Result<Json<ApiResponse<RunRow>>, AppError> {
     require(&user, "toon:project:read")?;
+    authorize_run(&state, &user, request.id).await?;
     let row=sqlx::query_as("SELECT id,agent_type,isolation_key,project_id,script_id,input,output,state,error_reason,think,think_level,start_time,finish_time,retry_of_id FROM toonflow.agent_runs WHERE id=$1").bind(request.id).fetch_optional(&state.pool).await.map_err(|_|AppError::internal("failed to get agent run"))?.ok_or_else(||AppError::not_found("agent run not found"))?;
     Ok(Json(ApiResponse::new(row)))
 }
@@ -1375,6 +1435,7 @@ pub async fn stop(
     Json(request): Json<RunIdRequest>,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
     require(&user, "toon:project:update")?;
+    authorize_run(&state, &user, request.id).await?;
     if let Some(handle) = ACTIVE_RUNS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1397,6 +1458,7 @@ pub async fn events(
     Json(request): Json<EventRequest>,
 ) -> Result<Json<ApiResponse<Vec<RunEvent>>>, AppError> {
     require(&user, "toon:project:read")?;
+    authorize_run(&state, &user, request.run_id).await?;
     let rows=sqlx::query_as("SELECT id,run_id,event_type,data,create_time FROM toonflow.agent_run_events WHERE run_id=$1 AND id>$2 ORDER BY id LIMIT 500").bind(request.run_id).bind(request.after_id).fetch_all(&state.pool).await.map_err(|_|AppError::internal("failed to get agent events"))?;
     Ok(Json(ApiResponse::new(rows)))
 }
@@ -1417,6 +1479,7 @@ pub async fn retry(
     Json(source): Json<RunIdRequest>,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
     require(&user, "toon:project:update")?;
+    authorize_run(&state, &user, source.id).await?;
     recover_stale(&state).await;
     let row:Option<RetryRunRow>=sqlx::query_as("SELECT agent_type,isolation_key,project_id,script_id,input,think,think_level FROM toonflow.agent_runs WHERE id=$1 AND state IN('failed','canceled','interrupted')").bind(source.id).fetch_optional(&state.pool).await.map_err(|_|AppError::internal("failed to load retry run"))?;
     let (agent_type, isolation_key, project_id, script_id, content, think, think_level) =
@@ -1430,6 +1493,7 @@ pub async fn retry(
         think,
         think_level,
     };
+    authorize_context(&state, &user, &request.agent_type, &request.isolation_key, request.project_id, request.script_id).await?;
     let run_id = create_run(&state, &request).await?;
     sqlx::query("UPDATE toonflow.agent_runs SET retry_of_id=$2 WHERE id=$1")
         .bind(run_id)
@@ -1461,6 +1525,7 @@ pub async fn memories(
 ) -> Result<Json<ApiResponse<Vec<MemoryRow>>>, AppError> {
     require(&user, "toon:project:read")?;
     validate_agent(&request.agent_type)?;
+    authorize_session(&state, &user, &request.agent_type, &request.isolation_key).await?;
     let rows=sqlx::query_as("SELECT id,role,content,memory_type,create_time FROM toonflow.agent_memories WHERE agent_type=$1 AND isolation_key=$2 ORDER BY create_time").bind(request.agent_type).bind(request.isolation_key).fetch_all(&state.pool).await.map_err(|_|AppError::internal("failed to list memories"))?;
     Ok(Json(ApiResponse::new(rows)))
 }
@@ -1476,6 +1541,7 @@ pub async fn get_memory_compat(
 ) -> Result<Json<ApiResponse<Vec<MemoryRow>>>, AppError> {
     require(&user, "toon:project:read")?;
     validate_agent(&request.agent_type)?;
+    ensure_project_access(&state.pool, &user, request.project_id).await?;
     let exact_key = format!("{}:{}", request.agent_type, request.project_id);
     let prefix = format!("{}:{}:%", request.agent_type, request.project_id);
     let rows = sqlx::query_as(
@@ -1499,6 +1565,7 @@ pub async fn runs(
 ) -> Result<Json<ApiResponse<Vec<RunRow>>>, AppError> {
     require(&user, "toon:project:read")?;
     validate_agent(&request.agent_type)?;
+    authorize_session(&state, &user, &request.agent_type, &request.isolation_key).await?;
     let rows=sqlx::query_as("SELECT id,agent_type,isolation_key,project_id,script_id,input,output,state,error_reason,think,think_level,start_time,finish_time,retry_of_id FROM toonflow.agent_runs WHERE agent_type=$1 AND isolation_key=$2 ORDER BY start_time DESC LIMIT 50").bind(request.agent_type).bind(request.isolation_key).fetch_all(&state.pool).await.map_err(|_|AppError::internal("failed to list agent runs"))?;
     Ok(Json(ApiResponse::new(rows)))
 }
@@ -1509,6 +1576,7 @@ pub async fn clear(
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
     require(&user, "toon:project:update")?;
     validate_agent(&request.agent_type)?;
+    authorize_session(&state, &user, &request.agent_type, &request.isolation_key).await?;
     let memory_type = request.memory_type.as_deref().unwrap_or("all");
     if !matches!(memory_type, "message" | "summary" | "all") {
         return Err(AppError::bad_request(
@@ -1590,6 +1658,17 @@ mod tests {
         format_chapter_ranges, parse_native_tool_arguments, parse_tool_calls, pipeline_rule,
         stop_run_after_tool_failure, tool_names,
     };
+
+    #[test]
+    fn session_keys_bind_history_to_a_canonical_project_and_script() {
+        assert_eq!(super::session_scope("scriptAgent", "scriptAgent:42:project").unwrap(), (42, None));
+        assert_eq!(super::session_scope("scriptAgent", "scriptAgent:42").unwrap(), (42, None));
+        assert_eq!(super::session_scope("productionAgent", "productionAgent:42:99").unwrap(), (42, Some(99)));
+        assert_eq!(super::session_scope("productionAgent", "productionAgent:42:none").unwrap(), (42, None));
+        for key in ["other:42", "productionAgent:42:99", "scriptAgent:42:99", "scriptAgent:42:project:extra", "scriptAgent:-1", "scriptAgent:042", "scriptAgent:0", "unscoped"] {
+            assert!(super::session_scope("scriptAgent", key).is_err(), "accepted {key}");
+        }
+    }
 
     #[test]
     fn scoped_skill_access_does_not_grant_supervision_write_tools() {

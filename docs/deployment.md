@@ -17,7 +17,7 @@
 docker compose -f script/docker/docker-compose.yml up -d
 ```
 
-包含 PostgreSQL（5432）、Redis（6379）、启用持久化 JetStream 的 NATS（4222/8222）、MinIO（9000/9001）和 r-nacos（8848/9848/10848）。也可以使用便捷脚本 `script/start-local.sh [infra|gateway|worker|backend|all]`：它会先起 compose，再按模式启动服务（自动导出本地默认环境变量）。`backend` 同时启动网关与 worker，`all` 再加上前端；这两个模式会等待 Gateway 就绪后再启动 Worker。单独调试可用 `gateway` 或 `worker`，但 `worker` 模式要求已有就绪的 Gateway 完成迁移。
+包含 PostgreSQL（5432）、Redis（6379）、启用持久化 JetStream 的 NATS（4222/8222）、RustFS（9000/9001）和 r-nacos（8848/9848/10848）。也可以使用便捷脚本 `script/start-local.sh [infra|gateway|worker|backend|all]`：它会先起 compose，再按模式启动服务（自动导出本地默认环境变量）。`backend` 同时启动网关与 worker，`all` 再加上前端；这两个模式会等待 Gateway 就绪后再启动 Worker。单独调试可用 `gateway` 或 `worker`，但 `worker` 模式要求已有就绪的 Gateway 完成迁移。
 
 ### 2.2 启动后端网关
 
@@ -25,9 +25,9 @@ docker compose -f script/docker/docker-compose.yml up -d
 export DATABASE_URL='postgres://rust_toon:rust_toon@127.0.0.1:5432/rust_toon'
 export REDIS_URL='redis://127.0.0.1:6379'
 export JWT_SECRET='local-development-jwt-secret-change-me-32bytes'
-export MINIO_ENDPOINT='http://127.0.0.1:9000'
-export MINIO_ACCESS_KEY='rust_toon'
-export MINIO_SECRET_KEY='rust_toon_password'
+export S3_ENDPOINT='http://127.0.0.1:9000'
+export S3_ACCESS_KEY='rust_toon'
+export S3_SECRET_KEY='rust_toon_password'
 export NACOS_ENABLED='true'
 export NACOS_REQUIRED='true'
 export NACOS_SERVER_ADDR='127.0.0.1:8848'
@@ -44,9 +44,9 @@ cargo run -p rust-toon-gateway
 ```bash
 export DATABASE_URL='postgres://rust_toon:rust_toon@127.0.0.1:5432/rust_toon'
 export NATS_URL='nats://127.0.0.1:4222'
-export MINIO_ENDPOINT='http://127.0.0.1:9000'
-export MINIO_ACCESS_KEY='rust_toon'
-export MINIO_SECRET_KEY='rust_toon_password'
+export S3_ENDPOINT='http://127.0.0.1:9000'
+export S3_ACCESS_KEY='rust_toon'
+export S3_SECRET_KEY='rust_toon_password'
 export NACOS_ENABLED='true'
 export NACOS_REQUIRED='true'
 export NACOS_SERVER_ADDR='127.0.0.1:8848'
@@ -71,7 +71,7 @@ pnpm dev:antd
 - 存活/就绪探针：`http://127.0.0.1:8080/livez`、`http://127.0.0.1:8080/readyz`
 - Worker 存活/就绪探针：`http://127.0.0.1:8081/livez`、`http://127.0.0.1:8081/readyz`
 - OpenAPI 文档：`http://127.0.0.1:8080/openapi.json`
-- MinIO 控制台：`http://127.0.0.1:9001`（`rust_toon` / `rust_toon_password`）
+- RustFS 控制台：`http://127.0.0.1:9001`（`rust_toon` / `rust_toon_password`）
 - r-nacos 控制台：`http://127.0.0.1:10848`（`rust_toon` / `rust_toon_nacos_password`）
 
 默认本地应用账号：`admin` / `admin123`。账号由基线迁移创建，Gateway 启动不会创建账号或重置密码；完整行为见[启动账号说明](configuration.md#112-启动账号说明)。首次登录后请立即修改密码。
@@ -89,7 +89,7 @@ bash script/test-production-e2e.sh
 bash script/test-distributed-deployment.sh
 bash script/test-k8s-deployment.sh
 bash script/test-distributed-jobs-e2e.sh
-bash script/test-minio-backup.sh
+bash script/test-s3-backup.sh
 pnpm --dir apps/web run test:unit
 pnpm --dir apps/web --filter @vben/web-antd run typecheck
 ```
@@ -129,20 +129,22 @@ DATABASE_MIN_CONNECTIONS=1
 DATABASE_MAX_CONNECTIONS=12
 REDIS_URL=redis://127.0.0.1:6379
 JWT_SECRET=replace-with-a-strong-random-secret-at-least-32-bytes
-MINIO_ENDPOINT=http://127.0.0.1:9000
-MINIO_ACCESS_KEY=rust_toon
-MINIO_SECRET_KEY=replace-with-a-strong-object-storage-secret
-MINIO_BUCKET=rust-toon
+S3_ENDPOINT=http://127.0.0.1:9000
+S3_ACCESS_KEY=rust_toon
+S3_SECRET_KEY=replace-with-a-strong-object-storage-secret
+S3_BUCKET=rust-toon
 GATEWAY_HOST=0.0.0.0
 GATEWAY_PORT=8080
 GATEWAY_DRAIN_DELAY_SECONDS=10
 RUST_LOG=info
 RUST_ENV=production
 READINESS_REQUIRE_REDIS=true
-READINESS_REQUIRE_MINIO=true
+READINESS_REQUIRE_OBJECT_STORAGE=true
 ```
 
-`JWT_SECRET` 必须 ≥ 32 字节，否则启动失败。当前版本不支持 `BOOTSTRAP_ADMIN_USERNAME` / `BOOTSTRAP_ADMIN_PASSWORD`；不要把它们写入环境文件。全新数据库会由基线迁移创建 `admin`，应在首次受控登录后立即修改其密码。当前上传、生成片段和最终成片统一进入 MinIO/S3；旧版本遗留的 `storage/uploads` 应先用 `script/migrate-local-uploads-to-minio.sh` 迁移。AI 密钥落库加密可通过 `SECRET_ENCRYPTION_KEY` 独立指定（缺省回退 `JWT_SECRET`）。
+`JWT_SECRET` 必须 ≥ 32 字节，否则启动失败。当前版本不支持 `BOOTSTRAP_ADMIN_USERNAME` / `BOOTSTRAP_ADMIN_PASSWORD`；不要把它们写入环境文件。全新数据库会由基线迁移创建 `admin`，应在首次受控登录后立即修改其密码。当前上传、生成片段和最终成片统一进入对象存储；旧版本遗留的 `storage/uploads` 应先用 `script/migrate-local-uploads-to-s3.sh` 迁移。AI 密钥落库加密可通过 `SECRET_ENCRYPTION_KEY` 独立指定（缺省回退 `JWT_SECRET`）。
+
+对象存储后端已从 MinIO 换成 RustFS（MinIO 社区版已停止维护），应用侧只依赖标准 S3 数据面接口。升级注意：环境变量已从 `MINIO_*` 整体更名为 `S3_*`（`READINESS_REQUIRE_MINIO` → `READINESS_REQUIRE_OBJECT_STORAGE`），现有部署的环境文件需同步重命名；本地 Docker 卷中的历史对象用 `script/migrate-minio-to-rustfs.sh` 迁移，该脚本只读取旧卷、绝不删除。
 
 ### 4.3 构建与试运行
 
@@ -156,7 +158,7 @@ set -a; . /etc/rust-toon/gateway.env; set +a
 
 ### 4.4 systemd
 
-仓库提供样例 `deploy/systemd/rust-toon-gateway.service`（`User=rust-toon`、`EnvironmentFile=/etc/rust-toon/gateway.env`、开启 `ProtectSystem=strict` 等加固项；运行时对象进入 MinIO，不开放仓库目录写权限）：
+仓库提供样例 `deploy/systemd/rust-toon-gateway.service`（`User=rust-toon`、`EnvironmentFile=/etc/rust-toon/gateway.env`、开启 `ProtectSystem=strict` 等加固项；运行时对象进入对象存储，不开放仓库目录写权限）：
 
 ```bash
 sudo useradd --system --home /opt/rust-toon --shell /usr/sbin/nologin rust-toon
@@ -194,7 +196,7 @@ sudo systemctl enable --now rust-toon-worker
 curl -fsS http://127.0.0.1:8081/readyz
 ```
 
-网关与 worker 可以部署到不同服务器。应用集群必须共享 PostgreSQL 和 MinIO，所有 worker 还必须连接同一 JetStream；每个 worker 都使用独立实例 ID 和数据库租约，无需指定静态分片。当前 Agent/Workflow 运行协调仍含进程内状态，因此生产集群暂时只运行 **1 个 Gateway**；最终成片 worker 可以运行任意多个副本。待 Agent/Workflow 也迁到持久任务协议后，才能解除 Gateway 单副本限制。
+网关与 worker 可以部署到不同服务器。应用集群必须共享 PostgreSQL 和对象存储，所有 worker 还必须连接同一 JetStream；每个 worker 都使用独立实例 ID 和数据库租约，无需指定静态分片。当前 Agent/Workflow 运行协调仍含进程内状态，因此生产集群暂时只运行 **1 个 Gateway**；最终成片 worker 可以运行任意多个副本。待 Agent/Workflow 也迁到持久任务协议后，才能解除 Gateway 单副本限制。
 
 单机 systemd 部署可用统一探针脚本检查网关、worker 和 JetStream；端点不在本机时通过同名环境变量覆盖：
 
@@ -207,7 +209,7 @@ Worker 默认只在 `127.0.0.1:8081` 暴露管理探针；远程节点通过主�
 
 ### 4.5 Docker Compose 分布式部署
 
-`script/docker/docker-compose.distributed.yml` 是独立的单机生产骨架，不继承本地 compose 的固定 `container_name`。业务流量只经 edge 进入；PostgreSQL、MinIO、r-nacos 控制台和 NATS 监控端口仅绑定 loopback，供本机维护使用。先用 `0600` 权限安装密钥文件，再启动 1 个 Gateway 和多个 worker：
+`script/docker/docker-compose.distributed.yml` 是独立的单机生产骨架，不继承本地 compose 的固定 `container_name`。业务流量只经 edge 进入；PostgreSQL、RustFS、r-nacos 控制台和 NATS 监控端口仅绑定 loopback，供本机维护使用。先用 `0600` 权限安装密钥文件，再启动 1 个 Gateway 和多个 worker：
 
 ```bash
 sudo install -d -o root -g root -m 0700 /etc/rust-toon
@@ -251,7 +253,7 @@ docker compose \
 
 扩缩 worker 时重复 `up -d --scale gateway=1 --scale toon-worker=N`。worker 收到 SIGTERM 后立即停止领新任务，取消在途执行并用当前 fencing token 把尝试重新排队；整个过程受 `TOON_WORKER_DRAIN_TIMEOUT_SECONDS` 限制，数据库或网络故障时仍可在租约过期后由其他实例接管。`stop_grace_period` 必须大于 drain deadline，生产若提高它需同步提高容器停止宽限。Gateway 收到 SIGTERM 会先把 `/readyz` 置为不可用并等待 `GATEWAY_DRAIN_DELAY_SECONDS`，但单机 Compose 的 edge 只有被动故障重试；需要无损滚动 Gateway 时应由真正消费 readiness 的编排器/LB 摘流。
 
-该 compose 不包含前端静态站；仍需按第 5 节使用 CDN/独立 Nginx 托管 `dist`，并把 `/api/` 指向 edge。Compose 中的 PostgreSQL、Redis、NATS、MinIO 和 r-nacos 都是单机持久化数据面；r-nacos 控制台默认只绑定 `127.0.0.1:10848`。高可用生产应替换为托管 PostgreSQL/Redis/对象存储、三节点 JetStream，并使用下一节的三节点 r-nacos 清单。JetStream 卷用于降低恢复延迟，但业务任务真相源是 PostgreSQL outbox，因此不能用 NATS 消息替代数据库备份。
+该 compose 不包含前端静态站；仍需按第 5 节使用 CDN/独立 Nginx 托管 `dist`，并把 `/api/` 指向 edge。Compose 中的 PostgreSQL、Redis、NATS、RustFS 和 r-nacos 都是单机持久化数据面；r-nacos 控制台默认只绑定 `127.0.0.1:10848`。高可用生产应替换为托管 PostgreSQL/Redis/对象存储、三节点 JetStream，并使用下一节的三节点 r-nacos 清单。JetStream 卷用于降低恢复延迟，但业务任务真相源是 PostgreSQL outbox，因此不能用 NATS 消息替代数据库备份。
 
 r-nacos 新数据卷只会创建 `NACOS_USERNAME` / `NACOS_PASSWORD` 指定的初始化管理员。首次登录 `http://127.0.0.1:10848` 后发布 `RUST_TOON` group 下的 `rust-toon-gateway.json` 与 `rust-toon-toon-worker.json`；合法 JSON 见[配置文档](configuration.md#15-r-nacos-动态配置cratesframeworkdynamic-config)。文档不存在时应用使用环境变量默认值并保持订阅，因此可先启动再发布。生产完成引导后应创建单独的应用账号、轮换 Gateway/Worker 的 r-nacos 凭据，并把管理员只留给运维入口。
 
@@ -264,14 +266,14 @@ r-nacos 新数据卷只会创建 `NACOS_USERNAME` / `NACOS_PASSWORD` 指定的�
 - 固定版本 `v0.8.6` 的三节点 r-nacos StatefulSet、每节点独立 10 GiB PVC、headless Raft 发现 Service、客户端/控制台 Service 与 `minAvailable: 2` PDB。OpenAPI 鉴权默认开启，控制台不对业务入口开放。
 - `/livez`、`/readyz` 与启动探针、SIGTERM 宽限、non-root、只读根文件系统、默认 seccomp、移除 Linux capabilities、资源 request/limit 和临时盘上限。
 - 默认拒绝入站/出站的 NetworkPolicy，以及 DNS、Gateway 入口、监控与外部依赖所需的最小端口规则。
-- Gateway/Worker 临时目录使用有 `sizeLimit` 的 `emptyDir`；上传、生成片段和最终成片都写到共享 MinIO/S3，因此基础清单不创建无消费者的本地上传 PVC。
+- Gateway/Worker 临时目录使用有 `sizeLimit` 的 `emptyDir`；上传、生成片段和最终成片都写到写入共享对象存储，因此基础清单不创建无消费者的本地上传 PVC。
 - Prometheus、Alertmanager、Grafana、Loki、Tempo 与 OpenTelemetry Collector。Prometheus/Loki/Tempo/Alertmanager 使用 PVC 保存运行数据，Grafana Dashboard 和数据源由 ConfigMap 声明式装载。
 
-这些清单会部署 r-nacos，但**不部署 PostgreSQL、Redis、NATS 或 MinIO**。部署前准备外部服务、默认 StorageClass、支持 NetworkPolicy 的 CNI，以及供 HPA 使用的 Metrics Server。基础 HPA 最大 8 个 Worker；按示例连接池计算为 Gateway 12 + Worker 8×8 = 76 个数据库连接，修改上限或副本数时必须重新核算 PostgreSQL 连接预算。生产 JetStream 建议三副本；若外部集群的 replication factor 不同，应同步修改 `NATS_JOB_REPLICAS`。
+这些清单会部署 r-nacos，但**不部署 PostgreSQL、Redis、NATS 或对象存储**。部署前准备外部服务、默认 StorageClass、支持 NetworkPolicy 的 CNI，以及供 HPA 使用的 Metrics Server。基础 HPA 最大 8 个 Worker；按示例连接池计算为 Gateway 12 + Worker 8×8 = 76 个数据库连接，修改上限或副本数时必须重新核算 PostgreSQL 连接预算。生产 JetStream 建议三副本；若外部集群的 replication factor 不同，应同步修改 `NATS_JOB_REPLICAS`。
 
-先构建并推送 `deploy/docker/Dockerfile.backend`，使用不可变 tag 或 digest，然后修改 `deploy/k8s/kustomization.yaml` 的 `images` 条目。不要部署示例中的 `.invalid` 镜像/endpoint。修改两个 ConfigMap 中的 MinIO endpoint、桶和容量参数；敏感连接信息不要写入 ConfigMap 或 Git。
+先构建并推送 `deploy/docker/Dockerfile.backend`，使用不可变 tag 或 digest，然后修改 `deploy/k8s/kustomization.yaml` 的 `images` 条目。不要部署示例中的 `.invalid` 镜像/endpoint。修改两个 ConfigMap 中的 S3 endpoint、桶和容量参数；敏感连接信息不要写入 ConfigMap 或 Git。
 
-`deploy/k8s/secret.example.yaml` 仅列出 Secret key，故意不在 Kustomize resources 中，所有值都是不可用的 `REPLACE_ME`。它把 Gateway、Worker、r-nacos 和 Grafana 管理员凭据拆成四个 scoped Secret，只有 PostgreSQL/MinIO 连接值需要分别写入前两份。首次安装时 Gateway/Worker 的 `NACOS_USERNAME` / `NACOS_PASSWORD` 必须与 r-nacos 初始化管理员匹配；集群建立后再创建应用账号并轮换。建议从权限为 `0600`、位于仓库外的文件或 External Secrets/Sealed Secrets 创建四份 Secret。以下是文件方式的安装顺序：
+`deploy/k8s/secret.example.yaml` 仅列出 Secret key，故意不在 Kustomize resources 中，所有值都是不可用的 `REPLACE_ME`。它把 Gateway、Worker、r-nacos 和 Grafana 管理员凭据拆成四个 scoped Secret，只有 PostgreSQL/对象存储连接值需要分别写入前两份。首次安装时 Gateway/Worker 的 `NACOS_USERNAME` / `NACOS_PASSWORD` 必须与 r-nacos 初始化管理员匹配；集群建立后再创建应用账号并轮换。建议从权限为 `0600`、位于仓库外的文件或 External Secrets/Sealed Secrets 创建四份 Secret。以下是文件方式的安装顺序：
 
 ```bash
 kubectl apply -f deploy/k8s/namespace.yaml
@@ -281,7 +283,7 @@ sudo install -o "$(id -un)" -g "$(id -gn)" -m 0600 \
 ${EDITOR:-vi} /secure/path/rust-toon-secret.yaml
 kubectl apply -f /secure/path/rust-toon-secret.yaml
 
-# 确认已修改 image、MINIO_ENDPOINT 和 NATS_JOB_REPLICAS 后再安装。
+# 确认已修改 image、S3_ENDPOINT 和 NATS_JOB_REPLICAS 后再安装。
 kubectl apply -k deploy/k8s
 # Vector 需要读取节点上的容器日志，因此独立部署在 baseline
 # Pod Security namespace，而不是 restricted 的应用 namespace。
@@ -292,7 +294,7 @@ kubectl apply -k deploy/logging-agent
 
 全新数据库也可以一次性应用全部资源：Gateway 启动时先执行 SQLx 迁移；每个 Worker 的受限 init container 会持续访问 `rust-toon-gateway:8080/readyz`，只有迁移、管理员校验及 Gateway 必需依赖全部就绪后才启动 Worker。不要删除这个等待条件，也不要让 Worker 自行执行迁移。
 
-基础 NetworkPolicy 只能按常用端口放行任意外部目的地，因为标准 Kubernetes NetworkPolicy 不支持 FQDN。请在环境 overlay 中把 PostgreSQL、Redis、NATS、MinIO 和 HTTPS provider egress 收窄为实际 CIDR，或使用 CNI 的 FQDN policy；若托管服务使用非默认端口也要同步调整。把 Ingress Controller 和监控组件所在 namespace 显式打标后才允许访问：
+基础 NetworkPolicy 只能按常用端口放行任意外部目的地，因为标准 Kubernetes NetworkPolicy 不支持 FQDN。请在环境 overlay 中把 PostgreSQL、Redis、NATS、对象存储和 HTTPS provider egress 收窄为实际 CIDR，或使用 CNI 的 FQDN policy；若托管服务使用非默认端口也要同步调整。把 Ingress Controller 和监控组件所在 namespace 显式打标后才允许访问：
 
 ```bash
 kubectl label namespace ingress-nginx rust-toon.io/gateway-access=true
@@ -345,18 +347,18 @@ Kubernetes 环境的 PostgreSQL/对象备份优先使用托管服务 PITR、CSI 
 
 仓库提供脚本与定时器样例：
 
-分布式 compose 把 PostgreSQL/MinIO 维护端口绑定到 `MAINTENANCE_BIND_ADDRESS`（默认 `127.0.0.1`），因此宿主机上的现有备份脚本可直接使用 `postgres://...@127.0.0.1:${POSTGRES_MAINTENANCE_PORT}/rust_toon` 和 `http://127.0.0.1:${MINIO_MAINTENANCE_PORT}`；不要把维护地址改成公网网卡。
+分布式 compose 把 PostgreSQL/RustFS 维护端口绑定到 `MAINTENANCE_BIND_ADDRESS`（默认 `127.0.0.1`），因此宿主机上的现有备份脚本可直接使用 `postgres://...@127.0.0.1:${POSTGRES_MAINTENANCE_PORT}/rust_toon` 和 `http://127.0.0.1:${RUSTFS_MAINTENANCE_PORT}`；不要把维护地址改成公网网卡。
 
-- `script/database/backup-consistent-set.sh`：生产定时备份入口。它按反向依赖顺序优雅停止 `BACKUP_SYSTEMD_UNITS` 中当时正在运行的 Worker/Gateway，等待写入完全静止，以同一个 `BACKUP_SET_ID` 依次执行 PostgreSQL 与 MinIO 备份并原子发布 set manifest，最后只恢复原先运行的服务。任一组件失败也会执行恢复服务的 trap，且不会发布完整 set manifest。
+- `script/database/backup-consistent-set.sh`：生产定时备份入口。它按反向依赖顺序优雅停止 `BACKUP_SYSTEMD_UNITS` 中当时正在运行的 Worker/Gateway，等待写入完全静止，以同一个 `BACKUP_SET_ID` 依次执行 PostgreSQL 与对象存储备份并原子发布 set manifest，最后只恢复原先运行的服务。任一组件失败也会执行恢复服务的 trap，且不会发布完整 set manifest。
 - `script/database/backup-postgres.sh`：一致性协调器使用的 `pg_dump` 组件，也可在已人工停写时单独执行；要求 `DATABASE_URL`。`BACKUP_DIR`（默认 `/var/backups/rust-toon/postgresql`）、`BACKUP_RETENTION_DAYS`（默认 14）控制目录与保留天数。
 - `script/database/restore-postgres.sh`：恢复，`--backup FILE --database-url URL --confirm`。
-- `script/database/backup-minio.sh`：一致性协调器使用的对象组件，使用 MinIO Client `mc` 镜像对象桶并生成逐对象 SHA-256 清单；配置 `MINIO_ENDPOINT`、`MINIO_ACCESS_KEY`、`MINIO_SECRET_KEY`、`MINIO_BUCKET` 和 `MINIO_BACKUP_DIR`，宿主机还需提供 `jq`。
-- `script/database/restore-minio.sh`：严格校验 manifest 版本、bucket、普通文件全集和 SHA-256 清单后恢复对象；跨 bucket 恢复必须额外传入 `--allow-bucket-mismatch`。默认保留目标端额外对象，只有显式传入 `--delete-extra --confirm` 才执行镜像删除。
+- `script/database/backup-s3.sh`：一致性协调器使用的对象组件，使用 S3 客户端 `mc` 镜像对象桶并生成逐对象 SHA-256 清单；配置 `S3_ENDPOINT`、`S3_ACCESS_KEY`、`S3_SECRET_KEY`、`S3_BUCKET` 和 `S3_BACKUP_DIR`，宿主机还需提供 `jq`。
+- `script/database/restore-s3.sh`：严格校验 manifest 版本、bucket、普通文件全集和 SHA-256 清单后恢复对象；跨 bucket 恢复必须额外传入 `--allow-bucket-mismatch`。默认保留目标端额外对象，只有显式传入 `--delete-extra --confirm` 才执行镜像删除。
 - `deploy/systemd/rust-toon-consistent-backup.service` + `.timer`：每日 03:15 触发唯一的一致性恢复集；旧的两个错峰 timer 已移除。单组件 service 仅供已人工停写后的诊断/补备份使用，不能把不同时间的组件产物拼成生产恢复集。
 
-r-nacos 的 Raft 数据不属于 PostgreSQL + MinIO 业务一致性恢复集。Compose 部署应通过带 `RNACOS_BACKUP_TOKEN` 的 r-nacos 备份接口另存配置中心备份；Kubernetes 优先对三份 PVC 做协调快照或使用 r-nacos 备份接口，并定期演练配置历史恢复。即使配置中心备份暂时不可用，Gateway/Worker 仍保留 SDK 磁盘缓存和环境变量默认值，但这不能替代配置历史备份。
+r-nacos 的 Raft 数据不属于 PostgreSQL + 对象存储业务一致性恢复集。Compose 部署应通过带 `RNACOS_BACKUP_TOKEN` 的 r-nacos 备份接口另存配置中心备份；Kubernetes 优先对三份 PVC 做协调快照或使用 r-nacos 备份接口，并定期演练配置历史恢复。即使配置中心备份暂时不可用，Gateway/Worker 仍保留 SDK 磁盘缓存和环境变量默认值，但这不能替代配置历史备份。
 
-systemd 样例以 `rust-toon` 用户运行，启用前需安装 `mc`、创建可写目录并保护包含凭据的环境文件。以下示例为 Linux amd64；其他架构请从 MinIO 官方下载目录选择对应二进制：
+systemd 样例以 `rust-toon` 用户运行，启用前需安装 `mc`、创建可写目录并保护包含凭据的环境文件。以下示例为 Linux amd64；其他架构请从 MinIO mc 官方下载目录选择对应二进制：
 
 ```bash
 sudo apt-get update && sudo apt-get install -y jq
@@ -364,7 +366,7 @@ curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/archive/mc.RELEASE.20
   -o /tmp/rust-toon-mc
 sudo install -o root -g root -m 0755 /tmp/rust-toon-mc /usr/local/bin/mc
 sudo install -d -o root -g root -m 0700 \
-  /var/backups/rust-toon/postgresql /var/backups/rust-toon/minio /var/backups/rust-toon/sets
+  /var/backups/rust-toon/postgresql /var/backups/rust-toon/s3 /var/backups/rust-toon/sets
 sudo install -d -o root -g rust-toon -m 0750 /etc/rust-toon
 sudo install -o root -g root -m 0600 \
   deploy/env/backup.env.example /etc/rust-toon/backup.env
@@ -376,7 +378,7 @@ sudo systemctl enable --now rust-toon-consistent-backup.timer
 sudo systemctl start rust-toon-consistent-backup.service
 ```
 
-生产恢复必须按 `sets/rust-toon-<set-id>.json` 选择同一个 set-id 指向的 PostgreSQL 与 MinIO 产物，不能再按“时间相近”自行配对。恢复期间保持 Gateway/Worker 停止，依次恢复两者，最后通过 `/readyz`、成果视频抽查和对象引用审计后恢复流量。维护窗口会短暂停止生成与 API 服务；若业务不能接受停写，应改用支持同一 as-of 版本的对象存储 versioning/快照方案。建议同时开启异地复制或 object lock；文件级镜像不能替代这些能力。
+生产恢复必须按 `sets/rust-toon-<set-id>.json` 选择同一个 set-id 指向的 PostgreSQL 与对象存储产物，不能再按“时间相近”自行配对。恢复期间保持 Gateway/Worker 停止，依次恢复两者，最后通过 `/readyz`、成果视频抽查和对象引用审计后恢复流量。维护窗口会短暂停止生成与 API 服务；若业务不能接受停写，应改用支持同一 as-of 版本的对象存储 versioning/快照方案。建议同时开启异地复制或 object lock；文件级镜像不能替代这些能力。
 
 ## 5. 前端生产部署
 

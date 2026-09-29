@@ -71,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
     );
     let infra_state = rust_toon_infra_server::InfraState::new(database.clone(), tokens.clone());
     let ai_state = rust_toon_ai_server::AiState::new(database.clone(), tokens.clone());
-    if std::env::var_os("MINIO_ENDPOINT").is_some() {
+    if std::env::var_os("S3_ENDPOINT").is_some() {
         rust_toon_toon_server::initialize_object_storage()
             .await
             .map_err(anyhow::Error::msg)?;

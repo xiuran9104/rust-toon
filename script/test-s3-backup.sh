@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-minio_container="rust-toon-minio-backup-test"
+s3_container="rust-toon-s3-backup-test"
 mc_container="rust-toon-mc-backup-test"
-minio_port="${TEST_MINIO_BACKUP_PORT:-59010}"
-minio_image="${MINIO_IMAGE:-minio/minio:RELEASE.2025-04-22T22-12-26Z}"
-mc_image="${MINIO_MC_IMAGE:-minio/mc:RELEASE.2025-04-16T18-13-26Z}"
+s3_port="${TEST_S3_BACKUP_PORT:-59010}"
+s3_image="${S3_IMAGE:-rustfs/rustfs:1.0.0}"
+mc_image="${S3_MC_IMAGE:-minio/mc:RELEASE.2025-04-16T18-13-26Z}"
 test_dir="$(mktemp -d)"
 
 cleanup() {
-  docker rm -f "$minio_container" "$mc_container" >/dev/null 2>&1 || true
+  docker rm -f "$s3_container" "$mc_container" >/dev/null 2>&1 || true
   rm -rf -- "$test_dir"
 }
 trap cleanup EXIT
-docker rm -f "$minio_container" "$mc_container" >/dev/null 2>&1 || true
+docker rm -f "$s3_container" "$mc_container" >/dev/null 2>&1 || true
 
 for command_name in cmp cp curl docker jq sha256sum; do
   command -v "$command_name" >/dev/null || {
-    echo "$command_name is required for the MinIO backup test" >&2
+    echo "$command_name is required for the object storage backup test" >&2
     exit 1
   }
 done
@@ -29,32 +29,31 @@ docker create --name "$mc_container" "$mc_image" --help >/dev/null
 docker cp "$mc_container:/usr/bin/mc" "$test_dir/mc" >/dev/null
 chmod 700 "$test_dir/mc"
 
-docker run -d --name "$minio_container" \
-  -e MINIO_ROOT_USER=rust_toon \
-  -e MINIO_ROOT_PASSWORD=rust_toon_password \
-  -p "$minio_port:9000" "$minio_image" \
-  server /data >/dev/null
+docker run -d --name "$s3_container" \
+  -e RUSTFS_ACCESS_KEY=rust_toon \
+  -e RUSTFS_SECRET_KEY=rust_toon_password \
+  -p "$s3_port:9000" "$s3_image" >/dev/null
 
 for _ in $(seq 1 45); do
-  curl -fsS "http://127.0.0.1:${minio_port}/minio/health/ready" >/dev/null 2>&1 && break
+  curl -fsS "http://127.0.0.1:${s3_port}/health" >/dev/null 2>&1 && break
   sleep 1
 done
-curl -fsS "http://127.0.0.1:${minio_port}/minio/health/ready" >/dev/null
+curl -fsS "http://127.0.0.1:${s3_port}/health" >/dev/null
 
 export PATH="$test_dir:$PATH"
 export MC_CONFIG_DIR="$test_dir/mc-client"
-mc alias set backup-test "http://127.0.0.1:${minio_port}" \
+mc alias set backup-test "http://127.0.0.1:${s3_port}" \
   rust_toon rust_toon_password >/dev/null
 mc mb --ignore-existing backup-test/rust-toon >/dev/null
 printf '%s' 'merged-episode-render' | \
   mc pipe backup-test/rust-toon/episodes/episode-1-v1.mp4 >/dev/null
 
 run_restore() {
-  MINIO_ENDPOINT="http://127.0.0.1:${minio_port}" \
-  MINIO_ACCESS_KEY=rust_toon \
-  MINIO_SECRET_KEY=rust_toon_password \
-  MINIO_BUCKET=rust-toon \
-    bash script/database/restore-minio.sh "$@"
+  S3_ENDPOINT="http://127.0.0.1:${s3_port}" \
+  S3_ACCESS_KEY=rust_toon \
+  S3_SECRET_KEY=rust_toon_password \
+  S3_BUCKET=rust-toon \
+    bash script/database/restore-s3.sh "$@"
 }
 
 expect_restore_failure() {
@@ -77,17 +76,17 @@ refresh_checksums() {
 }
 
 backup_path="$(
-  MINIO_ENDPOINT="http://127.0.0.1:${minio_port}" \
-  MINIO_ACCESS_KEY=rust_toon \
-  MINIO_SECRET_KEY=rust_toon_password \
-  MINIO_BUCKET=rust-toon \
-  MINIO_BACKUP_DIR="$test_dir/backups" \
-    bash script/database/backup-minio.sh
+  S3_ENDPOINT="http://127.0.0.1:${s3_port}" \
+  S3_ACCESS_KEY=rust_toon \
+  S3_SECRET_KEY=rust_toon_password \
+  S3_BUCKET=rust-toon \
+  S3_BACKUP_DIR="$test_dir/backups" \
+    bash script/database/backup-s3.sh
 )"
 
 # A backup set ID is the public backup identifier. A second publication using
 # the same identifier must fail instead of nesting into or replacing the first.
-backup_set_id="${backup_path##*/rust-toon-minio-}"
+backup_set_id="${backup_path##*/rust-toon-s3-}"
 fixed_date_bin="$test_dir/fixed-date-bin"
 mkdir -p "$fixed_date_bin"
 printf '#!/usr/bin/env bash\nprintf "%%s\\n" "%s"\n' "$backup_set_id" \
@@ -95,17 +94,17 @@ printf '#!/usr/bin/env bash\nprintf "%%s\\n" "%s"\n' "$backup_set_id" \
 chmod 700 "$fixed_date_bin/date"
 if collision_output="$(
   PATH="$fixed_date_bin:$PATH" \
-  MINIO_ENDPOINT="http://127.0.0.1:${minio_port}" \
-  MINIO_ACCESS_KEY=rust_toon \
-  MINIO_SECRET_KEY=rust_toon_password \
-  MINIO_BUCKET=rust-toon \
-  MINIO_BACKUP_DIR="$test_dir/backups" \
-    bash script/database/backup-minio.sh 2>&1
+  S3_ENDPOINT="http://127.0.0.1:${s3_port}" \
+  S3_ACCESS_KEY=rust_toon \
+  S3_SECRET_KEY=rust_toon_password \
+  S3_BUCKET=rust-toon \
+  S3_BACKUP_DIR="$test_dir/backups" \
+    bash script/database/backup-s3.sh 2>&1
 )"; then
-  echo "a same-timestamp MinIO backup unexpectedly overwrote its destination" >&2
+  echo "a same-timestamp object storage backup unexpectedly overwrote its destination" >&2
   exit 1
 fi
-if [[ "$collision_output" != *"Refusing to overwrite existing MinIO backup"* ]]; then
+if [[ "$collision_output" != *"Refusing to overwrite existing object storage backup"* ]]; then
   echo "same-timestamp backup failed for an unexpected reason: $collision_output" >&2
   exit 1
 fi
@@ -113,18 +112,18 @@ fi
 # A competing publisher must report the set ID without an unset-variable error,
 # and must never remove a lock it does not own.
 lock_set_id="concurrent-set-test"
-competing_lock="$test_dir/backups/.rust-toon-minio-$lock_set_id.lock"
+competing_lock="$test_dir/backups/.rust-toon-s3-$lock_set_id.lock"
 mkdir "$competing_lock"
 if lock_output="$(
   BACKUP_SET_ID="$lock_set_id" \
-  MINIO_ENDPOINT="http://127.0.0.1:${minio_port}" \
-  MINIO_ACCESS_KEY=rust_toon \
-  MINIO_SECRET_KEY=rust_toon_password \
-  MINIO_BUCKET=rust-toon \
-  MINIO_BACKUP_DIR="$test_dir/backups" \
-    bash script/database/backup-minio.sh 2>&1
+  S3_ENDPOINT="http://127.0.0.1:${s3_port}" \
+  S3_ACCESS_KEY=rust_toon \
+  S3_SECRET_KEY=rust_toon_password \
+  S3_BUCKET=rust-toon \
+  S3_BACKUP_DIR="$test_dir/backups" \
+    bash script/database/backup-s3.sh 2>&1
 )"; then
-  echo "a concurrent MinIO backup unexpectedly acquired an existing lock" >&2
+  echo "a concurrent object storage backup unexpectedly acquired an existing lock" >&2
   exit 1
 fi
 if [[ "$lock_output" != *"backup set $lock_set_id"* ]]; then
@@ -132,7 +131,7 @@ if [[ "$lock_output" != *"backup set $lock_set_id"* ]]; then
   exit 1
 fi
 if [[ ! -d "$competing_lock" ]]; then
-  echo "a failed MinIO backup removed a publish lock it did not own" >&2
+  echo "a failed object storage backup removed a publish lock it did not own" >&2
   exit 1
 fi
 rmdir -- "$competing_lock"
@@ -230,20 +229,20 @@ run_restore --backup "$backup_path" --confirm >/dev/null
 
 restored="$(mc cat backup-test/rust-toon/episodes/episode-1-v1.mp4)"
 if [[ "$restored" != "merged-episode-render" ]]; then
-  echo "restored MinIO object did not match its source" >&2
+  echo "restored object did not match its source" >&2
   exit 1
 fi
 
 # An empty object bucket still has a checksummed manifest and must remain restorable.
 mc rm backup-test/rust-toon/episodes/episode-1-v1.mp4 >/dev/null
 empty_backup_path="$(
-  MINIO_ENDPOINT="http://127.0.0.1:${minio_port}" \
-  MINIO_ACCESS_KEY=rust_toon \
-  MINIO_SECRET_KEY=rust_toon_password \
-  MINIO_BUCKET=rust-toon \
-  MINIO_BACKUP_DIR="$test_dir/empty-backups" \
-    bash script/database/backup-minio.sh
+  S3_ENDPOINT="http://127.0.0.1:${s3_port}" \
+  S3_ACCESS_KEY=rust_toon \
+  S3_SECRET_KEY=rust_toon_password \
+  S3_BUCKET=rust-toon \
+  S3_BACKUP_DIR="$test_dir/empty-backups" \
+    bash script/database/backup-s3.sh
 )"
 run_restore --backup "$empty_backup_path" --confirm >/dev/null
 
-echo "MinIO backup/restore integrity, collision, bucket, and empty-bucket checks passed"
+echo "object storage backup/restore integrity, collision, bucket, and empty-bucket checks passed"

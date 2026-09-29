@@ -448,7 +448,7 @@ async fn process_storage_cleanup_row(
     {
         Ok(result) => result,
         Err(_) => Err(format!(
-            "删除 MinIO 对象超时（{} 秒）",
+            "删除对象存储对象超时（{} 秒）",
             operation_timeout.as_secs()
         )),
     };
@@ -934,7 +934,7 @@ mod agent_memory_database_tests {
                     .await
                     .unwrap(),
                 StorageObjectReference::ActiveJob,
-                "{state} source snapshot must protect its MinIO object"
+                "{state} source snapshot must protect its object-storage object"
             );
             tx.rollback().await.unwrap();
 

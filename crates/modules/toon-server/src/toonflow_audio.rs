@@ -417,7 +417,7 @@ pub async fn generate_dubbing(
                 return Err(AppError::bad_request(error));
             }
         };
-    // TTS providers return a data URL. Store the bytes in MinIO immediately so
+    // TTS providers return a data URL. Store the bytes in object storage immediately so
     // the audio can be reused by video export and does not bloat PostgreSQL.
     let url = if generated_url.starts_with("data:audio/") {
         let (extension, bytes) = decode_audio(&generated_url)?;

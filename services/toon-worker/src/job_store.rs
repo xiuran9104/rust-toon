@@ -694,7 +694,7 @@ fn staging_cleanup_delay_seconds() -> i64 {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| (60..=86_400).contains(value))
         .unwrap_or(1_800);
-    let stream_timeout = std::env::var("MINIO_STREAM_TIMEOUT_SECONDS")
+    let stream_timeout = std::env::var("S3_STREAM_TIMEOUT_SECONDS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| (30..=86_400).contains(value))

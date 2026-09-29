@@ -212,12 +212,7 @@ async fn d_create_list(
             .ok_or_else(|| AppError::not_found("知识库不存在"))?;
     let mut ids = Vec::new();
     for item in v.list {
-        let content = reqwest::get(&item.url)
-            .await
-            .map_err(|e| AppError::bad_request(format!("下载文档失败: {e}")))?
-            .text()
-            .await
-            .map_err(|_| AppError::bad_request("读取文档失败"))?;
+        let content = crate::knowledge_download::download_text(&s.pool, &item.url).await?;
         let document_id = id();
         let parts = vector::split(&content, v.segment_max_tokens.max(1) as usize);
         sqlx::query("INSERT INTO ai.knowledge_documents(id,knowledge_id,name,url,content,content_length,tokens,segment_max_tokens,create_time,update_time)VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$9)").bind(document_id).bind(v.knowledge_id).bind(item.name).bind(item.url).bind(&content).bind(content.chars().count() as i32).bind((content.chars().count()/4) as i32).bind(v.segment_max_tokens).bind(now()).execute(&s.pool).await.map_err(|_|AppError::internal("保存文档失败"))?;
@@ -447,15 +442,15 @@ struct Split {
     segment_max_tokens: usize,
 }
 async fn s_split(
-    _u: CurrentUser,
+    user: CurrentUser,
+    State(state): State<AiState>,
     Query(q): Query<Split>,
 ) -> Result<Json<ApiResponse<Vec<Value>>>, AppError> {
-    let content = reqwest::get(&q.url)
-        .await
-        .map_err(|e| AppError::bad_request(format!("下载文档失败: {e}")))?
-        .text()
-        .await
-        .map_err(|_| AppError::bad_request("读取文档失败"))?;
+    require(&user, "ai:knowledge:create")?;
+    if !(1..=32_768).contains(&q.segment_max_tokens) {
+        return Err(AppError::bad_request("segmentMaxTokens 必须在 1 到 32768 之间"));
+    }
+    let content = crate::knowledge_download::download_text(&state.pool, &q.url).await?;
     Ok(Json(ApiResponse::new(vector::split(&content,q.segment_max_tokens).into_iter().map(|content|json!({"contentLength":content.chars().count(),"tokens":content.chars().count()/4,"content":content})).collect())))
 }
 #[derive(Deserialize)]

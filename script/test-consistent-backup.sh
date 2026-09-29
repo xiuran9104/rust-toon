@@ -67,8 +67,8 @@ touch "$backup_path"
 printf '%s\n' "$backup_path"
 EOF
 
-fake_minio_backup="$test_dir/backup-minio"
-cat > "$fake_minio_backup" <<'EOF'
+fake_object_backup="$test_dir/backup-object-storage"
+cat > "$fake_object_backup" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -76,21 +76,21 @@ state_dir="${FAKE_SYSTEMCTL_STATE_DIR:?}"
 set_id="${BACKUP_SET_ID:?}"
 [[ ! -e "$state_dir/active-rust-toon-gateway.service" ]]
 [[ ! -e "$state_dir/active-rust-toon-worker.service" ]]
-printf '%s\n' "$set_id" > "$state_dir/minio-set-id"
-if [[ "${FAKE_MINIO_BACKUP_FAIL:-false}" == "true" ]]; then
+printf '%s\n' "$set_id" > "$state_dir/object-set-id"
+if [[ "${FAKE_OBJECT_BACKUP_FAIL:-false}" == "true" ]]; then
   exit 42
 fi
-backup_path="$state_dir/rust-toon-minio-$set_id"
+backup_path="$state_dir/rust-toon-s3-$set_id"
 mkdir "$backup_path"
 printf '%s\n' "$backup_path"
 EOF
-chmod 700 "$fake_systemctl" "$fake_postgres_backup" "$fake_minio_backup"
+chmod 700 "$fake_systemctl" "$fake_postgres_backup" "$fake_object_backup"
 
 run_coordinator() {
   FAKE_SYSTEMCTL_STATE_DIR="$state_dir" \
   SYSTEMCTL_BIN="$fake_systemctl" \
   POSTGRES_BACKUP_SCRIPT="$fake_postgres_backup" \
-  MINIO_BACKUP_SCRIPT="$fake_minio_backup" \
+  S3_BACKUP_SCRIPT="$fake_object_backup" \
   CONSISTENT_BACKUP_DIR="$test_dir/sets" \
   BACKUP_SYSTEMD_UNITS="rust-toon-gateway.service rust-toon-worker.service inactive.service" \
   BACKUP_SET_ID="$1" \
@@ -100,7 +100,7 @@ run_coordinator() {
 manifest="$(run_coordinator test-set-001)"
 [[ -f "$manifest" ]]
 [[ "$(cat "$state_dir/postgres-set-id")" == "test-set-001" ]]
-[[ "$(cat "$state_dir/minio-set-id")" == "test-set-001" ]]
+[[ "$(cat "$state_dir/object-set-id")" == "test-set-001" ]]
 [[ -f "$state_dir/active-rust-toon-gateway.service" ]]
 [[ -f "$state_dir/active-rust-toon-worker.service" ]]
 [[ ! -f "$state_dir/active-inactive.service" ]]
@@ -110,15 +110,15 @@ expected_actions=$'stop rust-toon-worker.service\nstop rust-toon-gateway.service
 
 jq -e \
   --arg postgres "$state_dir/rust-toon-test-set-001.dump" \
-  --arg minio "$state_dir/rust-toon-minio-test-set-001" \
+  --arg objectStorage "$state_dir/rust-toon-s3-test-set-001" \
   '.formatVersion == 1 and .setId == "test-set-001" and
    .consistency == "services-quiesced" and
    .quiescedUnits == ["rust-toon-gateway.service", "rust-toon-worker.service"] and
-   .postgresql == $postgres and .minio == $minio' \
+   .postgresql == $postgres and .objectStorage == $objectStorage' \
   "$manifest" >/dev/null
 
 : > "$state_dir/actions.log"
-if FAKE_MINIO_BACKUP_FAIL=true run_coordinator test-set-failure \
+if FAKE_OBJECT_BACKUP_FAIL=true run_coordinator test-set-failure \
   > "$test_dir/failure.out" 2> "$test_dir/failure.err"; then
   echo "consistent backup unexpectedly succeeded after a component failure" >&2
   exit 1

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-minio_endpoint="${MINIO_ENDPOINT:-http://127.0.0.1:9000}"
-minio_access_key="${MINIO_ACCESS_KEY:-}"
-minio_secret_key="${MINIO_SECRET_KEY:-}"
-minio_bucket="${MINIO_BUCKET:-rust-toon}"
+s3_endpoint="${S3_ENDPOINT:-http://127.0.0.1:9000}"
+s3_access_key="${S3_ACCESS_KEY:-}"
+s3_secret_key="${S3_SECRET_KEY:-}"
+s3_bucket="${S3_BUCKET:-rust-toon}"
 backup_path=""
 confirmed=false
 delete_extra=false
@@ -12,7 +12,7 @@ allow_bucket_mismatch=false
 
 usage() {
   echo "Usage: $0 --backup DIR --confirm [--bucket NAME] [--delete-extra] [--allow-bucket-mismatch]"
-  echo "MINIO_ACCESS_KEY and MINIO_SECRET_KEY must target the restore destination."
+  echo "S3_ACCESS_KEY and S3_SECRET_KEY must target the restore destination."
 }
 
 while (($#)); do
@@ -22,7 +22,7 @@ while (($#)); do
       shift 2
       ;;
     --bucket)
-      minio_bucket="${2:?--bucket requires a name}"
+      s3_bucket="${2:?--bucket requires a name}"
       shift 2
       ;;
     --delete-extra)
@@ -53,19 +53,19 @@ if [[ -z "$backup_path" || "$confirmed" != true ]]; then
   usage >&2
   exit 1
 fi
-if [[ -z "$minio_access_key" || -z "$minio_secret_key" ]]; then
-  echo "MINIO_ACCESS_KEY and MINIO_SECRET_KEY are required" >&2
+if [[ -z "$s3_access_key" || -z "$s3_secret_key" ]]; then
+  echo "S3_ACCESS_KEY and S3_SECRET_KEY are required" >&2
   exit 1
 fi
 backup_path="$(realpath -e -- "$backup_path")"
 if [[ ! -d "$backup_path/objects" || -L "$backup_path/objects" \
   || ! -f "$backup_path/manifest.json" || -L "$backup_path/manifest.json" \
   || ! -f "$backup_path/SHA256SUMS" || -L "$backup_path/SHA256SUMS" ]]; then
-  echo "Invalid MinIO backup directory: $backup_path" >&2
+  echo "Invalid object storage backup directory: $backup_path" >&2
   exit 1
 fi
 
-command -v mc >/dev/null || { echo "MinIO Client (mc) is required" >&2; exit 1; }
+command -v mc >/dev/null || { echo "S3 client (mc) is required" >&2; exit 1; }
 command -v cmp >/dev/null || { echo "cmp is required" >&2; exit 1; }
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
 command -v sha256sum >/dev/null || { echo "sha256sum is required" >&2; exit 1; }
@@ -78,8 +78,8 @@ is_valid_bucket_name() {
     && [[ ! "$bucket" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
 }
 
-if ! is_valid_bucket_name "$minio_bucket"; then
-  echo "Invalid target MinIO bucket name: $minio_bucket" >&2
+if ! is_valid_bucket_name "$s3_bucket"; then
+  echo "Invalid target bucket name: $s3_bucket" >&2
   exit 1
 fi
 
@@ -107,10 +107,10 @@ if ! manifest_bucket_json="$(
     end
   ' "$backup_path/manifest.json" 2>/dev/null
 )"; then
-  echo "Invalid MinIO backup manifest: expected formatVersion 1 and a bucket string" >&2
+  echo "Invalid object storage backup manifest: expected formatVersion 1 and a bucket string" >&2
   exit 1
 fi
-target_bucket_json="$(jq -cn --arg bucket "$minio_bucket" '$bucket')"
+target_bucket_json="$(jq -cn --arg bucket "$s3_bucket" '$bucket')"
 if [[ "$manifest_bucket_json" != "$target_bucket_json" && "$allow_bucket_mismatch" != true ]]; then
   echo "Backup bucket $manifest_bucket_json does not match target bucket $target_bucket_json; use --allow-bucket-mismatch for an intentional cross-bucket restore" >&2
   exit 1
@@ -127,7 +127,7 @@ cleanup() {
 trap cleanup EXIT
 
 if [[ -n "$(find "$backup_path" -mindepth 1 ! -type d ! -type f -print -quit)" ]]; then
-  echo "Invalid MinIO backup: symlinks and special files are not allowed" >&2
+  echo "Invalid object storage backup: symlinks and special files are not allowed" >&2
   exit 1
 fi
 
@@ -152,14 +152,14 @@ fi
 mc_config_dir="$(mktemp -d)"
 
 MC_CONFIG_DIR="$mc_config_dir" mc alias set rust-toon-target \
-  "$minio_endpoint" "$minio_access_key" "$minio_secret_key" >/dev/null
-MC_CONFIG_DIR="$mc_config_dir" mc mb --ignore-existing "rust-toon-target/$minio_bucket" >/dev/null
+  "$s3_endpoint" "$s3_access_key" "$s3_secret_key" >/dev/null
+MC_CONFIG_DIR="$mc_config_dir" mc mb --ignore-existing "rust-toon-target/$s3_bucket" >/dev/null
 
 mirror_args=(--quiet --overwrite --preserve)
 if [[ "$delete_extra" == true ]]; then
   mirror_args+=(--remove)
 fi
 MC_CONFIG_DIR="$mc_config_dir" mc mirror "${mirror_args[@]}" \
-  "$backup_path/objects" "rust-toon-target/$minio_bucket" >/dev/null
+  "$backup_path/objects" "rust-toon-target/$s3_bucket" >/dev/null
 
-echo "MinIO restore completed. Run /readyz and an object-reference audit before enabling traffic."
+echo "Object storage restore completed. Run /readyz and an object-reference audit before enabling traffic."

@@ -3,13 +3,13 @@ set -euo pipefail
 
 postgres_container="rust-toon-production-e2e-postgres"
 nats_container="rust-toon-production-e2e-nats"
-minio_container="rust-toon-production-e2e-minio"
+s3_container="rust-toon-production-e2e-s3"
 postgres_port="${TEST_PRODUCTION_POSTGRES_PORT:-55435}"
 nats_port="${TEST_PRODUCTION_NATS_PORT:-54224}"
 nats_monitor_port="${TEST_PRODUCTION_NATS_MONITOR_PORT:-58224}"
-minio_port="${TEST_PRODUCTION_MINIO_PORT:-59002}"
+s3_port="${TEST_PRODUCTION_S3_PORT:-59002}"
 worker_port="${TEST_PRODUCTION_WORKER_PORT:-58103}"
-minio_image="${MINIO_IMAGE:-minio/minio:RELEASE.2025-04-22T22-12-26Z}"
+s3_image="${S3_IMAGE:-rustfs/rustfs:1.0.0}"
 upload_dir="$(mktemp -d)"
 worker_pid=""
 cleanup() {
@@ -17,11 +17,11 @@ cleanup() {
     kill "$worker_pid" >/dev/null 2>&1 || true
     wait "$worker_pid" >/dev/null 2>&1 || true
   fi
-  docker rm -f "$postgres_container" "$nats_container" "$minio_container" >/dev/null 2>&1 || true
+  docker rm -f "$postgres_container" "$nats_container" "$s3_container" >/dev/null 2>&1 || true
   rm -rf -- "$upload_dir"
 }
 trap cleanup EXIT
-docker rm -f "$postgres_container" "$nats_container" "$minio_container" >/dev/null 2>&1 || true
+docker rm -f "$postgres_container" "$nats_container" "$s3_container" >/dev/null 2>&1 || true
 
 for command_name in cargo curl docker ffmpeg; do
   command -v "$command_name" >/dev/null 2>&1 || {
@@ -39,11 +39,10 @@ docker run -d --name "$nats_container" \
   -p "$nats_port:4222" \
   -p "$nats_monitor_port:8222" \
   nats:2 --jetstream --store_dir=/data --http_port=8222 >/dev/null
-docker run -d --name "$minio_container" \
-  -e MINIO_ROOT_USER=rust_toon \
-  -e MINIO_ROOT_PASSWORD=rust_toon_password \
-  -p "$minio_port:9000" "$minio_image" \
-  server /data >/dev/null
+docker run -d --name "$s3_container" \
+  -e RUSTFS_ACCESS_KEY=rust_toon \
+  -e RUSTFS_SECRET_KEY=rust_toon_password \
+  -p "$s3_port:9000" "$s3_image" >/dev/null
 
 for _ in $(seq 1 30); do
   docker exec "$postgres_container" pg_isready -h 127.0.0.1 -p 5432 -U rust_toon -d rust_toon_test >/dev/null 2>&1 && break
@@ -52,10 +51,10 @@ done
 docker exec "$postgres_container" pg_isready -h 127.0.0.1 -p 5432 -U rust_toon -d rust_toon_test >/dev/null
 
 for _ in $(seq 1 45); do
-  curl -fsS "http://127.0.0.1:${minio_port}/minio/health/ready" >/dev/null 2>&1 && break
+  curl -fsS "http://127.0.0.1:${s3_port}/health" >/dev/null 2>&1 && break
   sleep 1
 done
-curl -fsS "http://127.0.0.1:${minio_port}/minio/health/ready" >/dev/null
+curl -fsS "http://127.0.0.1:${s3_port}/health" >/dev/null
 
 for _ in $(seq 1 45); do
   curl -fsS "http://127.0.0.1:${nats_monitor_port}/healthz?js-enabled-only=true" \
@@ -68,10 +67,10 @@ export TEST_DATABASE_URL="postgres://rust_toon:rust_toon@127.0.0.1:${postgres_po
 export DATABASE_URL="$TEST_DATABASE_URL"
 export TEST_UPLOAD_DIR="$upload_dir"
 export NATS_URL="nats://127.0.0.1:${nats_port}"
-export MINIO_ENDPOINT="http://127.0.0.1:${minio_port}"
-export MINIO_ACCESS_KEY="rust_toon"
-export MINIO_SECRET_KEY="rust_toon_password"
-export MINIO_BUCKET="rust-toon"
+export S3_ENDPOINT="http://127.0.0.1:${s3_port}"
+export S3_ACCESS_KEY="rust_toon"
+export S3_SECRET_KEY="rust_toon_password"
+export S3_BUCKET="rust-toon"
 
 # The gateway owns schema initialization in production. Run the same SQLx
 # migration chain before starting the independent worker, then exercise the

@@ -3,12 +3,12 @@ set -euo pipefail
 
 postgres_container="rust-toon-gateway-e2e-postgres"
 redis_container="rust-toon-gateway-e2e-redis"
-minio_container="rust-toon-gateway-e2e-minio"
+s3_container="rust-toon-gateway-e2e-s3"
 postgres_port="${TEST_GATEWAY_POSTGRES_PORT:-55436}"
 redis_port="${TEST_GATEWAY_REDIS_PORT:-56380}"
-minio_port="${TEST_GATEWAY_MINIO_PORT:-59000}"
+s3_port="${TEST_GATEWAY_S3_PORT:-59000}"
 gateway_port="${TEST_GATEWAY_PORT:-58081}"
-minio_image="${MINIO_IMAGE:-minio/minio:RELEASE.2025-04-22T22-12-26Z}"
+s3_image="${S3_IMAGE:-rustfs/rustfs:1.0.0}"
 work_dir="$(mktemp -d)"
 gateway_pid=""
 completed=false
@@ -18,7 +18,7 @@ cleanup() {
     kill "$gateway_pid" >/dev/null 2>&1 || true
     wait "$gateway_pid" >/dev/null 2>&1 || true
   fi
-  docker rm -f "$postgres_container" "$redis_container" "$minio_container" >/dev/null 2>&1 || true
+  docker rm -f "$postgres_container" "$redis_container" "$s3_container" >/dev/null 2>&1 || true
   if [[ "$completed" != true && -f "$work_dir/gateway.log" ]]; then
     echo "Gateway log:" >&2
     tail -n 200 "$work_dir/gateway.log" >&2 || true
@@ -26,7 +26,7 @@ cleanup() {
   rm -rf -- "$work_dir"
 }
 trap cleanup EXIT
-docker rm -f "$postgres_container" "$redis_container" "$minio_container" >/dev/null 2>&1 || true
+docker rm -f "$postgres_container" "$redis_container" "$s3_container" >/dev/null 2>&1 || true
 
 for command_name in cargo curl docker ffmpeg ffprobe node; do
   command -v "$command_name" >/dev/null || {
@@ -42,11 +42,10 @@ docker run -d --name "$postgres_container" \
   -p "$postgres_port:5432" postgres:18 >/dev/null
 docker run -d --name "$redis_container" \
   -p "$redis_port:6379" redis:8 >/dev/null
-docker run -d --name "$minio_container" \
-  -e MINIO_ROOT_USER=rust_toon \
-  -e MINIO_ROOT_PASSWORD=rust_toon_password \
-  -p "$minio_port:9000" "$minio_image" \
-  server /data >/dev/null
+docker run -d --name "$s3_container" \
+  -e RUSTFS_ACCESS_KEY=rust_toon \
+  -e RUSTFS_SECRET_KEY=rust_toon_password \
+  -p "$s3_port:9000" "$s3_image" >/dev/null
 
 for _ in $(seq 1 45); do
   docker exec "$postgres_container" pg_isready -h 127.0.0.1 -p 5432 -U rust_toon -d rust_toon_test >/dev/null 2>&1 && break
@@ -61,10 +60,10 @@ done
 docker exec "$redis_container" redis-cli ping | grep -q '^PONG$'
 
 for _ in $(seq 1 45); do
-  curl -fsS "http://127.0.0.1:${minio_port}/minio/health/ready" >/dev/null 2>&1 && break
+  curl -fsS "http://127.0.0.1:${s3_port}/health" >/dev/null 2>&1 && break
   sleep 1
 done
-curl -fsS "http://127.0.0.1:${minio_port}/minio/health/ready" >/dev/null
+curl -fsS "http://127.0.0.1:${s3_port}/health" >/dev/null
 
 cargo build -p rust-toon-gateway
 
@@ -73,12 +72,12 @@ export REDIS_URL="redis://127.0.0.1:${redis_port}"
 export JWT_SECRET="gateway-e2e-secret-with-at-least-32-bytes"
 export GATEWAY_HOST="127.0.0.1"
 export GATEWAY_PORT="$gateway_port"
-export MINIO_ENDPOINT="http://127.0.0.1:${minio_port}"
-export MINIO_ACCESS_KEY="rust_toon"
-export MINIO_SECRET_KEY="rust_toon_password"
-export MINIO_BUCKET="rust-toon"
+export S3_ENDPOINT="http://127.0.0.1:${s3_port}"
+export S3_ACCESS_KEY="rust_toon"
+export S3_SECRET_KEY="rust_toon_password"
+export S3_BUCKET="rust-toon"
 export READINESS_REQUIRE_REDIS="true"
-export READINESS_REQUIRE_MINIO="true"
+export READINESS_REQUIRE_OBJECT_STORAGE="true"
 export READINESS_REQUIRE_FFMPEG="true"
 export RATE_LIMIT_MAX_REQUESTS="2"
 export RUST_LOG="warn"
@@ -162,28 +161,28 @@ if [[ "$probe_audit_count" != "0" ]]; then
 fi
 
 # The object-store probe uses the configured credentials and bucket rather
-# than MinIO's anonymous process-health endpoint.
-docker stop "$minio_container" >/dev/null
+# than the storage engine's anonymous process-health endpoint.
+docker stop "$s3_container" >/dev/null
 curl -fsS "http://127.0.0.1:${gateway_port}/livez" >/dev/null
 curl -fsS "http://127.0.0.1:${gateway_port}/health" >/dev/null
-minio_readiness_status="$(
+object_storage_readiness_status="$(
   curl -sS \
-    -o "$work_dir/minio-not-ready.json" \
+    -o "$work_dir/object-storage-not-ready.json" \
     -w '%{http_code}' \
     "http://127.0.0.1:${gateway_port}/readyz"
 )"
-if [[ "$minio_readiness_status" != "503" ]]; then
-  echo "Expected /readyz to return 503 after MinIO stopped; got $minio_readiness_status" >&2
+if [[ "$object_storage_readiness_status" != "503" ]]; then
+  echo "Expected /readyz to return 503 after object storage stopped; got $object_storage_readiness_status" >&2
   exit 1
 fi
 node -e '
   const fs = require("node:fs");
   const health = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-  if (health.status !== "unavailable" || health.checks?.minio?.status !== "failed") {
+  if (health.status !== "unavailable" || health.checks?.objectStorage?.status !== "failed") {
     throw new Error(`unexpected object-storage readiness body: ${JSON.stringify(health)}`);
   }
-' "$work_dir/minio-not-ready.json"
-docker start "$minio_container" >/dev/null
+' "$work_dir/object-storage-not-ready.json"
+docker start "$s3_container" >/dev/null
 for _ in $(seq 1 45); do
   curl -fsS "http://127.0.0.1:${gateway_port}/readyz" >/dev/null 2>&1 && break
   sleep 1

@@ -3,12 +3,12 @@ set -euo pipefail
 
 postgres_container="rust-toon-distributed-e2e-postgres"
 nats_container="rust-toon-distributed-e2e-nats"
-minio_container="rust-toon-distributed-e2e-minio"
+s3_container="rust-toon-distributed-e2e-s3"
 nats_volume="rust-toon-distributed-e2e-nats-data"
 postgres_port="${TEST_DISTRIBUTED_POSTGRES_PORT:-55437}"
 nats_port="${TEST_DISTRIBUTED_NATS_PORT:-54222}"
 nats_monitor_port="${TEST_DISTRIBUTED_NATS_MONITOR_PORT:-58222}"
-minio_port="${TEST_DISTRIBUTED_MINIO_PORT:-59003}"
+s3_port="${TEST_DISTRIBUTED_S3_PORT:-59003}"
 gateway_port="${TEST_DISTRIBUTED_GATEWAY_PORT:-58082}"
 worker_a_port="${TEST_DISTRIBUTED_WORKER_A_PORT:-58101}"
 worker_b_port="${TEST_DISTRIBUTED_WORKER_B_PORT:-58102}"
@@ -25,7 +25,7 @@ cleanup() {
       wait "$process_id" >/dev/null 2>&1 || true
     fi
   done
-  docker rm -f "$postgres_container" "$nats_container" "$minio_container" \
+  docker rm -f "$postgres_container" "$nats_container" "$s3_container" \
     >/dev/null 2>&1 || true
   docker volume rm "$nats_volume" >/dev/null 2>&1 || true
   if [[ "$completed" != true ]]; then
@@ -47,7 +47,7 @@ for command_name in cargo curl docker node; do
   }
 done
 
-docker rm -f "$postgres_container" "$nats_container" "$minio_container" \
+docker rm -f "$postgres_container" "$nats_container" "$s3_container" \
   >/dev/null 2>&1 || true
 docker volume rm "$nats_volume" >/dev/null 2>&1 || true
 docker volume create "$nats_volume" >/dev/null
@@ -62,11 +62,11 @@ docker run -d --name "$nats_container" \
   -p "$nats_port:4222" \
   -p "$nats_monitor_port:8222" \
   nats:2 --jetstream --store_dir=/data --http_port=8222 >/dev/null
-docker run -d --name "$minio_container" \
-  -e MINIO_ROOT_USER=rust_toon \
-  -e MINIO_ROOT_PASSWORD=rust_toon_password \
-  -p "$minio_port:9000" \
-  minio/minio:RELEASE.2025-04-22T22-12-26Z server /data >/dev/null
+docker run -d --name "$s3_container" \
+  -e RUSTFS_ACCESS_KEY=rust_toon \
+  -e RUSTFS_SECRET_KEY=rust_toon_password \
+  -p "$s3_port:9000" \
+  rustfs/rustfs:1.0.0 >/dev/null
 
 for _ in $(seq 1 45); do
   docker exec "$postgres_container" \
@@ -88,15 +88,18 @@ curl -fsS \
   >/dev/null
 
 for _ in $(seq 1 45); do
-  curl -fsS "http://127.0.0.1:${minio_port}/minio/health/ready" \
+  curl -fsS "http://127.0.0.1:${s3_port}/health" \
     >/dev/null 2>&1 && break
   sleep 1
 done
-curl -fsS "http://127.0.0.1:${minio_port}/minio/health/ready" >/dev/null
-docker exec "$minio_container" \
-  mc alias set local http://127.0.0.1:9000 rust_toon rust_toon_password \
-  >/dev/null
-docker exec "$minio_container" mc mb --ignore-existing local/rust-toon >/dev/null
+curl -fsS "http://127.0.0.1:${s3_port}/health" >/dev/null
+# RustFS does not bundle an S3 client; run mc in a sidecar sharing the storage
+# container's network namespace so 127.0.0.1:9000 reaches the S3 API.
+mc_image="${S3_MC_IMAGE:-minio/mc:RELEASE.2025-04-16T18-13-26Z}"
+docker pull "$mc_image" >/dev/null
+MC_HOST_local="http://rust_toon:rust_toon_password@127.0.0.1:9000" \
+  docker run --rm --network "container:$s3_container" "$mc_image" \
+  mb --ignore-existing local/rust-toon >/dev/null
 
 cargo build -p rust-toon-gateway -p rust-toon-worker
 
@@ -104,14 +107,14 @@ export DATABASE_URL="postgres://rust_toon:rust_toon@127.0.0.1:${postgres_port}/r
 export JWT_SECRET="distributed-e2e-secret-with-at-least-32-bytes"
 export RUST_ENV="development"
 export RUST_LOG="warn"
-export MINIO_ENDPOINT="http://127.0.0.1:${minio_port}"
-export MINIO_ACCESS_KEY="rust_toon"
-export MINIO_SECRET_KEY="rust_toon_password"
-export MINIO_BUCKET="rust-toon"
+export S3_ENDPOINT="http://127.0.0.1:${s3_port}"
+export S3_ACCESS_KEY="rust_toon"
+export S3_SECRET_KEY="rust_toon_password"
+export S3_BUCKET="rust-toon"
 export GATEWAY_HOST="127.0.0.1"
 export GATEWAY_PORT="$gateway_port"
 export READINESS_REQUIRE_REDIS="false"
-export READINESS_REQUIRE_MINIO="false"
+export READINESS_REQUIRE_OBJECT_STORAGE="false"
 export READINESS_REQUIRE_FFMPEG="false"
 
 ./target/debug/rust-toon-gateway >"$work_dir/gateway.log" 2>&1 &

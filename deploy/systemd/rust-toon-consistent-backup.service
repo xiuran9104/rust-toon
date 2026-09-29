@@ -1,5 +1,5 @@
 [Unit]
-Description=Rust Toon consistent PostgreSQL and MinIO backup set
+Description=Rust Toon consistent PostgreSQL and object storage backup set
 After=network-online.target
 Wants=network-online.target
 

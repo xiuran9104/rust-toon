@@ -26,7 +26,7 @@ Rust Toon 是面向动漫/短剧生产的 AI 工作台。后端使用 Rust，前
 bash script/start-local.sh all
 ```
 
-完整栈模式会依次启动 PostgreSQL、Redis、JetStream、MinIO、r-nacos、Gateway、Toon Worker 和前端，并等待网关迁移完成后才启动 Worker。其他模式：
+完整栈模式会依次启动 PostgreSQL、Redis、JetStream、RustFS、r-nacos、Gateway、Toon Worker 和前端，并等待网关迁移完成后才启动 Worker。其他模式：
 
 - `infra`：只启动基础设施。
 - `gateway` / `worker`：启动基础设施后，在前台运行指定服务；单独使用 `worker` 前必须已有就绪的 Gateway 完成迁移。
@@ -38,7 +38,7 @@ bash script/start-local.sh all
 - 前端：`http://127.0.0.1:5666`
 - Gateway 就绪：`http://127.0.0.1:8080/readyz`
 - Worker 就绪：`http://127.0.0.1:8081/readyz`
-- MinIO：`http://127.0.0.1:9001`
+- RustFS 控制台：`http://127.0.0.1:9001`
 - r-nacos：`http://127.0.0.1:10848`
 
 本地应用账号为 `admin` / `admin123`。该账号由数据库基线迁移创建，启动环境变量不会创建或重置管理员；首次登录后请立即修改密码。端口冲突、保留已有数据或手动分终端启动时，按[部署文档的本地开发章节](docs/deployment.md#2-本地开发)操作。
@@ -52,7 +52,7 @@ bash script/test-gateway-e2e.sh
 bash script/test-ai-e2e.sh
 bash script/test-production-e2e.sh
 bash script/test-rnacos-dynamic-config.sh
-bash script/test-minio-backup.sh
+bash script/test-s3-backup.sh
 pnpm --dir apps/web run test:unit
 pnpm --dir apps/web --filter @vben/web-antd run typecheck
 pnpm --dir apps/web --filter @vben/web-antd run build
@@ -80,4 +80,4 @@ bash script/test-real-ai-providers.sh
 
 ## 数据库备份
 
-PostgreSQL 与 MinIO 必须作为同一个恢复集备份。生产入口是 `script/database/backup-consistent-set.sh`；恢复命令、保留策略和 systemd timer 见[部署文档](docs/deployment.md#47-备份与恢复)。
+PostgreSQL 与对象存储必须作为同一个恢复集备份。生产入口是 `script/database/backup-consistent-set.sh`；恢复命令、保留策略和 systemd timer 见[部署文档](docs/deployment.md#47-备份与恢复)。

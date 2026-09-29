@@ -9,6 +9,7 @@ repository.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 chrono.workspace = true
+futures-util.workspace = true
 rust-toon-framework-common.workspace = true
 rust-toon-framework-database.workspace = true
 rust-toon-framework-dynamic-config.workspace = true

@@ -8,7 +8,7 @@ This file contains the repository invariants and safety rules for AI coding agen
 - Frontend: Vben Admin app at `apps/web`, main app package `@vben/web-antd`.
 - Database migrations: `sql/postgresql`, executed automatically by the Rust gateway on startup. `0001_initial.sql` is the consolidated schema and baseline data.
 - Bootstrap reference: `sql/bootstrap/current.sql` is a reference-only `pg_dump` snapshot and is never loaded by the application. The migration chain is sufficient to initialize a new server without `current.sql`.
-- Local infrastructure: PostgreSQL, Redis, NATS, MinIO, and r-nacos via `script/docker/docker-compose.yml`.
+- Local infrastructure: PostgreSQL, Redis, NATS, RustFS, and r-nacos via `script/docker/docker-compose.yml`.
 
 The durable worker is horizontally scalable. Keep the current Gateway at one production replica: Toon Agent/Workflow live-run registries are still process-local even though video export and cleanup jobs are distributed. Do not advertise or configure Gateway horizontal scaling until those realtime runtimes are migrated to durable workers.
 
@@ -38,7 +38,7 @@ Available modes are `infra`, `gateway`, `worker`, `backend`, and `all`. The `bac
 
 For manual debugging, start services in this order:
 
-1. PostgreSQL, Redis, NATS with JetStream, MinIO, and r-nacos.
+1. PostgreSQL, Redis, NATS with JetStream, RustFS, and r-nacos.
 2. Gateway; wait for `/readyz` so migrations have committed.
 3. Toon Worker.
 4. Vben frontend.
@@ -50,7 +50,7 @@ Open:
 - Backend liveness/readiness: `http://127.0.0.1:8080/livez`, `http://127.0.0.1:8080/readyz`
 - Worker liveness/readiness: `http://127.0.0.1:8081/livez`, `http://127.0.0.1:8081/readyz`
 - OpenAPI: `http://127.0.0.1:8080/openapi.json`
-- MinIO console: `http://127.0.0.1:9001`
+- RustFS console: `http://127.0.0.1:9001`
 - r-nacos console: `http://127.0.0.1:10848`
 
 Default local application account:
@@ -74,7 +74,7 @@ bash script/test-gateway-e2e.sh
 bash script/test-production-e2e.sh
 bash script/test-distributed-jobs-e2e.sh
 bash script/test-rnacos-dynamic-config.sh
-bash script/test-minio-backup.sh
+bash script/test-s3-backup.sh
 pnpm --dir apps/web run test:unit
 pnpm --dir apps/web --filter @vben/web-antd run typecheck
 ```
@@ -94,19 +94,19 @@ Production invariants:
 - Run exactly one Gateway replica until Agent/Workflow live-run coordination is durable.
 - Scale media capacity through Toon Worker replicas.
 - Start Workers only after Gateway readiness confirms migrations have completed.
-- Keep PostgreSQL, Redis, NATS, MinIO, and r-nacos credentials outside Git.
+- Keep PostgreSQL, Redis, NATS, RustFS, and r-nacos credentials outside Git.
 - Worker nodes need FFmpeg and FFprobe; Gateway nodes do not execute video merges.
 - Serve frontend static output through a reverse proxy/CDN and keep `/metrics` off public routes.
 
 ## Backups
 
-Back up PostgreSQL and MinIO as one recovery set. The production entrypoint is:
+Back up PostgreSQL and object storage as one recovery set. The production entrypoint is:
 
 ```bash
 sudo bash script/database/backup-consistent-set.sh
 ```
 
-The coordinator gracefully stops the configured Gateway/Worker systemd units, runs both component backups with the same `BACKUP_SET_ID`, publishes a set manifest, and restarts only units that were active. The matching restore scripts require an explicit `--confirm`. See `docs/deployment.md#47-备份与恢复`; do not reconstruct a recovery set by pairing unrelated PostgreSQL and MinIO backups.
+The coordinator gracefully stops the configured Gateway/Worker systemd units, runs both component backups with the same `BACKUP_SET_ID`, publishes a set manifest, and restarts only units that were active. The matching restore scripts require an explicit `--confirm`. See `docs/deployment.md#47-备份与恢复`; do not reconstruct a recovery set by pairing unrelated PostgreSQL and object storage backups.
 
 ## Common Problems
 
@@ -116,6 +116,6 @@ The coordinator gracefully stops the configured Gateway/Worker systemd units, ru
 - Repeated local login failures: the baseline account is `admin` / `admin123`; five failures trigger a persistent temporary lockout.
 - Frontend API 404: check `VITE_BASE_URL`, `VITE_GLOB_API_URL`, and Nginx `/api/` proxy prefix handling.
 - SSE responses arrive all at once: disable proxy buffering and increase read timeout.
-- `/readyz` returns 503: inspect the per-dependency checks and verify PostgreSQL plus required Redis/MinIO/FFmpeg endpoints.
+- `/readyz` returns 503: inspect the per-dependency checks and verify PostgreSQL plus required Redis/object-storage/FFmpeg endpoints.
 - Queued video exports never start: verify at least one worker is ready and NATS has JetStream enabled; check `toonflow.distributed_jobs` for `last_error` and lease state.
 - Port already in use: check `ss -ltnp | rg ':(8080|8081|5666|4222|5432|6379)'`.

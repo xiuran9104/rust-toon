@@ -22,13 +22,13 @@ fn hmac(key: &[u8], data: &str) -> Result<Vec<u8>, String> {
 }
 
 async fn request(method: Method, key: &str, body: Vec<u8>) -> Result<reqwest::Response, String> {
-    let endpoint = value("MINIO_ENDPOINT", "http://127.0.0.1:9000")
+    let endpoint = value("S3_ENDPOINT", "http://127.0.0.1:9000")
         .trim_end_matches('/')
         .to_owned();
-    let access = value("MINIO_ACCESS_KEY", "rust_toon");
-    let secret = value("MINIO_SECRET_KEY", "rust_toon_password");
-    let bucket = value("MINIO_BUCKET", "rust-toon");
-    let region = value("MINIO_REGION", "us-east-1");
+    let access = value("S3_ACCESS_KEY", "rust_toon");
+    let secret = value("S3_SECRET_KEY", "rust_toon_password");
+    let bucket = value("S3_BUCKET", "rust-toon");
+    let region = value("S3_REGION", "us-east-1");
     let uri = format!("/{bucket}/{}", key.trim_start_matches('/'));
     let url = Url::parse(&format!("{endpoint}{uri}")).map_err(|error| error.to_string())?;
     let host = match url.port() {
@@ -76,7 +76,7 @@ fn storage_client() -> &'static ResilientHttpClient {
     static CLIENT: OnceLock<ResilientHttpClient> = OnceLock::new();
     CLIENT.get_or_init(|| {
         let timeout = Duration::from_secs(
-            std::env::var("MINIO_REQUEST_TIMEOUT_SECONDS")
+            std::env::var("S3_REQUEST_TIMEOUT_SECONDS")
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(30)
@@ -103,24 +103,42 @@ fn storage_client() -> &'static ResilientHttpClient {
 pub async fn put(key: &str, bytes: Vec<u8>) -> Result<(), String> {
     let bucket = request(Method::PUT, "", Vec::new()).await?;
     if !bucket.status().is_success() && bucket.status().as_u16() != 409 {
-        return Err(format!("MinIO bucket 初始化失败：HTTP {}", bucket.status()));
+        return Err(format!("对象存储 bucket 初始化失败：HTTP {}", bucket.status()));
     }
     let response = request(Method::PUT, key, bytes).await?;
     if response.status().is_success() {
         Ok(())
     } else {
-        Err(format!("MinIO 上传失败：HTTP {}", response.status()))
+        Err(format!("对象存储上传失败：HTTP {}", response.status()))
     }
 }
 
 pub async fn get(key: &str) -> Result<Vec<u8>, String> {
     let response = request(Method::GET, key, Vec::new()).await?;
     if !response.status().is_success() {
-        return Err(format!("MinIO 读取失败：HTTP {}", response.status()));
+        return Err(format!("对象存储读取失败：HTTP {}", response.status()));
     }
     response
         .bytes()
         .await
         .map(|bytes| bytes.to_vec())
         .map_err(|error| error.to_string())
+}
+
+pub async fn get_bounded(key: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
+    let mut response = request(Method::GET, key, Vec::new()).await?;
+    if !response.status().is_success() {
+        return Err("读取上传文件失败".into());
+    }
+    if response.content_length().is_some_and(|length| length > max_bytes as u64) {
+        return Err("上传文件超过知识库读取上限".into());
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| "读取上传文件失败")? {
+        if bytes.len().saturating_add(chunk.len()) > max_bytes {
+            return Err("上传文件超过知识库读取上限".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }

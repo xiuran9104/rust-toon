@@ -110,10 +110,10 @@ secret_examples = load_documents(secret_path)
 secret_requirements = {
   "rust-toon-gateway-secrets" => %w[
     DATABASE_URL REDIS_URL JWT_SECRET SECRET_ENCRYPTION_KEY
-    MINIO_ACCESS_KEY MINIO_SECRET_KEY NACOS_USERNAME NACOS_PASSWORD
+    S3_ACCESS_KEY S3_SECRET_KEY NACOS_USERNAME NACOS_PASSWORD
   ],
   "rust-toon-worker-secrets" => %w[
-    DATABASE_URL MINIO_ACCESS_KEY MINIO_SECRET_KEY NATS_URL
+    DATABASE_URL S3_ACCESS_KEY S3_SECRET_KEY NATS_URL
     NACOS_USERNAME NACOS_PASSWORD
   ],
   "rust-toon-rnacos-secrets" => %w[
@@ -278,8 +278,8 @@ assert(worker_config.dig("data", "TOON_WORKER_CONCURRENCY") == "1",
        "Worker base concurrency must preserve temporary-disk headroom")
 assert(gateway_config.dig("data", "READINESS_REQUIRE_REDIS") == "true",
        "Gateway readiness must require Redis")
-assert(gateway_config.dig("data", "READINESS_REQUIRE_MINIO") == "true",
-       "Gateway readiness must require MinIO")
+assert(gateway_config.dig("data", "READINESS_REQUIRE_OBJECT_STORAGE") == "true",
+       "Gateway readiness must require object storage")
 assert(gateway_config.dig("data", "TELEMETRY_LOG_FORMAT") == "json" &&
        worker_config.dig("data", "TELEMETRY_LOG_FORMAT") == "json",
        "Kubernetes workloads must emit production JSON logs")

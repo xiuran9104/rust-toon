@@ -15,11 +15,10 @@ use tokio_util::io::ReaderStream;
 
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::{HeaderMap, HeaderValue, Response, StatusCode, header as http_header},
 };
 use rust_toon_framework_security::CurrentUser;
-use serde::Deserialize;
 
 use crate::{ToonState, shared::require, toonflow_episode_renders::ensure_project_access};
 
@@ -35,19 +34,19 @@ fn timeout_from_env(name: &str, default: u64, minimum: u64, maximum: u64) -> Dur
     )
 }
 
-fn minio_connect_timeout() -> Duration {
-    timeout_from_env("MINIO_CONNECT_TIMEOUT_SECONDS", 10, 1, 300)
+fn s3_connect_timeout() -> Duration {
+    timeout_from_env("S3_CONNECT_TIMEOUT_SECONDS", 10, 1, 300)
 }
 
-fn minio_request_timeout() -> Duration {
-    timeout_from_env("MINIO_REQUEST_TIMEOUT_SECONDS", 30, 1, 3_600)
+fn s3_request_timeout() -> Duration {
+    timeout_from_env("S3_REQUEST_TIMEOUT_SECONDS", 30, 1, 3_600)
 }
 
-fn minio_stream_timeout() -> Duration {
-    timeout_from_env("MINIO_STREAM_TIMEOUT_SECONDS", 1_800, 30, 86_400)
+fn s3_stream_timeout() -> Duration {
+    timeout_from_env("S3_STREAM_TIMEOUT_SECONDS", 1_800, 30, 86_400)
 }
 
-struct MinioConfig {
+struct S3Config {
     endpoint: String,
     access_key: String,
     secret_key: String,
@@ -55,17 +54,17 @@ struct MinioConfig {
     region: String,
 }
 
-fn config() -> MinioConfig {
-    MinioConfig {
-        endpoint: std::env::var("MINIO_ENDPOINT")
+fn config() -> S3Config {
+    S3Config {
+        endpoint: std::env::var("S3_ENDPOINT")
             .unwrap_or_else(|_| "http://127.0.0.1:9000".to_string())
             .trim_end_matches('/')
             .to_string(),
-        access_key: std::env::var("MINIO_ACCESS_KEY").unwrap_or_else(|_| "rust_toon".to_string()),
-        secret_key: std::env::var("MINIO_SECRET_KEY")
+        access_key: std::env::var("S3_ACCESS_KEY").unwrap_or_else(|_| "rust_toon".to_string()),
+        secret_key: std::env::var("S3_SECRET_KEY")
             .unwrap_or_else(|_| "rust_toon_password".to_string()),
-        bucket: std::env::var("MINIO_BUCKET").unwrap_or_else(|_| "rust-toon".to_string()),
-        region: std::env::var("MINIO_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
+        bucket: std::env::var("S3_BUCKET").unwrap_or_else(|_| "rust-toon".to_string()),
+        region: std::env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
     }
 }
 
@@ -95,9 +94,9 @@ async fn signed_request_with_range(
 ) -> Result<reqwest::Response, String> {
     let payload_hash = sha256_hex(&body);
     let timeout = if method == Method::GET {
-        minio_stream_timeout()
+        s3_stream_timeout()
     } else {
-        minio_request_timeout()
+        s3_request_timeout()
     };
     signed_request_builder_with_timeout(method, object_key, &payload_hash, range, timeout)?
         .body(body)
@@ -126,14 +125,14 @@ fn object_storage_client() -> &'static ResilientHttpClient {
     static CLIENT: OnceLock<ResilientHttpClient> = OnceLock::new();
     CLIENT.get_or_init(|| {
         let client = reqwest::Client::builder()
-            .connect_timeout(minio_connect_timeout())
+            .connect_timeout(s3_connect_timeout())
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         ResilientHttpClient::new(
             "object-storage",
             client,
             HttpResilienceConfig {
-                timeout: minio_stream_timeout(),
+                timeout: s3_stream_timeout(),
                 max_attempts: 3,
                 max_concurrent_calls: 32,
                 ..HttpResilienceConfig::default()
@@ -147,14 +146,14 @@ fn remote_media_client() -> &'static ResilientHttpClient {
     static CLIENT: OnceLock<ResilientHttpClient> = OnceLock::new();
     CLIENT.get_or_init(|| {
         let client = reqwest::Client::builder()
-            .connect_timeout(minio_connect_timeout())
+            .connect_timeout(s3_connect_timeout())
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         ResilientHttpClient::new(
             "media-download",
             client,
             HttpResilienceConfig {
-                timeout: minio_stream_timeout(),
+                timeout: s3_stream_timeout(),
                 max_attempts: 3,
                 max_concurrent_calls: 16,
                 ..HttpResilienceConfig::default()
@@ -207,7 +206,7 @@ fn signed_request_builder_with_timeout(
         config.access_key,
     );
     let client = reqwest::Client::builder()
-        .connect_timeout(minio_connect_timeout())
+        .connect_timeout(s3_connect_timeout())
         .build()
         .map_err(|error| error.to_string())?;
     let mut request = client
@@ -229,14 +228,14 @@ async fn ensure_bucket() -> Result<(), String> {
         return Ok(());
     }
     if head.status().as_u16() != 404 {
-        return Err(format!("访问 MinIO bucket 失败：HTTP {}", head.status()));
+        return Err(format!("访问对象存储 bucket 失败：HTTP {}", head.status()));
     }
     let response = signed_request(Method::PUT, None, Vec::new()).await?;
     if response.status().is_success() || response.status().as_u16() == 409 {
         return Ok(());
     }
     Err(format!(
-        "创建 MinIO bucket 失败：HTTP {}",
+        "创建对象存储 bucket 失败：HTTP {}",
         response.status()
     ))
 }
@@ -270,7 +269,7 @@ pub async fn persist_remote_image(url: &str, asset_id: i64) -> Result<String, St
     let upload = signed_request(Method::PUT, Some(&key), bytes).await?;
     if !upload.status().is_success() {
         return Err(format!(
-            "上传生成图片到 MinIO 失败：HTTP {}",
+            "上传生成图片到对象存储失败：HTTP {}",
             upload.status()
         ));
     }
@@ -379,8 +378,8 @@ async fn download_remote_image(url: &str) -> Result<(String, Vec<u8>), String> {
     let response = remote_media_client()
         .execute(
             reqwest::Client::builder()
-                .connect_timeout(minio_connect_timeout())
-                .timeout(minio_stream_timeout())
+                .connect_timeout(s3_connect_timeout())
+                .timeout(s3_stream_timeout())
                 .build()
                 .map_err(|error| format!("创建图片下载客户端失败：{error}"))?
                 .get(url),
@@ -528,7 +527,7 @@ pub async fn cleanup_provider_video_temp_on_startup() -> Result<u64, String> {
     Ok(removed)
 }
 
-/// Reserve the final object path in PostgreSQL before any MinIO write. The
+/// Reserve the final object path in PostgreSQL before any object-storage write. The
 /// delayed cleanup row is an outbox: a crash after PUT but before the video
 /// row update still leaves enough durable information to delete the orphan.
 pub async fn persist_remote_video_for_row(
@@ -545,7 +544,7 @@ pub async fn persist_remote_video_for_row(
     let file_path = asset_file_path_named(project_id, "videos", &object_name, "mp4")?;
     let cleanup_delay = crate::toonflow_video_export::source_download_timeout()
         .as_secs()
-        .saturating_add(minio_stream_timeout().as_secs())
+        .saturating_add(s3_stream_timeout().as_secs())
         .saturating_add(3_600)
         .min(i64::MAX as u64) as i64;
     sqlx::query(
@@ -601,7 +600,7 @@ pub async fn persist_asset_bytes(
     .await
 }
 
-/// Reserve a continuity-frame path before the MinIO PUT. The delayed cleanup
+/// Reserve a continuity-frame path before the object-storage PUT. The delayed cleanup
 /// record survives a process crash between object upload and the cache-row
 /// upsert; once referenced, the normal reference check safely keeps it.
 pub(crate) async fn persist_continuity_frame_with_reservation(
@@ -612,7 +611,7 @@ pub(crate) async fn persist_continuity_frame_with_reservation(
 ) -> Result<String, String> {
     let object_name = format!("frame-{previous_video_id}-{}", uuid::Uuid::new_v4());
     let file_path = asset_file_path_named(project_id, "continuity-frames", &object_name, "png")?;
-    let cleanup_delay = minio_request_timeout()
+    let cleanup_delay = s3_request_timeout()
         .as_secs()
         .saturating_add(3_600)
         .min(i64::MAX as u64) as i64;
@@ -650,7 +649,7 @@ pub(crate) async fn persist_asset_bytes_named(
     let key = asset_image_key(&file_path).ok_or_else(|| "无法生成资产对象路径".to_string())?;
     let upload = signed_request(Method::PUT, Some(key), bytes).await?;
     if !upload.status().is_success() {
-        return Err(format!("上传资产到 MinIO 失败：HTTP {}", upload.status()));
+        return Err(format!("上传资产到对象存储失败：HTTP {}", upload.status()));
     }
     Ok(file_path)
 }
@@ -728,15 +727,15 @@ pub(crate) async fn persist_asset_file_named(
         Some(key),
         &payload_hash,
         None,
-        minio_stream_timeout(),
+        s3_stream_timeout(),
     )?
     .header(header::CONTENT_LENGTH, metadata.len())
     .body(body)
     .pipe_execute(object_storage_client())
     .await
-    .map_err(|error| format!("上传资产到 MinIO 失败：{error}"))?;
+    .map_err(|error| format!("上传资产到对象存储失败：{error}"))?;
     if !upload.status().is_success() {
-        return Err(format!("上传资产到 MinIO 失败：HTTP {}", upload.status()));
+        return Err(format!("上传资产到对象存储失败：HTTP {}", upload.status()));
     }
     Ok(file_path)
 }
@@ -744,7 +743,7 @@ pub(crate) async fn persist_asset_file_named(
 async fn read_image(key: &str) -> Result<(String, Vec<u8>), String> {
     let response = signed_request(Method::GET, Some(key), Vec::new()).await?;
     if !response.status().is_success() {
-        return Err(format!("读取 MinIO 图片失败：HTTP {}", response.status()));
+        return Err(format!("读取对象存储图片失败：HTTP {}", response.status()));
     }
     let mut content_type = response
         .headers()
@@ -820,7 +819,7 @@ pub(crate) async fn delete_asset_file(file_path: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "删除 MinIO 资产文件失败：HTTP {}",
+            "删除对象存储资产文件失败：HTTP {}",
             response.status()
         ))
     }
@@ -895,7 +894,7 @@ pub(crate) fn asset_object_key(file_path: &str) -> Option<&str> {
 /// Check that a persisted Toonflow asset is readable from the configured object store.
 ///
 /// This is intentionally shared with the production pipeline verification so tests validate
-/// the same MinIO-backed storage path used in production instead of assuming local `/upload`
+/// the same S3-backed storage path used in production instead of assuming local `/upload`
 /// files.
 #[cfg(test)]
 pub(crate) async fn asset_exists(file_path: &str) -> Result<bool, String> {
@@ -908,11 +907,11 @@ pub(crate) async fn asset_exists(file_path: &str) -> Result<bool, String> {
 
 pub(crate) async fn read_asset_bytes(file_path: &str) -> Result<Vec<u8>, String> {
     let Some(key) = asset_image_key(file_path) else {
-        return Err("不支持的 MinIO 资产路径".into());
+        return Err("不支持的对象存储资产路径".into());
     };
     let response = signed_request(Method::GET, Some(key), Vec::new()).await?;
     if !response.status().is_success() {
-        return Err(format!("读取 MinIO 资产失败：HTTP {}", response.status()));
+        return Err(format!("读取对象存储资产失败：HTTP {}", response.status()));
     }
     response
         .bytes()
@@ -927,11 +926,11 @@ pub(crate) async fn copy_asset_to_file(
     max_bytes: u64,
 ) -> Result<u64, String> {
     let Some(key) = asset_image_key(file_path) else {
-        return Err("不支持的 MinIO 资产路径".into());
+        return Err("不支持的对象存储资产路径".into());
     };
     let response = signed_request(Method::GET, Some(key), Vec::new()).await?;
     if !response.status().is_success() {
-        return Err(format!("读取 MinIO 资产失败：HTTP {}", response.status()));
+        return Err(format!("读取对象存储资产失败：HTTP {}", response.status()));
     }
     if response
         .content_length()
@@ -945,7 +944,7 @@ pub(crate) async fn copy_asset_to_file(
     let mut total = 0_u64;
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| format!("读取 MinIO 视频流失败：{error}"))?;
+        let chunk = chunk.map_err(|error| format!("读取对象存储视频流失败：{error}"))?;
         total = total
             .checked_add(chunk.len() as u64)
             .ok_or_else(|| "源视频大小溢出".to_string())?;
@@ -976,11 +975,6 @@ fn image_content_type(bytes: &[u8]) -> Option<&'static str> {
     } else {
         None
     }
-}
-
-#[derive(Deserialize)]
-pub struct AssetAccessQuery {
-    pub(crate) token: String,
 }
 
 async fn authorize_asset_key(
@@ -1014,17 +1008,13 @@ async fn authorize_asset_key(
 }
 
 pub async fn serve_image(
+    user: CurrentUser,
     State(state): State<ToonState>,
     Path(key): Path<String>,
-    Query(query): Query<AssetAccessQuery>,
     request_headers: HeaderMap,
 ) -> Result<Response<Body>, AppError> {
-    let claims = state
-        .tokens
-        .verify_access_token(&query.token)
-        .map_err(|_| AppError::unauthorized("invalid token"))?;
-    require(&claims.user, "toon:project:read")?;
-    authorize_asset_key(&state, &claims.user, &key).await?;
+    require(&user, "toon:project:read")?;
+    authorize_asset_key(&state, &user, &key).await?;
     let range = request_headers
         .get(http_header::RANGE)
         .and_then(|value| value.to_str().ok());
@@ -1191,7 +1181,7 @@ mod tests {
     }
 
     #[test]
-    fn treats_minio_generic_binary_types_as_missing_metadata() {
+    fn treats_s3_generic_binary_types_as_missing_metadata() {
         assert!(is_generic_binary_content_type("application/octet-stream"));
         assert!(is_generic_binary_content_type("binary/octet-stream"));
         assert!(is_generic_binary_content_type(
@@ -1212,8 +1202,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires the local MinIO service"]
-    async fn minio_round_trip() {
+    #[ignore = "requires the local object storage service"]
+    async fn s3_round_trip() {
         ensure_bucket().await.expect("create test bucket");
         let key = format!("toonflow/tests/{}.txt", uuid::Uuid::new_v4());
         let uploaded = signed_request(Method::PUT, Some(&key), b"rust-toon".to_vec())

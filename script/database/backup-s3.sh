@@ -2,16 +2,16 @@
 set -euo pipefail
 umask 077
 
-minio_endpoint="${MINIO_ENDPOINT:-http://127.0.0.1:9000}"
-minio_access_key="${MINIO_ACCESS_KEY:-}"
-minio_secret_key="${MINIO_SECRET_KEY:-}"
-minio_bucket="${MINIO_BUCKET:-rust-toon}"
-backup_dir="${MINIO_BACKUP_DIR:-/var/backups/rust-toon/minio}"
+s3_endpoint="${S3_ENDPOINT:-http://127.0.0.1:9000}"
+s3_access_key="${S3_ACCESS_KEY:-}"
+s3_secret_key="${S3_SECRET_KEY:-}"
+s3_bucket="${S3_BUCKET:-rust-toon}"
+backup_dir="${S3_BACKUP_DIR:-/var/backups/rust-toon/s3}"
 retention_days="${BACKUP_RETENTION_DAYS:-14}"
 backup_set_id="${BACKUP_SET_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 
 usage() {
-  echo "Usage: MINIO_ACCESS_KEY=... MINIO_SECRET_KEY=... $0 [--output-dir DIR] [--retention-days DAYS] [--bucket NAME]"
+  echo "Usage: S3_ACCESS_KEY=... S3_SECRET_KEY=... $0 [--output-dir DIR] [--retention-days DAYS] [--bucket NAME]"
 }
 
 while (($#)); do
@@ -25,7 +25,7 @@ while (($#)); do
       shift 2
       ;;
     --bucket)
-      minio_bucket="${2:?--bucket requires a name}"
+      s3_bucket="${2:?--bucket requires a name}"
       shift 2
       ;;
     -h|--help)
@@ -40,8 +40,8 @@ while (($#)); do
   esac
 done
 
-if [[ -z "$minio_access_key" || -z "$minio_secret_key" ]]; then
-  echo "MINIO_ACCESS_KEY and MINIO_SECRET_KEY are required" >&2
+if [[ -z "$s3_access_key" || -z "$s3_secret_key" ]]; then
+  echo "S3_ACCESS_KEY and S3_SECRET_KEY are required" >&2
   exit 1
 fi
 if [[ ! "$retention_days" =~ ^[0-9]+$ ]] || ((retention_days < 1)); then
@@ -67,15 +67,15 @@ case "$backup_dir" in
     ;;
 esac
 
-command -v mc >/dev/null || { echo "MinIO Client (mc) is required" >&2; exit 1; }
+command -v mc >/dev/null || { echo "S3 client (mc) is required" >&2; exit 1; }
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
 command -v sha256sum >/dev/null || { echo "sha256sum is required" >&2; exit 1; }
 
 mkdir -p "$backup_dir"
 chmod 700 "$backup_dir"
 
-final_path="$backup_dir/rust-toon-minio-$backup_set_id"
-publish_lock="$backup_dir/.rust-toon-minio-$backup_set_id.lock"
+final_path="$backup_dir/rust-toon-s3-$backup_set_id"
+publish_lock="$backup_dir/.rust-toon-s3-$backup_set_id.lock"
 created_at="$(date -u +%Y%m%dT%H%M%SZ)"
 temporary_path=""
 mc_config_dir=""
@@ -95,26 +95,26 @@ cleanup() {
 trap cleanup EXIT
 
 if ! mkdir -- "$publish_lock" 2>/dev/null; then
-  echo "A MinIO backup is already being published for backup set $backup_set_id" >&2
+  echo "A object storage backup is already being published for backup set $backup_set_id" >&2
   exit 1
 fi
 owns_publish_lock=true
 if [[ -e "$final_path" || -L "$final_path" ]]; then
-  echo "Refusing to overwrite existing MinIO backup: $final_path" >&2
+  echo "Refusing to overwrite existing object storage backup: $final_path" >&2
   exit 1
 fi
 
-temporary_path="$(mktemp -d "$backup_dir/.rust-toon-minio-$backup_set_id.XXXXXX")"
+temporary_path="$(mktemp -d "$backup_dir/.rust-toon-s3-$backup_set_id.XXXXXX")"
 mc_config_dir="$(mktemp -d)"
 
 MC_CONFIG_DIR="$mc_config_dir" mc alias set rust-toon-source \
-  "$minio_endpoint" "$minio_access_key" "$minio_secret_key" >/dev/null
-MC_CONFIG_DIR="$mc_config_dir" mc stat "rust-toon-source/$minio_bucket" >/dev/null
+  "$s3_endpoint" "$s3_access_key" "$s3_secret_key" >/dev/null
+MC_CONFIG_DIR="$mc_config_dir" mc stat "rust-toon-source/$s3_bucket" >/dev/null
 mkdir -p "$temporary_path/objects"
 MC_CONFIG_DIR="$mc_config_dir" mc mirror --quiet --preserve \
-  "rust-toon-source/$minio_bucket" "$temporary_path/objects" >/dev/null
+  "rust-toon-source/$s3_bucket" "$temporary_path/objects" >/dev/null
 
-jq -cn --arg bucket "$minio_bucket" --arg created_at "$created_at" --arg set_id "$backup_set_id" \
+jq -cn --arg bucket "$s3_bucket" --arg created_at "$created_at" --arg set_id "$backup_set_id" \
   '{formatVersion: 1, bucket: $bucket, createdAt: $created_at, setId: $set_id}' \
   > "$temporary_path/manifest.json"
 (
@@ -125,13 +125,13 @@ jq -cn --arg bucket "$minio_bucket" --arg created_at "$created_at" --arg set_id 
 )
 
 if ! mv -T -- "$temporary_path" "$final_path"; then
-  echo "Failed to publish MinIO backup without replacing an existing destination: $final_path" >&2
+  echo "Failed to publish object storage backup without replacing an existing destination: $final_path" >&2
   exit 1
 fi
 temporary_path=""
 chmod -R go-rwx "$final_path"
 
 find "$backup_dir" -mindepth 1 -maxdepth 1 -type d \
-  -name 'rust-toon-minio-*' -mtime "+$retention_days" -exec rm -rf -- {} +
+  -name 'rust-toon-s3-*' -mtime "+$retention_days" -exec rm -rf -- {} +
 
 echo "$final_path"

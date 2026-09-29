@@ -1,5 +1,5 @@
 [Unit]
-Description=Rust Toon MinIO object backup
+Description=Rust Toon object storage backup
 After=network-online.target
 Wants=network-online.target
 
@@ -8,7 +8,7 @@ Type=oneshot
 User=rust-toon
 Group=rust-toon
 EnvironmentFile=/etc/rust-toon/backup.env
-ExecStart=/opt/rust-toon/script/database/backup-minio.sh
+ExecStart=/opt/rust-toon/script/database/backup-s3.sh
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7

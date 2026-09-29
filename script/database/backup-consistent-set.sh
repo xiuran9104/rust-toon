@@ -6,7 +6,7 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 backup_root="${CONSISTENT_BACKUP_DIR:-/var/backups/rust-toon/sets}"
 systemctl_bin="${SYSTEMCTL_BIN:-systemctl}"
 postgres_backup_script="${POSTGRES_BACKUP_SCRIPT:-$script_dir/backup-postgres.sh}"
-minio_backup_script="${MINIO_BACKUP_SCRIPT:-$script_dir/backup-minio.sh}"
+object_backup_script="${S3_BACKUP_SCRIPT:-$script_dir/backup-s3.sh}"
 units_value="${BACKUP_SYSTEMD_UNITS:-rust-toon-gateway.service rust-toon-worker.service}"
 set_id="${BACKUP_SET_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 temporary_manifest=""
@@ -28,8 +28,8 @@ command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
   echo "PostgreSQL backup script is not executable: $postgres_backup_script" >&2
   exit 1
 }
-[[ -x "$minio_backup_script" ]] || {
-  echo "MinIO backup script is not executable: $minio_backup_script" >&2
+[[ -x "$object_backup_script" ]] || {
+  echo "Object storage backup script is not executable: $object_backup_script" >&2
   exit 1
 }
 
@@ -92,17 +92,17 @@ if [[ -e "$manifest" || -L "$manifest" ]]; then
 fi
 
 postgres_path="$(BACKUP_SET_ID="$set_id" "$postgres_backup_script")"
-minio_path="$(BACKUP_SET_ID="$set_id" "$minio_backup_script")"
+object_storage_path="$(BACKUP_SET_ID="$set_id" "$object_backup_script")"
 
 jq -cn \
   --arg set_id "$set_id" \
   --arg created_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --arg postgres "$postgres_path" \
-  --arg minio "$minio_path" \
+  --arg objectStorage "$object_storage_path" \
   --argjson quiesced_units "$(printf '%s\n' "${active_units[@]}" | jq -R . | jq -s .)" \
   '{formatVersion: 1, setId: $set_id, createdAt: $created_at,
     consistency: "services-quiesced", quiescedUnits: $quiesced_units,
-    postgresql: $postgres, minio: $minio}' > "$temporary_manifest"
+    postgresql: $postgres, objectStorage: $objectStorage}' > "$temporary_manifest"
 mv -- "$temporary_manifest" "$manifest"
 temporary_manifest=""
 chmod 600 "$manifest"

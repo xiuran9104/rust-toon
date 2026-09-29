@@ -56,7 +56,7 @@ async fn save_data_url(
     }
     crate::toonflow_storage::persist_asset_bytes(project_id, category, extension, bytes)
         .await
-        .map_err(|_| AppError::internal("failed to save upload to MinIO"))
+        .map_err(|_| AppError::internal("failed to save upload to object storage"))
 }
 
 pub(crate) async fn save_asset_cover_data_url(
