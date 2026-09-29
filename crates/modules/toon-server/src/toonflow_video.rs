@@ -13,7 +13,7 @@ use axum::{Json, extract::State, http::StatusCode};
 use rust_toon_framework_common::ApiResponse;
 use rust_toon_framework_security::CurrentUser;
 use rust_toon_framework_web::AppError;
-use serde::{Deserialize, Deserializer, de::Error as _};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use serde_json::{Value, json};
 use sqlx::FromRow;
 use std::{
@@ -923,28 +923,28 @@ pub struct Generate {
     retry_of_id: Option<i64>,
 }
 
-/// Combines caller-provided frames with canonical asset images while preserving their first-use order.
+/// Combines canonical asset images with caller-provided frames. Assets stay first so the
+/// server-owned `@图N` manifest has the same order as the provider payload.
 fn merge_references(upload_data: Value, asset_references: Vec<String>) -> Result<Value, String> {
-    let mut references = upload_data
-        .as_array()
+    let mut references = asset_references
         .into_iter()
-        .flatten()
-        .filter_map(|item| {
-            item.as_str()
-                .map(str::to_string)
-                .or_else(|| item.get("src").and_then(Value::as_str).map(str::to_string))
-        })
         .filter(|reference| !reference.is_empty())
         .map(Value::String)
         .collect::<Vec<_>>();
-    for reference in asset_references {
-        if !references
-            .iter()
-            .any(|item| item.as_str() == Some(&reference))
-        {
-            references.push(json!(reference));
-        }
-    }
+    references.extend(
+        upload_data
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| {
+                item.as_str()
+                    .map(str::to_string)
+                    .or_else(|| item.get("src").and_then(Value::as_str).map(str::to_string))
+            })
+            .filter(|reference| !reference.is_empty())
+            .map(Value::String)
+            .collect::<Vec<_>>(),
+    );
     let mut seen = HashSet::new();
     references.retain(|reference| seen.insert(reference.as_str().unwrap_or_default().to_string()));
     if references.len() > 4 {
@@ -1020,6 +1020,267 @@ fn validate_prompt_references(prompt: &str, count: usize) -> Result<(), String> 
     Ok(())
 }
 
+fn compile_video_prompt_with_manifest(
+    prompt: &str,
+    references: &[crate::toonflow_asset_context::TrackAssetReference],
+) -> Result<String, String> {
+    validate_prompt_references(prompt, references.len())?;
+    if references.is_empty() {
+        return Ok(prompt.trim().to_string());
+    }
+    for index in 1..=references.len() {
+        let marker = format!("@图{index}");
+        if !prompt.contains(&marker) {
+            return Err(format!("视频提示词缺少服务端参考清单中的 {marker}"));
+        }
+    }
+    let declarations = references
+        .iter()
+        .enumerate()
+        .map(|(index, reference)| {
+            format!(
+                "@图{} 为{}（{}，资产ID={}，图片ID={}）",
+                index + 1,
+                reference.asset_name,
+                reference.asset_type,
+                reference.asset_id,
+                reference.image_id,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("；");
+    Ok(format!("参考图清单：{declarations}\n{}", prompt.trim()))
+}
+
+#[derive(Clone, Debug, FromRow)]
+struct StructuredStoryboardRow {
+    id: i64,
+    index: Option<i32>,
+    scene_key: Option<String>,
+    scene_state_key: Option<String>,
+    video_desc: Option<String>,
+    prompt: String,
+    duration: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StructuredShotReference {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    index: Option<usize>,
+    asset_id: i64,
+    asset_type: String,
+    name: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StructuredShotDescription {
+    storyboard_id: i64,
+    sequence: i32,
+    scene_key: Option<String>,
+    scene_state_key: Option<String>,
+    duration_seconds: f64,
+    description: String,
+    references: Vec<StructuredShotReference>,
+}
+
+fn parse_shot_duration(value: &str, position: usize) -> Result<f64, String> {
+    let duration = value
+        .trim()
+        .trim_end_matches(|character| character == 's' || character == '秒')
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| format!("第 {position} 个分镜时长无效"))?;
+    if !duration.is_finite() || duration <= 0.0 {
+        return Err(format!("第 {position} 个分镜时长必须大于 0"));
+    }
+    Ok(duration)
+}
+
+async fn load_structured_shot_descriptions(
+    pool: &sqlx::PgPool,
+    project_id: i64,
+    script_id: i64,
+    track_id: i64,
+    include_reference_indices: bool,
+) -> Result<Vec<StructuredShotDescription>, String> {
+    let manifest = if include_reference_indices {
+        crate::toonflow_asset_context::load_track_asset_reference_manifest(
+            pool, project_id, script_id, track_id,
+        )
+        .await
+        .map_err(|error| format!("加载轨道参考清单失败：{error}"))?
+    } else {
+        Vec::new()
+    };
+    let manifest_indices = manifest
+        .iter()
+        .enumerate()
+        .map(|(index, reference)| (reference.asset_id, index + 1))
+        .collect::<HashMap<_, _>>();
+    let rows = sqlx::query_as::<_, StructuredStoryboardRow>(
+        r#"SELECT storyboard.id,storyboard.index,storyboard.scene_key,
+                  scene_state.state_key AS scene_state_key,
+                  storyboard.video_desc,storyboard.prompt,storyboard.duration
+           FROM toonflow.storyboards storyboard
+           LEFT JOIN toonflow.scene_states scene_state ON scene_state.id=storyboard.scene_state_id
+           WHERE storyboard.project_id=$1 AND storyboard.script_id=$2
+             AND storyboard.track_id=$3
+           ORDER BY storyboard.index,storyboard.id"#,
+    )
+    .bind(project_id)
+    .bind(script_id)
+    .bind(track_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| format!("加载结构化镜头失败：{error}"))?;
+    if rows.is_empty() {
+        return Err("视频轨道没有可编译的分镜".into());
+    }
+    let asset_rows = sqlx::query_as::<_, (i64, i64, String, String)>(
+        r#"SELECT binding.storyboard_id,asset.id,asset.type,asset.name
+           FROM toonflow.assets_storyboards binding
+           JOIN toonflow.storyboards storyboard ON storyboard.id=binding.storyboard_id
+           JOIN toonflow.assets asset ON asset.id=binding.asset_id AND asset.project_id=$1
+           WHERE storyboard.project_id=$1 AND storyboard.script_id=$2
+             AND storyboard.track_id=$3
+           ORDER BY storyboard.index,storyboard.id,binding.sort_order,binding.asset_id"#,
+    )
+    .bind(project_id)
+    .bind(script_id)
+    .bind(track_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| format!("加载镜头资产绑定失败：{error}"))?;
+    let mut assets_by_storyboard: HashMap<i64, Vec<StructuredShotReference>> = HashMap::new();
+    for (storyboard_id, asset_id, asset_type, name) in asset_rows {
+        let index = manifest_indices.get(&asset_id).copied();
+        if include_reference_indices && index.is_none() {
+            return Err(format!(
+                "分镜 {storyboard_id} 的资产 {asset_id} 未进入最终参考清单"
+            ));
+        }
+        assets_by_storyboard
+            .entry(storyboard_id)
+            .or_default()
+            .push(StructuredShotReference {
+                index,
+                asset_id,
+                asset_type,
+                name,
+            });
+    }
+    rows.into_iter()
+        .enumerate()
+        .map(|(position, row)| {
+            let description = row
+                .video_desc
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(row.prompt)
+                .trim()
+                .to_string();
+            if description.is_empty() {
+                return Err(format!("第 {} 个分镜缺少画面描述", position + 1));
+            }
+            let duration =
+                parse_shot_duration(row.duration.as_deref().unwrap_or_default(), position + 1)?;
+            Ok(StructuredShotDescription {
+                storyboard_id: row.id,
+                sequence: row.index.unwrap_or(position as i32 + 1),
+                scene_key: row.scene_key.filter(|value| !value.trim().is_empty()),
+                scene_state_key: row
+                    .scene_state_key
+                    .filter(|value| !value.trim().is_empty()),
+                duration_seconds: duration,
+                description,
+                references: assets_by_storyboard.remove(&row.id).unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, FromRow)]
+struct VideoReferenceAsset {
+    file_path: String,
+    asset_id: i64,
+    asset_type: String,
+    asset_name: String,
+    image_id: i64,
+}
+
+fn reference_kind(mode: &str, index: usize, count: usize) -> &'static str {
+    if mode == "text" {
+        "reference_image"
+    } else if mode == "startFrameOptional" && count == 1 {
+        "last_frame"
+    } else if index == 0 {
+        "first_frame"
+    } else {
+        "last_frame"
+    }
+}
+
+fn asset_reference_role(asset_type: &str) -> &'static str {
+    match asset_type {
+        "scene" => "environment_reference",
+        "role" | "character" => "required_subject",
+        _ => "required_subject",
+    }
+}
+
+async fn build_reference_manifest(
+    pool: &sqlx::PgPool,
+    video_id: i64,
+    mode: &str,
+    references: &[Value],
+) -> Result<Vec<Value>, String> {
+    let assets = sqlx::query_as::<_, VideoReferenceAsset>(
+        r#"SELECT DISTINCT ON (i.file_path)
+                  i.file_path,a.id AS asset_id,a.type AS asset_type,
+                  a.name AS asset_name,i.id AS image_id
+           FROM toonflow.videos v
+           JOIN toonflow.assets a ON a.project_id=v.project_id
+           JOIN toonflow.images i ON i.id=a.image_id
+           WHERE v.id=$1 AND i.file_path=ANY($2::text[])
+           ORDER BY i.file_path,a.id"#,
+    )
+    .bind(video_id)
+    .bind(
+        references
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("加载视频参考资产清单失败：{e}"))?
+    .into_iter()
+    .map(|asset| (asset.file_path.clone(), asset))
+    .collect::<HashMap<_, _>>();
+
+    Ok(references
+        .iter()
+        .enumerate()
+        .map(|(index, reference)| {
+            let kind = reference_kind(mode, index, references.len());
+            let asset = reference.as_str().and_then(|path| assets.get(path));
+            json!({
+                "index": index + 1,
+                "kind": kind,
+                "role": asset.map(|item| asset_reference_role(&item.asset_type)).unwrap_or(kind),
+                "url": reference,
+                "reference": reference,
+                "assetId": asset.map(|item| item.asset_id),
+                "assetType": asset.map(|item| item.asset_type.as_str()),
+                "name": asset.map(|item| item.asset_name.as_str()),
+                "imageId": asset.map(|item| item.image_id),
+            })
+        })
+        .collect())
+}
+
 async fn generate_with_snapshot(
     pool: &sqlx::PgPool,
     video_id: i64,
@@ -1034,14 +1295,39 @@ async fn generate_with_snapshot(
         payload["prompt"].as_str().unwrap_or_default(),
         references.len(),
     )?;
-    let manifest = references.iter().enumerate().map(|(index, reference)| json!({
-        "index":index+1,"reference":reference,
-        "kind": if payload["mode"] == "text" { "reference_image" }
-            else if payload["mode"] == "startFrameOptional" && references.len() == 1 { "last_frame" }
-            else if index == 0 { "first_frame" } else { "last_frame" },
-    })).collect::<Vec<_>>();
+    let mode = payload["mode"].as_str().unwrap_or("text");
+    let manifest = build_reference_manifest(pool, video_id, mode, &references).await?;
+    let context = sqlx::query_as::<_, (i64, i64, Option<i64>)>(
+        "SELECT project_id,script_id,video_track_id FROM toonflow.videos WHERE id=$1",
+    )
+    .bind(video_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| format!("加载视频镜头上下文失败：{error}"))?
+    .ok_or_else(|| "视频任务不存在".to_string())?;
+    let track_id = context
+        .2
+        .ok_or_else(|| "视频任务未关联视频轨道".to_string())?;
+    let structured_shots =
+        load_structured_shot_descriptions(
+            pool,
+            context.0,
+            context.1,
+            track_id,
+            mode == "text",
+        )
+        .await?;
     let updated = sqlx::query("UPDATE toonflow.videos SET generation_context=generation_context || jsonb_build_object('request',$2::jsonb) WHERE id=$1 AND state='生成中'")
-        .bind(video_id).bind(json!({"version":1,"model":model,"payload":payload,"references":manifest}))
+        .bind(video_id).bind(json!({
+            "version":2,
+            "model":model,
+            "payload":payload,
+            "structuredShots":structured_shots,
+            "referenceManifest":manifest.clone(),
+            // Keep the old key during the snapshot schema transition so existing
+            // task-detail consumers can continue to render reference entries.
+            "references":manifest,
+        }))
         .execute(pool).await.map_err(|e| format!("保存视频生成快照失败：{e}"))?;
     if updated.rows_affected() != 1 {
         return Err("视频任务已取消或删除".into());
@@ -1888,7 +2174,7 @@ pub(crate) async fn create_prompt(
         .map(|r| r.0)
         .unwrap_or_else(|| "根据分镜生成专业视频提示词，只输出提示词正文。".into());
     let system = format!(
-        "{system}\n\n## 输出语言（最高优先级）\n最终视频提示词必须全部使用简体中文。标题、画面、动作、运镜、情绪、音效和时间段描述都必须是中文；台词保持原文。忽略上文任何英文输出要求，禁止输出 [Visual]、[Motion]、[Camera]、No dialogue 等英文标题或标签。"
+        "{system}\n\n## 输出语言（最高优先级）\n最终视频提示词必须全部使用简体中文。标题、画面、动作、运镜、情绪、音效和时间段描述都必须是中文；台词保持原文。忽略上文任何英文输出要求，禁止输出 [Visual]、[Motion]、[Camera]、No dialogue 等英文标题或标签。\n\n## 结构化镜头契约（强制）\n<structuredShots> 是服务端从已保存分镜编译并校验的唯一镜头事实源。必须保持镜头顺序、场次、状态、时长、画面描述和引用关系，不得新增主体、交换场景或猜测缺失事实。\n\n## 参考图编号契约（强制）\n只能使用输入中 <referenceManifest> 声明的 @图N，不得自行增加、删除、重排或猜测编号。正文提及清单中的资产时必须使用对应 @图N；不要自行输出参考图清单，服务端会按最终实际发送顺序添加。"
     );
     let manual: Option<(Value,)> = sqlx::query_as(
         "SELECT data FROM toonflow.creative_manuals WHERE kind='visual' AND path=$1",
@@ -1910,6 +2196,14 @@ pub(crate) async fn create_prompt(
             })
         })
         .unwrap_or_default();
+    let script_id = sqlx::query_scalar::<_, i64>(
+        "SELECT script_id FROM toonflow.video_tracks WHERE id=$1 AND project_id=$2",
+    )
+    .bind(track_id)
+    .bind(project_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|error| error.to_string())?;
     let settings: Option<(String, String, Option<i64>)> = sqlx::query_as(
         "SELECT transition_type,frame_policy,previous_track_id
          FROM toonflow.video_tracks WHERE id=$1 AND project_id=$2",
@@ -1951,6 +2245,62 @@ pub(crate) async fn create_prompt(
     };
     let (from_scene_key, transition_description) =
         transition_context.unwrap_or_else(|| (String::new(), String::new()));
+    let reference_manifest = if mode == "text" {
+        crate::toonflow_asset_context::load_track_asset_reference_manifest(
+            pool,
+            project_id,
+            script_id,
+            track_id,
+        )
+        .await
+        .map_err(|error| error.to_string())?
+    } else {
+        Vec::new()
+    };
+    if reference_manifest.len() > 4 {
+        let reason = format!(
+            "当前视频参考图上限为 4 张，实际 {} 张；请减少参考素材后重试，系统不会静默丢弃参考图",
+            reference_manifest.len()
+        );
+        let _ = sqlx::query(
+            "UPDATE toonflow.video_tracks SET state='生成失败',reason=$2
+             WHERE id=$1 AND project_id=$3",
+        )
+        .bind(track_id)
+        .bind(&reason)
+        .bind(project_id)
+        .execute(pool)
+        .await;
+        return Err(reason);
+    }
+    let reference_manifest_xml = reference_manifest
+        .iter()
+        .enumerate()
+        .map(|(index, reference)| {
+            format!(
+                "<reference index=\"{}\" marker=\"@图{}\" role=\"{}\" assetId=\"{}\" imageId=\"{}\" name=\"{}\" url=\"{}\"></reference>",
+                index + 1,
+                index + 1,
+                asset_reference_role(&reference.asset_type),
+                reference.asset_id,
+                reference.image_id,
+                xml_attribute(&reference.asset_name),
+                xml_attribute(&reference.file_path),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let structured_shots =
+        load_structured_shot_descriptions(
+            pool,
+            project_id,
+            script_id,
+            track_id,
+            mode == "text",
+        )
+        .await?;
+    let structured_shots_json = serde_json::to_string(&structured_shots)
+        .map_err(|error| format!("序列化结构化镜头失败：{error}"))?;
     let storyboard_items = boards
         .into_iter()
         .map(|(prompt, video_desc, duration, scene_key)| {
@@ -1968,7 +2318,7 @@ pub(crate) async fn create_prompt(
         .collect::<Vec<_>>()
         .join("\n");
     let content = format!(
-        "模型名称：{resolved_model}\n模式：{mode}\n视觉规范：{visual}\n<transition type=\"{}\" framePolicy=\"{}\" previousTrackId=\"{}\" fromSceneKey=\"{}\" toSceneKey=\"{}\" description=\"{}\"></transition>\n<storyboardItems>\n{}\n</storyboardItems>",
+        "模型名称：{resolved_model}\n模式：{mode}\n视觉规范：{visual}\n<referenceManifest>\n{reference_manifest_xml}\n</referenceManifest>\n<structuredShots>{structured_shots_json}</structuredShots>\n<transition type=\"{}\" framePolicy=\"{}\" previousTrackId=\"{}\" fromSceneKey=\"{}\" toSceneKey=\"{}\" description=\"{}\"></transition>\n<storyboardItems>\n{}\n</storyboardItems>",
         xml_attribute(&transition_type),
         xml_attribute(&frame_policy),
         previous_track_id
@@ -1981,6 +2331,21 @@ pub(crate) async fn create_prompt(
     );
     match ai_client::project_text(pool, "universalAi", project_id, &system, &content).await {
         Ok(text) => {
+            let text = match compile_video_prompt_with_manifest(&text, &reference_manifest) {
+                Ok(text) => text,
+                Err(reason) => {
+                    let _ = sqlx::query(
+                        "UPDATE toonflow.video_tracks SET state='生成失败',reason=$2
+                         WHERE id=$1 AND project_id=$3",
+                    )
+                    .bind(track_id)
+                    .bind(&reason)
+                    .bind(project_id)
+                    .execute(pool)
+                    .await;
+                    return Err(reason);
+                }
+            };
             sqlx::query(
                 "UPDATE toonflow.video_tracks SET prompt=$2,state='已完成',reason=NULL
                  WHERE id=$1 AND project_id=$3",
@@ -2047,10 +2412,12 @@ fn model_parameter(value: &Value) -> Result<String, AppError> {
 mod prompt_tests {
     use super::{
         FRAME_POLICY_OWN, FRAME_POLICY_PREVIOUS_TAIL, Generate, TrackTransitionSettings,
-        WorkflowVideoJob, merge_references, model_parameter, normalize_storyboard_ids,
-        references_for_mode, validate_prompt_references, video_prompt_name, workflow_job_is_ready,
-        xml_attribute,
+        WorkflowVideoJob, asset_reference_role, compile_video_prompt_with_manifest,
+        merge_references, model_parameter, normalize_storyboard_ids, parse_shot_duration,
+        reference_kind, references_for_mode, validate_prompt_references, video_prompt_name,
+        workflow_job_is_ready, xml_attribute,
     };
+    use crate::toonflow_asset_context::TrackAssetReference;
     use serde_json::json;
     use std::collections::{HashMap, HashSet};
 
@@ -2165,7 +2532,7 @@ mod prompt_tests {
     }
 
     #[test]
-    fn normalizes_storyboard_media_and_appends_unique_asset_references() {
+    fn places_unique_canonical_assets_before_storyboard_media() {
         let references = merge_references(
             json!([
                 {"id": 1, "src": "https://example.com/storyboard.png"},
@@ -2180,9 +2547,9 @@ mod prompt_tests {
         assert_eq!(
             references,
             json!([
-                "https://example.com/storyboard.png",
+                "https://example.com/role.png",
                 "https://example.com/direct.png",
-                "https://example.com/role.png"
+                "https://example.com/storyboard.png",
             ])
         );
     }
@@ -2241,6 +2608,54 @@ mod prompt_tests {
         assert!(validate_prompt_references("@图1 人物参考 @图2 场景", 2).is_ok());
         assert!(validate_prompt_references("@图3", 2).is_err());
         assert!(validate_prompt_references("@图0", 2).is_err());
+        assert_eq!(reference_kind("text", 0, 1), "reference_image");
+        assert_eq!(reference_kind("startEndRequired", 0, 2), "first_frame");
+        assert_eq!(reference_kind("startEndRequired", 1, 2), "last_frame");
+        assert_eq!(reference_kind("startFrameOptional", 0, 1), "last_frame");
+        assert_eq!(asset_reference_role("role"), "required_subject");
+        assert_eq!(asset_reference_role("scene"), "environment_reference");
+    }
+
+    #[test]
+    fn compiles_server_owned_reference_declarations() {
+        let references = vec![
+            TrackAssetReference {
+                asset_id: 11,
+                asset_name: "沈辞".into(),
+                asset_type: "role".into(),
+                image_id: 101,
+                file_path: "role.png".into(),
+            },
+            TrackAssetReference {
+                asset_id: 22,
+                asset_name: "城楼".into(),
+                asset_type: "scene".into(),
+                image_id: 202,
+                file_path: "scene.png".into(),
+            },
+        ];
+        let prompt = compile_video_prompt_with_manifest(
+            "@图1 走向 @图2，镜头缓慢推进。",
+            &references,
+        )
+        .unwrap();
+        assert!(prompt.starts_with(
+            "参考图清单：@图1 为沈辞（role，资产ID=11，图片ID=101）；@图2 为城楼（scene，资产ID=22，图片ID=202）"
+        ));
+        assert!(prompt.ends_with("@图1 走向 @图2，镜头缓慢推进。"));
+        assert!(compile_video_prompt_with_manifest("@图1 独自行走", &references)
+            .unwrap_err()
+            .contains("缺少服务端参考清单中的 @图2"));
+        assert!(compile_video_prompt_with_manifest("@图3 出现", &references).is_err());
+    }
+
+    #[test]
+    fn parses_positive_structured_shot_durations_without_coercion() {
+        assert_eq!(parse_shot_duration("4", 1).unwrap(), 4.0);
+        assert_eq!(parse_shot_duration("2.5s", 2).unwrap(), 2.5);
+        assert_eq!(parse_shot_duration("3秒", 3).unwrap(), 3.0);
+        assert!(parse_shot_duration("0", 4).unwrap_err().contains("必须大于 0"));
+        assert!(parse_shot_duration("未知", 5).unwrap_err().contains("时长无效"));
     }
 }
 #[derive(Deserialize)]

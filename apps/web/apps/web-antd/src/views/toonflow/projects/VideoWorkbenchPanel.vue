@@ -28,6 +28,12 @@ import { storyboardsForTrack } from './storyboard-track-groups';
 import { defaultVideoGenerationMode, videoFrameRole } from './video-generation-mode';
 import { groupVideoTracksByScene } from './video-scene-groups';
 import {
+  hasVideoGenerationSnapshot,
+  videoGenerationRequest,
+  videoReferenceManifest,
+  videoStructuredShots,
+} from './video-generation-snapshot';
+import {
   normalizeVideoTransitionSettings,
   previousVideoTrackContext,
   transitionDurationApplies,
@@ -71,7 +77,21 @@ const emit = defineEmits<{
 const activeTrackId = ref<number | undefined>(props.initialTrackId);
 const activeTab = ref<'preview' | 'generate' | 'editor'>(props.initialTab ?? 'preview');
 const previewVideo = ref<any>();
+const snapshotVideo = ref<any>();
 const inspectingVideoIds = ref<number[]>([]);
+const snapshotRequest = computed(() => videoGenerationRequest(snapshotVideo.value));
+const snapshotReferences = computed(() => videoReferenceManifest(snapshotVideo.value));
+const snapshotShots = computed(() => videoStructuredShots(snapshotVideo.value));
+
+function snapshotRoleLabel(reference: any) {
+  return {
+    environment_reference: '场景参考',
+    first_frame: '首帧',
+    last_frame: '尾帧',
+    reference_image: '普通参考',
+    required_subject: '必需主体',
+  }[reference?.role ?? reference?.kind] ?? reference?.role ?? reference?.kind ?? '参考图';
+}
 
 async function inspectVideo(video: any) {
   if (inspectingVideoIds.value.includes(video.id)) return;
@@ -752,7 +772,16 @@ watch(editorVolume, (volume) => {
 async function loadVideoModels() {
   try {
     const models = await getModelSimpleList(AiModelTypeEnum.VIDEO);
-    videoModelOptions.value = models.map((model) => ({ label: model.name || model.model, value: model.id, supportsAudio: model.config?.capabilities ? (model.config.capabilities as any).audio !== false : true }));
+    videoModelOptions.value = models.map((model) => {
+      const capabilities = model.config?.capabilities as any;
+      return {
+        label: model.name || model.model,
+        value: model.id,
+        supportsAudio: capabilities
+          ? (capabilities.videoAudio ?? capabilities.audio) !== false
+          : true,
+      };
+    });
   } catch {
     if (props.videoModel) videoModelOptions.value = [{ label: `项目模型 #${props.videoModel}`, value: props.videoModel, supportsAudio: true }];
   }
@@ -819,6 +848,7 @@ onActivated(() => {
                     <div class="video-actions"><span class="version-label">V{{ Number(versionIndex) + 1 }}</span><Button v-if="['生成成功','已完成'].includes(video.state)" size="small" @click="emit('selectVideo', activeTrack, video)">{{ isSelectedVideo(activeTrack, video) ? '已选中' : '选中' }}</Button><Button v-if="['生成成功','已完成'].includes(video.state)" size="small" :type="compareIds.includes(video.id) ? 'primary' : 'default'" @click="toggleCompare(video)">{{ compareIds.includes(video.id) ? '已加入对比' : '对比' }}</Button><Button v-if="video.state === '生成中'" size="small" @click="emit('cancelVideo', video)">取消</Button><Button v-if="['生成失败','已取消'].includes(video.state)" size="small" @click="emit('retryVideo', video, activeTrack)">重试</Button><Button danger size="small" type="text" @click="emit('deleteVideo', video)">删除</Button></div>
                     <div class="video-actions">
                       <Tooltip :title="videoQualityPresentation(video).detail"><Tag :color="videoQualityPresentation(video).color">{{ videoQualityPresentation(video).label }}</Tag></Tooltip>
+                      <Button v-if="hasVideoGenerationSnapshot(video)" size="small" @click="snapshotVideo = video">生成快照</Button>
                       <Button v-if="videoUrl(video) && !['生成中', '已取消'].includes(video.state)" size="small" :loading="inspectingVideoIds.includes(video.id)" @click="inspectVideo(video)">检查质量</Button>
                     </div>
                     <p v-if="video.errorReason" class="video-quality-error">{{ video.errorReason }}</p>
@@ -979,6 +1009,41 @@ onActivated(() => {
     <Modal root-class-name="toon-overlay" v-model:open="previewVideo" width="76vw" :footer="null" title="视频预览" destroy-on-close>
           <video v-if="videoUrl(previewVideo)" :key="previewVideo?.id" :src="videoUrl(previewVideo)" class="preview-player" controls disablepictureinpicture disableremoteplayback controlslist="nodownload noplaybackrate" preload="metadata" playsinline />
     </Modal>
+    <Modal root-class-name="toon-overlay" v-model:open="snapshotVideo" width="920px" :footer="null" title="视频生成快照" destroy-on-close>
+      <div class="generation-snapshot">
+        <div class="snapshot-summary">
+          <Tag color="blue">快照 v{{ snapshotRequest.version ?? 1 }}</Tag>
+          <Tag>{{ snapshotRequest.model || '模型未记录' }}</Tag>
+          <Tag>{{ snapshotRequest.payload?.mode || '模式未记录' }}</Tag>
+          <span>视频任务 #{{ snapshotVideo?.id }}</span>
+        </div>
+        <section>
+          <header><b>实际参考图</b><span>{{ snapshotReferences.length }} 张 · 顺序与供应商请求一致</span></header>
+          <div v-if="snapshotReferences.length" class="snapshot-reference-list">
+            <article v-for="reference in snapshotReferences" :key="`${reference.index}-${reference.url}`">
+              <img v-if="reference.url" :src="assetFileUrl(String(reference.url))" :alt="reference.name || `参考图 ${reference.index}`" loading="lazy" />
+              <div><b>@图{{ reference.index }} · {{ reference.name || '非资产帧' }}</b><span>{{ snapshotRoleLabel(reference) }}</span><small v-if="reference.assetId">资产 #{{ reference.assetId }} · 图片 #{{ reference.imageId ?? '—' }} · {{ reference.assetType }}</small><small class="snapshot-url">{{ reference.url || 'URL 未记录' }}</small></div>
+            </article>
+          </div>
+          <Empty v-else :image="Empty.PRESENTED_IMAGE_SIMPLE" description="该任务没有参考图快照" />
+        </section>
+        <section>
+          <header><b>结构化镜头</b><span>{{ snapshotShots.length }} 个镜头</span></header>
+          <div v-if="snapshotShots.length" class="snapshot-shot-list">
+            <article v-for="shot in snapshotShots" :key="shot.storyboardId ?? shot.sequence">
+              <div class="snapshot-shot-heading"><b>镜头 {{ shot.sequence ?? '—' }}</b><Tag>{{ shot.durationSeconds ?? '—' }} 秒</Tag><span>{{ shot.sceneKey || '未分场' }}<template v-if="shot.sceneStateKey"> · {{ shot.sceneStateKey }}</template></span></div>
+              <p>{{ shot.description || '无画面描述' }}</p>
+              <div v-if="shot.references?.length" class="snapshot-shot-references"><Tag v-for="reference in shot.references" :key="reference.assetId">{{ reference.index ? `@图${reference.index} · ` : '' }}{{ reference.name || `资产 #${reference.assetId}` }}</Tag></div>
+            </article>
+          </div>
+          <Empty v-else :image="Empty.PRESENTED_IMAGE_SIMPLE" description="旧任务尚无结构化镜头快照" />
+        </section>
+        <section>
+          <header><b>供应商请求参数</b><span>凭据不会写入生成快照</span></header>
+          <pre>{{ JSON.stringify(snapshotRequest.payload ?? {}, null, 2) }}</pre>
+        </section>
+      </div>
+    </Modal>
     <Modal root-class-name="toon-overlay" v-model:open="compareOpen" width="90vw" title="候选版本对比" :footer="null" destroy-on-close>
       <div class="compare-grid">
         <article v-for="video in compareVideos" :key="video.id" class="compare-item">
@@ -1060,6 +1125,25 @@ onActivated(() => {
 .video-card { overflow: hidden; border: 1px solid var(--ant-color-border-secondary); border-radius: 8px; }
 .video-card--selected { border-color: var(--ant-color-primary); box-shadow: 0 0 0 2px var(--ant-color-primary-bg); }
 .compare-grid { display:grid; gap:16px; grid-template-columns:repeat(2,minmax(0,1fr)); }.compare-item { padding:12px; border:1px solid var(--ant-color-border-secondary); border-radius:8px; }.compare-heading { display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; }.compare-item video { display:block; width:100%; max-height:60vh; aspect-ratio:16/9; margin-bottom:12px; background:#000; object-fit:contain; }
+.generation-snapshot { display: grid; gap: 16px; }
+.snapshot-summary { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.snapshot-summary > span { margin-left: auto; color: var(--ant-color-text-tertiary); font-size: 12px; }
+.generation-snapshot > section { padding: 14px; border: 1px solid var(--ant-color-border-secondary); border-radius: 8px; background: var(--ant-color-bg-layout); }
+.generation-snapshot > section > header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+.generation-snapshot > section > header span { color: var(--ant-color-text-tertiary); font-size: 12px; }
+.snapshot-reference-list, .snapshot-shot-list { display: grid; gap: 8px; }
+.snapshot-reference-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.snapshot-reference-list article { display: grid; min-width: 0; gap: 10px; padding: 8px; border: 1px solid var(--ant-color-border-secondary); border-radius: 7px; background: var(--ant-color-bg-container); grid-template-columns: 96px minmax(0, 1fr); }
+.snapshot-reference-list img { width: 96px; height: 64px; border-radius: 5px; background: #000; object-fit: contain; }
+.snapshot-reference-list article > div { display: grid; min-width: 0; align-content: start; gap: 3px; }
+.snapshot-reference-list span, .snapshot-reference-list small { color: var(--ant-color-text-secondary); font-size: 11px; }
+.snapshot-url { overflow: hidden; color: var(--ant-color-text-tertiary) !important; text-overflow: ellipsis; white-space: nowrap; }
+.snapshot-shot-list article { padding: 10px; border-left: 3px solid var(--ant-color-primary); border-radius: 5px; background: var(--ant-color-bg-container); }
+.snapshot-shot-heading { display: flex; align-items: center; gap: 8px; }
+.snapshot-shot-heading > span:last-child { margin-left: auto; color: var(--ant-color-text-tertiary); font-size: 11px; }
+.snapshot-shot-list p { margin: 8px 0; color: var(--ant-color-text-secondary); line-height: 1.6; white-space: pre-wrap; }
+.snapshot-shot-references { display: flex; gap: 4px; flex-wrap: wrap; }
+.generation-snapshot pre { max-height: 320px; margin: 0; padding: 10px; overflow: auto; border-radius: 6px; color: var(--ant-color-text-secondary); background: var(--ant-color-fill-tertiary); font-size: 11px; white-space: pre-wrap; word-break: break-all; }
 .video-preview { position: relative; display: grid; width: 100%; overflow: hidden; aspect-ratio: 16 / 9; padding: 0; border: 0; color: #fff; background: var(--toon-ink); cursor: pointer; place-items: center; }.video-preview video { width: 100%; height: 100%; object-fit: cover; }
 .video-placeholder { display: grid; gap: 8px; color: var(--toon-line); font-size: 12px; place-items: center; }.video-state { position: absolute; top: 8px; left: 8px; }.play-mark { position: absolute; display: grid; width: 38px; height: 38px; border-radius: 50%; background: rgb(0 0 0 / 50%); place-items: center; }
 .generating-ring { width: 24px; height: 24px; border: 2px solid rgb(255 255 255 / 25%); border-top-color: #fff; border-radius: 50%; animation: spin 0.9s linear infinite; }

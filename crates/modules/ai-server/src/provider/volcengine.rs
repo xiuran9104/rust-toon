@@ -34,11 +34,13 @@ pub(super) fn apply_image_generation_options(model: &str, body: &mut Value) {
     }
 }
 
-fn normalize_seedance_duration(model: &str, duration: i64) -> i64 {
-    if model.to_ascii_lowercase().contains("seedance-1-5") {
-        duration.clamp(4, 12)
+fn validate_seedance_duration(model: &str, duration: i64) -> Result<i64, String> {
+    if model.to_ascii_lowercase().contains("seedance-1-5") && !(4..=12).contains(&duration) {
+        Err(format!(
+            "Seedance 1.5 不支持 {duration} 秒视频，允许范围为 4 至 12 秒"
+        ))
     } else {
-        duration
+        Ok(duration)
     }
 }
 
@@ -105,10 +107,12 @@ impl VolcEngineMediaProvider {
         ] {
             if let Some(value) = payload.get(key).cloned() {
                 let value = if key == "duration" {
-                    value
-                        .as_i64()
-                        .map(|duration| json!(normalize_seedance_duration(&config.model, duration)))
-                        .unwrap_or(value)
+                    match value.as_i64() {
+                        Some(duration) => {
+                            json!(validate_seedance_duration(&config.model, duration)?)
+                        }
+                        None => value,
+                    }
                 } else {
                     value
                 };
@@ -222,7 +226,7 @@ impl VolcEngineMediaProvider {
 #[cfg(test)]
 mod tests {
     use super::{
-        VolcEngineMediaProvider, apply_image_generation_options, normalize_seedance_duration,
+        VolcEngineMediaProvider, apply_image_generation_options, validate_seedance_duration,
         normalize_seedream_size,
     };
     use rust_toon_ai_api::ModelConfig;
@@ -277,13 +281,17 @@ mod tests {
     }
 
     #[test]
-    fn clamps_seedance_1_5_duration_to_provider_range() {
-        assert_eq!(normalize_seedance_duration("doubao-seedance-1-5-pro", 3), 4);
+    fn rejects_unsupported_seedance_1_5_duration_without_clamping() {
+        assert!(validate_seedance_duration("doubao-seedance-1-5-pro", 3).is_err());
+        assert!(validate_seedance_duration("doubao-seedance-1-5-pro", 15).is_err());
         assert_eq!(
-            normalize_seedance_duration("doubao-seedance-1-5-pro", 15),
-            12
+            validate_seedance_duration("doubao-seedance-1-5-pro", 4).unwrap(),
+            4
         );
-        assert_eq!(normalize_seedance_duration("doubao-seedance-2-0", 3), 3);
+        assert_eq!(
+            validate_seedance_duration("doubao-seedance-2-0", 3).unwrap(),
+            3
+        );
     }
 
     #[test]

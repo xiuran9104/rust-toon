@@ -256,6 +256,16 @@ pub struct ModelCapabilities {
     pub think_levels: Vec<String>,
     #[serde(default)]
     pub multi_reference: bool,
+    #[serde(default)]
+    pub video_resolutions: Vec<String>,
+    #[serde(default)]
+    pub video_min_duration: Option<i64>,
+    #[serde(default)]
+    pub video_max_duration: Option<i64>,
+    #[serde(default)]
+    pub video_max_references: Option<usize>,
+    #[serde(default)]
+    pub video_audio: Option<bool>,
 }
 
 impl ModelConfig {

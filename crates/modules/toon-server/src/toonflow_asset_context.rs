@@ -19,6 +19,15 @@ pub(crate) struct StoryboardAssetReference {
 }
 
 #[derive(Clone, Debug, FromRow)]
+pub(crate) struct TrackAssetReference {
+    pub(crate) asset_id: i64,
+    pub(crate) asset_name: String,
+    pub(crate) asset_type: String,
+    pub(crate) image_id: i64,
+    pub(crate) file_path: String,
+}
+
+#[derive(Clone, Debug, FromRow)]
 struct StoryboardAssetReferenceRow {
     asset_name: String,
     asset_type: String,
@@ -168,8 +177,27 @@ pub async fn load_track_asset_references(
     script_id: i64,
     track_id: i64,
 ) -> Result<Vec<String>, sqlx::Error> {
-    sqlx::query_scalar(
-        r#"SELECT DISTINCT i.file_path
+    Ok(load_track_asset_reference_manifest(pool, project_id, script_id, track_id)
+        .await?
+        .into_iter()
+        .map(|reference| reference.file_path)
+        .collect())
+}
+
+/// Loads the canonical video-reference manifest in storyboard first-use order.
+pub async fn load_track_asset_reference_manifest(
+    pool: &sqlx::PgPool,
+    project_id: i64,
+    script_id: i64,
+    track_id: i64,
+) -> Result<Vec<TrackAssetReference>, sqlx::Error> {
+    sqlx::query_as(
+        r#"SELECT asset_id,asset_name,asset_type,image_id,file_path
+           FROM (
+             SELECT DISTINCT ON (i.file_path)
+                    a.id AS asset_id,a.name AS asset_name,a.type AS asset_type,
+                    i.id AS image_id,i.file_path,
+                    s.id AS storyboard_id,ast.sort_order
            FROM toonflow.storyboards s
            JOIN toonflow.assets_storyboards ast ON ast.storyboard_id=s.id
            JOIN toonflow.assets a ON a.id=ast.asset_id
@@ -177,7 +205,9 @@ pub async fn load_track_asset_references(
            WHERE s.track_id=$1 AND s.project_id=$2 AND s.script_id=$3
              AND a.project_id=$2
              AND i.file_path IS NOT NULL AND i.file_path <> ''
-           ORDER BY i.file_path"#,
+             ORDER BY i.file_path,s.id,ast.sort_order,a.id
+           ) ordered_references
+           ORDER BY storyboard_id,sort_order,asset_id"#,
     )
     .bind(track_id)
     .bind(project_id)

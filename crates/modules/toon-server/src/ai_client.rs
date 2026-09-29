@@ -595,6 +595,16 @@ async fn validate_video_request(
         .await
         .map_err(normalized_app_error)?;
     let capabilities = config.capabilities();
+    validate_video_payload(&config.name, &config.model, &capabilities, payload)?;
+    Ok(model_id)
+}
+
+fn validate_video_payload(
+    model_name: &str,
+    model: &str,
+    capabilities: &rust_toon_ai_api::ModelCapabilities,
+    payload: &Value,
+) -> Result<(), String> {
     let mode = payload
         .get("mode")
         .and_then(Value::as_str)
@@ -603,10 +613,62 @@ async fn validate_video_request(
         && !mode.is_empty()
         && !capabilities.video_modes.iter().any(|value| value == mode)
     {
-        return Err(format!("模型 {} 不支持视频模式 {mode}", config.name));
+        return Err(format!("模型 {model_name} 不支持视频模式 {mode}"));
+    }
+    let reference_count = payload
+        .get("references")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let expected_references = match mode {
+        "text" => None,
+        "singleImage" => Some((1, 1)),
+        "startEndRequired" => Some((2, 2)),
+        "endFrameOptional" | "startFrameOptional" => Some((1, 2)),
+        "" => None,
+        _ => return Err(format!("未知的视频生成模式：{mode}")),
+    };
+    if let Some((minimum, maximum)) = expected_references
+        && !(minimum..=maximum).contains(&reference_count)
+    {
+        return Err(format!(
+            "视频模式 {mode} 需要 {minimum} 至 {maximum} 张参考图，实际 {reference_count} 张"
+        ));
+    }
+    let maximum_references = capabilities.video_max_references.unwrap_or(4);
+    if reference_count > maximum_references {
+        return Err(format!(
+            "模型 {model_name} 最多支持 {maximum_references} 张参考图，实际 {reference_count} 张"
+        ));
     }
     let duration = payload.get("duration").and_then(Value::as_i64);
     let resolution = payload.get("resolution").and_then(Value::as_str);
+    if let Some(duration) = duration {
+        let inferred_seedance_1_5 = model.to_ascii_lowercase().contains("seedance-1-5");
+        let minimum = capabilities
+            .video_min_duration
+            .or(inferred_seedance_1_5.then_some(4));
+        let maximum = capabilities
+            .video_max_duration
+            .or(inferred_seedance_1_5.then_some(12));
+        if minimum.is_some_and(|minimum| duration < minimum)
+            || maximum.is_some_and(|maximum| duration > maximum)
+        {
+            return Err(format!(
+                "模型 {model_name} 不支持 {duration} 秒视频，允许范围为 {} 至 {} 秒",
+                minimum.map_or_else(|| "未限制".into(), |value| value.to_string()),
+                maximum.map_or_else(|| "未限制".into(), |value| value.to_string()),
+            ));
+        }
+    }
+    if let Some(resolution) = resolution
+        && !capabilities.video_resolutions.is_empty()
+        && !capabilities
+            .video_resolutions
+            .iter()
+            .any(|value| value == resolution)
+    {
+        return Err(format!("模型 {model_name} 不支持分辨率 {resolution}"));
+    }
     if let (Some(duration), Some(resolution), Some(allowed)) = (
         duration,
         resolution,
@@ -615,11 +677,15 @@ async fn validate_video_request(
         && !allowed.iter().any(|value| value == resolution)
     {
         return Err(format!(
-            "模型 {} 在 {duration} 秒时不支持分辨率 {resolution}",
-            config.name
+            "模型 {model_name} 在 {duration} 秒时不支持分辨率 {resolution}"
         ));
     }
-    Ok(model_id)
+    if payload.get("audio").and_then(Value::as_bool) == Some(true)
+        && capabilities.video_audio == Some(false)
+    {
+        return Err(format!("模型 {model_name} 不支持同步生成音频"));
+    }
+    Ok(())
 }
 
 pub async fn speech(
@@ -648,7 +714,9 @@ pub async fn speech(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_transient_model_error, should_record_task};
+    use super::{is_transient_model_error, should_record_task, validate_video_payload};
+    use rust_toon_ai_api::ModelCapabilities;
+    use serde_json::json;
 
     #[test]
     fn nested_text_requests_are_not_user_visible_tasks() {
@@ -670,5 +738,79 @@ mod tests {
         assert!(!is_transient_model_error(
             "input text may contain sensitive information"
         ));
+    }
+
+    #[test]
+    fn validates_video_modes_reference_counts_and_audio_capability() {
+        let capabilities = ModelCapabilities {
+            video_modes: vec!["singleImage".into(), "startEndRequired".into()],
+            video_resolutions: vec!["720p".into(), "1080p".into()],
+            video_min_duration: Some(4),
+            video_max_duration: Some(10),
+            video_max_references: Some(2),
+            video_audio: Some(false),
+            ..Default::default()
+        };
+        assert!(validate_video_payload(
+            "测试视频模型",
+            "video-v1",
+            &capabilities,
+            &json!({
+                "mode":"startEndRequired",
+                "references":["first","last"],
+                "duration":6,
+                "resolution":"1080p",
+                "audio":false
+            }),
+        )
+        .is_ok());
+        assert!(validate_video_payload(
+            "测试视频模型",
+            "video-v1",
+            &capabilities,
+            &json!({"mode":"startEndRequired","references":["first"],"duration":6}),
+        )
+        .unwrap_err()
+        .contains("需要 2 至 2 张参考图"));
+        assert!(validate_video_payload(
+            "测试视频模型",
+            "video-v1",
+            &capabilities,
+            &json!({"mode":"singleImage","references":["first"],"duration":6,"audio":true}),
+        )
+        .unwrap_err()
+        .contains("不支持同步生成音频"));
+    }
+
+    #[test]
+    fn rejects_configured_resolution_duration_and_seedance_legacy_clamping() {
+        let capabilities = ModelCapabilities {
+            video_resolutions: vec!["720p".into()],
+            video_min_duration: Some(5),
+            video_max_duration: Some(8),
+            ..Default::default()
+        };
+        assert!(validate_video_payload(
+            "限制模型",
+            "video-v1",
+            &capabilities,
+            &json!({"mode":"text","references":[],"duration":4,"resolution":"720p"}),
+        )
+        .is_err());
+        assert!(validate_video_payload(
+            "限制模型",
+            "video-v1",
+            &capabilities,
+            &json!({"mode":"text","references":[],"duration":6,"resolution":"1080p"}),
+        )
+        .is_err());
+        assert!(validate_video_payload(
+            "Seedance 1.5",
+            "doubao-seedance-1-5-pro",
+            &ModelCapabilities::default(),
+            &json!({"mode":"text","references":[],"duration":3}),
+        )
+        .unwrap_err()
+        .contains("允许范围为 4 至 12 秒"));
     }
 }
