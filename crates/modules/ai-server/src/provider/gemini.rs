@@ -226,6 +226,7 @@ mod tests {
             }],
             temperature: None,
             max_tokens: None,
+            ..Default::default()
         });
         assert_eq!(v["contents"][0]["role"], "model");
     }

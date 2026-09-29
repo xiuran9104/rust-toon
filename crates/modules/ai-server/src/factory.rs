@@ -1,7 +1,6 @@
 use crate::provider::{
-    AnthropicProvider, AzureOpenAiProvider, ChatProvider, GeminiProvider,
-    OpenAiCompatibleProvider, provider_app_error,
-    VolcEngineMediaProvider,
+    AgentEngineProvider, AnthropicProvider, AzureOpenAiProvider, ChatProvider, GeminiProvider,
+    OpenAiCompatibleProvider, VolcEngineMediaProvider, provider_app_error,
 };
 use rust_toon_ai_api::{
     AiModelType, AiPlatform, ChatRequest, ChatResponse, EmbeddingRequest, EmbeddingResponse,
@@ -83,6 +82,7 @@ impl AiModelFactory {
             AiPlatform::Anthropic => Box::new(AnthropicProvider),
             AiPlatform::Gemini => Box::new(GeminiProvider),
             AiPlatform::AzureOpenAI => Box::new(AzureOpenAiProvider),
+            AiPlatform::AgentEngine => Box::new(AgentEngineProvider),
             _ => {
                 return Err(AppError::bad_request(format!(
                     "platform {} provider is not implemented yet",
@@ -150,6 +150,12 @@ impl AiModelFactory {
             | AiPlatform::Ollama
             | AiPlatform::OpenAICompatible => OpenAiCompatibleProvider
                 .raw_chat_with_header(&config, body, "authorization")
+                .await
+                .map_err(provider_app_error),
+            // The engine runs its own built-in tools; external tool
+            // definitions are ignored for this platform.
+            AiPlatform::AgentEngine => AgentEngineProvider
+                .chat_tools(&config, messages)
                 .await
                 .map_err(provider_app_error),
             _ => Err(AppError::bad_request(format!(
@@ -237,6 +243,12 @@ impl AiModelFactory {
                 .chat_tools_stream(&config, messages, tools, on_delta)
                 .await
                 .map_err(provider_app_error),
+            // External tool definitions are ignored: the engine drives its
+            // own built-in tools, so this reuses the plain engine turn.
+            AiPlatform::AgentEngine => AgentEngineProvider
+                .chat_tools_stream(&config, messages, on_delta)
+                .await
+                .map_err(provider_app_error),
             _ => Err(AppError::bad_request(format!(
                 "平台 {} 暂不支持流式工具调用",
                 config.platform
@@ -292,6 +304,10 @@ impl AiModelFactory {
                 .await
                 .map_err(provider_app_error),
             AiPlatform::AzureOpenAI => AzureOpenAiProvider
+                .chat_stream(&config, &request, on_delta)
+                .await
+                .map_err(provider_app_error),
+            AiPlatform::AgentEngine => AgentEngineProvider
                 .chat_stream(&config, &request, on_delta)
                 .await
                 .map_err(provider_app_error),

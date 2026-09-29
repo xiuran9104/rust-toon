@@ -292,6 +292,7 @@ fn chat_request(
         ],
         temperature: Some(temperature as f64),
         max_tokens: (tokens > 0).then_some(tokens as u32),
+        ..Default::default()
     }
 }
 pub async fn project_text(

@@ -2,6 +2,7 @@ mod chat;
 mod chat_role;
 mod factory;
 mod knowledge;
+mod knowledge_download;
 mod media;
 mod midjourney;
 mod model_prompt_map;
@@ -264,7 +265,10 @@ async fn resolve_api_key(
     if !request.api_key.trim().is_empty() {
         return Ok(request.api_key.trim().to_string());
     }
-    if AiPlatform::parse(&request.platform) == Some(AiPlatform::Ollama) {
+    if matches!(
+        AiPlatform::parse(&request.platform),
+        Some(AiPlatform::Ollama | AiPlatform::AgentEngine)
+    ) {
         return Ok(String::new());
     }
     let api_key: Option<String> = sqlx::query_scalar(
@@ -532,6 +536,7 @@ async fn test(
                         }],
                         temperature: Some(0.2),
                         max_tokens: Some(256),
+                        ..Default::default()
                     },
                 )
                 .await?;

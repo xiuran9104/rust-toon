@@ -6,7 +6,7 @@ use axum::{
     routing::{delete, get, post, put},
 };
 use futures_util::stream;
-use rust_toon_ai_api::{ChatMessage, ChatRequest, ChatResponse};
+use rust_toon_ai_api::{AiPlatform, ChatMessage, ChatRequest, ChatResponse};
 use rust_toon_framework_common::ApiResponse;
 use rust_toon_framework_security::CurrentUser;
 use rust_toon_framework_web::AppError;
@@ -327,6 +327,10 @@ async fn load_request(
             messages: list,
             temperature: Some(c.get("temperature")),
             max_tokens: Some(c.get::<i32, _>("max_tokens") as u32),
+            conversation_id: Some(v.conversation_id),
+            user_id: Some(user.user_id.clone()),
+            tenant_id: user.tenant_id.clone(),
+            system_message: c.get::<Option<String>, _>("system_message"),
         },
         send,
         c.get("tool_ids"),
@@ -341,6 +345,23 @@ async fn generate(
 ) -> Result<(ChatResponse, Value), AppError> {
     let tools = crate::tools::load_definitions(&state.pool, tool_ids).await?;
     if tools.is_empty() {
+        return state
+            .factory
+            .chat(model_id, request)
+            .await
+            .map(|r| (r, json!([])));
+    }
+    // AgentEngine drives its own built-in tools inside the sidecar, so the
+    // rust-toon tool loop and external tool definitions do not apply; the
+    // turn is routed to the plain engine chat with the threaded identity.
+    if state
+        .factory
+        .config(model_id)
+        .await
+        .ok()
+        .and_then(|config| AiPlatform::parse(&config.platform))
+        == Some(AiPlatform::AgentEngine)
+    {
         return state
             .factory
             .chat(model_id, request)
@@ -458,6 +479,17 @@ async fn send_stream(
     let (model_id, receive_id, request, send, tool_ids, knowledge_status) =
         load_request(&state, &user, &v).await?;
     let conversation_id = v.conversation_id;
+    // AgentEngine runs its tool loop inside the sidecar and streams like a
+    // plain chat model, so it skips the buffered rust-toon tool loop even
+    // when the conversation carries tool bindings.
+    let direct_stream = tool_ids.is_empty()
+        || state
+            .factory
+            .config(model_id)
+            .await
+            .ok()
+            .and_then(|config| AiPlatform::parse(&config.platform))
+            == Some(AiPlatform::AgentEngine);
     let (tx, rx) = mpsc::channel::<Result<String, std::convert::Infallible>>(32);
     let pool = state.pool.clone();
     let factory = state.factory.clone();
@@ -466,14 +498,14 @@ async fn send_stream(
         let send_for_chunks = send.clone();
         let knowledge_status_for_chunks = knowledge_status.clone();
         let tx_chunks = tx.clone();
-        let result = if tool_ids.is_empty() {
+        let result = if direct_stream {
             factory.chat_stream(model_id,request,move|delta|{let tx=tx_chunks.clone();let send=send_for_chunks.clone();let knowledge_status=knowledge_status_for_chunks.clone();async move{let payload=json!({"code":0,"data":{"send":send,"receive":{"id":receive_id,"conversationId":conversation_id,"type":"assistant","modelId":model_id,"content":delta,"reasoningContent":null,"knowledgeStatus":knowledge_status}},"msg":""});tx.send(Ok(format!("data: {}\n\n",payload))).await.map_err(|_|"客户端已断开".to_string())}}).await.map(|r|(r,json!([])))
         } else {
             generate(&state_for_tools, model_id, request, &tool_ids).await
         };
         match result {
             Ok((response, tool_calls)) => {
-                if !tool_ids.is_empty() {
+                if !direct_stream {
                     let payload = json!({"code":0,"data":{"send":send,"receive":{"id":receive_id,"conversationId":conversation_id,"type":"assistant","modelId":model_id,"content":response.content,"reasoningContent":response.reasoning,"knowledgeStatus":knowledge_status}},"msg":""});
                     let _ = tx.send(Ok(format!("data: {}\n\n", payload))).await;
                 }

@@ -14,11 +14,19 @@ fn merge_tool_call_delta(target: &mut Value, part: &Value) {
     // Ark sends empty IDs and names on argument-only chunks. These must not
     // erase the metadata from the first chunk. Function names can also arrive
     // in fragments, just like arguments.
-    if let Some(id) = part.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()) {
+    if let Some(id) = part
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    {
         target["id"] = json!(id);
     }
     for key in ["name", "arguments"] {
-        if let Some(fragment) = part.get("function").and_then(|f| f.get(key)).and_then(Value::as_str) {
+        if let Some(fragment) = part
+            .get("function")
+            .and_then(|f| f.get(key))
+            .and_then(Value::as_str)
+        {
             let previous = target["function"][key].as_str().unwrap_or("");
             target["function"][key] = json!(format!("{previous}{fragment}"));
         }
@@ -196,14 +204,16 @@ fn ai_resilience_error(error: rust_toon_framework_resilience::ResilienceError) -
     .encoded()
 }
 
+mod agent_engine;
 mod anthropic;
 mod azure;
-mod volcengine;
 mod gemini;
+mod volcengine;
+pub use agent_engine::AgentEngineProvider;
 pub use anthropic::AnthropicProvider;
 pub use azure::AzureOpenAiProvider;
-pub use volcengine::VolcEngineMediaProvider;
 pub use gemini::GeminiProvider;
+pub use volcengine::VolcEngineMediaProvider;
 
 fn value_as_id(value: &Value) -> Option<String> {
     value
@@ -950,27 +960,48 @@ impl ChatProvider for OpenAiCompatibleProvider {
 
 #[cfg(test)]
 mod structured_error_tests {
-    use super::{ProviderError, merge_tool_call_delta, provider_app_error, retryable_status, upstream_error};
+    use super::{
+        ProviderError, merge_tool_call_delta, provider_app_error, retryable_status, upstream_error,
+    };
     use reqwest::StatusCode;
     use serde_json::json;
 
     #[test]
     fn tool_stream_preserves_metadata_across_empty_ark_chunks() {
         let mut call = json!({"id":"","type":"function","function":{"name":"","arguments":""}});
-        merge_tool_call_delta(&mut call, &json!({"id":"call_1","function":{"name":"read_skill_file","arguments":""}}));
-        merge_tool_call_delta(&mut call, &json!({"id":"","function":{"name":"","arguments":"{\"path\":"}}));
-        merge_tool_call_delta(&mut call, &json!({"id":"","function":{"name":"","arguments":"\"production_skills/storyboard_prompt_techniques.md\"}"}}));
+        merge_tool_call_delta(
+            &mut call,
+            &json!({"id":"call_1","function":{"name":"read_skill_file","arguments":""}}),
+        );
+        merge_tool_call_delta(
+            &mut call,
+            &json!({"id":"","function":{"name":"","arguments":"{\"path\":"}}),
+        );
+        merge_tool_call_delta(
+            &mut call,
+            &json!({"id":"","function":{"name":"","arguments":"\"production_skills/storyboard_prompt_techniques.md\"}"}}),
+        );
         assert_eq!(call["id"], "call_1");
         assert_eq!(call["function"]["name"], "read_skill_file");
-        let args: serde_json::Value = serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
-        assert_eq!(args["path"], "production_skills/storyboard_prompt_techniques.md");
+        let args: serde_json::Value =
+            serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            args["path"],
+            "production_skills/storyboard_prompt_techniques.md"
+        );
     }
 
     #[test]
     fn tool_stream_accumulates_fragmented_names_and_arguments() {
         let mut call = json!({"id":"","function":{"name":"","arguments":""}});
-        merge_tool_call_delta(&mut call, &json!({"id":"call_2","function":{"name":"get_novel_","arguments":"{"}}));
-        merge_tool_call_delta(&mut call, &json!({"function":{"name":"events","arguments":"}"}}));
+        merge_tool_call_delta(
+            &mut call,
+            &json!({"id":"call_2","function":{"name":"get_novel_","arguments":"{"}}),
+        );
+        merge_tool_call_delta(
+            &mut call,
+            &json!({"function":{"name":"events","arguments":"}"}}),
+        );
         assert_eq!(call["id"], "call_2");
         assert_eq!(call["function"]["name"], "get_novel_events");
         assert_eq!(call["function"]["arguments"], "{}");

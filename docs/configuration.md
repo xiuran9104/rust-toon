@@ -105,19 +105,19 @@ Worker 文档只允许调整四个后台扫描周期，不会动态改变任务�
 | --- | --- | --- | --- |
 | `INFRA_UPLOAD_MAX_BYTES` | `20971520`（20 MiB） | `/infra/file/upload` 的文件体积上限；最大可配置为 100 MiB | `infra-server/src/lib.rs` |
 
-当前应用运行时文件统一存入 MinIO/S3；`INFRA_UPLOAD_DIR` 只由旧本地文件迁移脚本读取，不再是 Gateway 运行参数。FFmpeg/供应商下载的中间文件使用系统临时目录并在完成或恢复时清理。
+当前应用运行时文件统一存入 S3 兼容对象存储；`INFRA_UPLOAD_DIR` 只由旧本地文件迁移脚本读取，不再是 Gateway 运行参数。FFmpeg/供应商下载的中间文件使用系统临时目录并在完成或恢复时清理。
 
-### 1.8 MinIO 对象存储（`crates/modules/toon-server/src/toonflow_storage.rs`）
+### 1.8 对象存储（RustFS，S3 兼容）（`crates/modules/toon-server/src/toonflow_storage.rs`）
 
-网关以自实现的 AWS SigV4 签名直连 MinIO/S3：
+网关以自实现的 AWS SigV4 签名直连 S3 兼容对象存储（本地为 RustFS）：：
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `MINIO_ENDPOINT` | `http://127.0.0.1:9000` | S3 endpoint（末尾 `/` 会被裁剪） |
-| `MINIO_ACCESS_KEY` | `rust_toon` | 与 compose 的 `MINIO_ROOT_USER` 对应 |
-| `MINIO_SECRET_KEY` | `rust_toon_password` | 与 compose 的 `MINIO_ROOT_PASSWORD` 对应 |
-| `MINIO_BUCKET` | `rust-toon` | 桶名 |
-| `MINIO_REGION` | `us-east-1` | 签名区域 |
+| `S3_ENDPOINT` | `http://127.0.0.1:9000` | S3 endpoint（末尾 `/` 会被裁剪） |
+| `S3_ACCESS_KEY` | `rust_toon` | 与 compose 的 `RUSTFS_ACCESS_KEY` 对应 |
+| `S3_SECRET_KEY` | `rust_toon_password` | 与 compose 的 `RUSTFS_SECRET_KEY` 对应 |
+| `S3_BUCKET` | `rust-toon` | 桶名 |
+| `S3_REGION` | `us-east-1` | 签名区域 |
 
 ### 1.9 可观测性（`crates/framework/telemetry`）
 
@@ -144,13 +144,15 @@ Gateway 与 Toon Worker 默认在各自监听端口暴露 `GET /metrics`，使�
 | --- | --- | --- | --- |
 | `RUST_ENV` | `development` | 运行环境标识，展示在 infra 监控的服务器信息中 | `infra-server/src/monitor.rs` |
 | `READINESS_REQUIRE_REDIS` | 设置了 `REDIS_URL` 时为 `true` | Redis 不可用时让 `/readyz` 返回 503 | `gateway/src/readiness.rs` |
-| `READINESS_REQUIRE_MINIO` | 生产环境或设置了 `MINIO_ENDPOINT` 时为 `true` | 使用生产链路同款签名 S3 请求验证凭据和 bucket；不可访问时让 `/readyz` 返回 503 | `gateway/src/readiness.rs` |
+| `READINESS_REQUIRE_OBJECT_STORAGE` | 生产环境或设置了 `S3_ENDPOINT` 时为 `true` | 使用生产链路同款签名 S3 请求验证凭据和 bucket；不可访问时让 `/readyz` 返回 503 | `gateway/src/readiness.rs` |
 | `READINESS_REQUIRE_FFMPEG` | `false` | 仅在承担成片导出的节点上启用；缺少或无法执行 FFmpeg/FFprobe 时让 `/readyz` 返回 503 | `gateway/src/readiness.rs` |
 | `SECRET_ENCRYPTION_KEY` | 回退 `JWT_SECRET`，再回退内置常量 `rust-toon-local-secret` | AI 模型 api_key、文件配置等敏感字段落库时的对称加密密钥（`enc:v1:` 前缀格式） | `system-server/src/management/compat.rs`、`infra-server/src/lib.rs` |
 | `TEST_DATABASE_URL` | 无 | 仅测试使用：迁移测试与分镜数据库集成测试 | `toon-server/src/lib.rs` 测试、`script/test-database-migrations.sh` |
 | `TEST_POSTGRES_PORT` | `55432` | 迁移测试脚本起临时 PostgreSQL 容器所用端口 | `script/test-database-migrations.sh` |
 | `AI_REQUEST_TIMEOUT_SECONDS` | `120` | AI Provider 单次 HTTP 请求总超时，实际限制在 5～900 秒；连接超时固定为 15 秒 | `ai-server/src/provider.rs` |
 | `AI_REQUEST_RETRIES` | `2` | AI Provider 失败重试次数，实际最多 5 次；连接失败、超时、408/409/425/429 和 5xx 会指数退避重试，支持上游 `Retry-After` | `ai-server/src/provider.rs` |
+| `PIREN_SIDECAR_URL` | `http://127.0.0.1:7750` | AgentEngine 平台的 Agent 引擎 sidecar 地址（`AgentEngine` 模型配置的平台字符串为 `AgentEngine`，亦接受 `agent-engine`）；请求路径固定为 `/sidecar/v1/turn`，超时与重试复用 `AI_REQUEST_TIMEOUT_SECONDS` / `AI_REQUEST_RETRIES` | `ai-server/src/provider/agent_engine.rs` |
+| `PIREN_SIDECAR_SECRET` | 无 | AgentEngine 代理 JWT 的 HS256 签名密钥，**至少 32 字节**；未设置或过短时 AgentEngine 调用在首次使用时失败。仅用于 sidecar 代理令牌（`iss=rust-toon`、`aud=piren-sidecar`、有效期 300 秒），与用户登录 `JWT_SECRET` 相互独立 | `ai-server/src/provider/agent_engine.rs` |
 | `AI_VIDEO_POLL_INTERVAL_SECONDS` | `5` | 异步视频任务轮询间隔 | `toon-server/src/ai_client.rs` |
 | `AI_VIDEO_POLL_TIMEOUT_SECONDS` | `600` | 异步视频任务最长等待时间 | `toon-server/src/ai_client.rs` |
 
@@ -158,7 +160,7 @@ Gateway 与 Toon Worker 默认在各自监听端口暴露 `GET /metrics`，使�
 
 最终成片等长任务不在 HTTP 网关进程中执行。网关在同一个 PostgreSQL 事务中写入业务任务和 `toonflow.distributed_jobs`，worker 的 dispatcher 再把任务引用投递到 NATS JetStream。PostgreSQL 是任务真相源，JetStream 使用显式 ACK 和至少一次投递；worker 通过数据库租约、心跳和 fencing token 保证多个实例竞争时只有租约持有者能够提交结果。
 
-视频 Provider 返回成功后，Gateway 会先以流式方式把源视频归档到项目 MinIO，再把视频记录标记为“生成成功”；成片任务只接受这些项目内不可变对象路径，避免排队或重试期间上游签名 URL 过期、换内容。对象清理在 DELETE 前会再次校验 cleanup lease，并检查成片、视频、图片、分镜与连续帧引用；仍被引用的对象只关闭清理任务，不执行删除。
+视频 Provider 返回成功后，Gateway 会先以流式方式把源视频归档到项目对象存储，再把视频记录标记为“生成成功”；成片任务只接受这些项目内不可变对象路径，避免排队或重试期间上游签名 URL 过期、换内容。对象清理在 DELETE 前会再次校验 cleanup lease，并检查成片、视频、图片、分镜与连续帧引用；仍被引用的对象只关闭清理任务，不执行删除。
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -178,8 +180,8 @@ Gateway 与 Toon Worker 默认在各自监听端口暴露 `GET /metrics`，使�
 | `TOON_WORKER_REPUBLISH_AFTER_SECONDS` | `300` | 数据库仍为非终态但 JetStream 消息丢失或超过 MaxDeliver 时，轮换 `message_id` 并重新发布的等待时间 |
 | `TOON_WORKER_REAPER_INTERVAL_SECONDS` | `15` | 过期租约扫描与重试调度周期 |
 | `TOON_WORKER_CLEANUP_INTERVAL_SECONDS` | `5` | 独立对象清理 subsystem 的扫描周期；不会阻塞 worker 注册心跳与任务 reaper |
-| `TOON_WORKER_CLEANUP_TIMEOUT_SECONDS` | `30` | 单个 MinIO 删除请求超时，必须短于任务租约；失败按 PostgreSQL 时间指数退避，最多 20 次 |
-| `TOON_WORKER_STAGING_CLEANUP_DELAY_SECONDS` | `1800` | 失败 attempt 的未引用上传至少延迟多久再删除；实际不会短于 MinIO 流超时，避免 DELETE/PUT 竞态 |
+| `TOON_WORKER_CLEANUP_TIMEOUT_SECONDS` | `30` | 单个对象存储删除请求超时，必须短于任务租约；失败按 PostgreSQL 时间指数退避，最多 20 次 |
+| `TOON_WORKER_STAGING_CLEANUP_DELAY_SECONDS` | `1800` | 失败 attempt 的未引用上传至少延迟多久再删除；实际不会短于对象存储流超时，避免 DELETE/PUT 竞态 |
 | `TOON_WORKER_DRAIN_TIMEOUT_SECONDS` | `45` | Worker 停机时取消在途执行、按当前 fencing token 无损重新排队且不消耗业务重试次数的最长等待时间 |
 | `TOON_WORKER_MAX_SOURCE_BYTES` | `2147483648` | 单个成片源视频的最大字节数 |
 | `TOON_WORKER_MAX_JOB_SOURCE_BYTES` | `10737418240` | 单次成片任务全部源视频的累计最大字节数 |
@@ -190,16 +192,16 @@ Gateway 与 Toon Worker 默认在各自监听端口暴露 `GET /metrics`，使�
 | `TOON_WORKFLOW_STALE_SECONDS` | `7200` | 运行期 panic 兜底扫描判定工作流节点失联前的最小年龄；正常重启由启动修复立即处理 |
 | `TOON_WORKER_FFMPEG_TIMEOUT_SECONDS` | `7200` | 单个 FFmpeg 标准化或合并进程的总超时 |
 | `TOON_WORKER_STALE_WORKDIR_SECONDS` | `604800` | Worker 启动时删除的遗留 attempt 临时目录最小年龄；应大于 FFmpeg 超时 |
-| `MINIO_CONNECT_TIMEOUT_SECONDS` | `10` | Gateway/Worker 连接 MinIO 的超时 |
-| `MINIO_REQUEST_TIMEOUT_SECONDS` | `30` | MinIO HEAD、DELETE 和小对象请求总超时 |
-| `MINIO_STREAM_TIMEOUT_SECONDS` | `1800` | MinIO 视频流式 GET/PUT 总超时，防止连接永久占用 Worker |
+| `S3_CONNECT_TIMEOUT_SECONDS` | `10` | Gateway/Worker 连接对象存储的超时 |
+| `S3_REQUEST_TIMEOUT_SECONDS` | `30` | 对象存储 HEAD、DELETE 和小对象请求总超时 |
+| `S3_STREAM_TIMEOUT_SECONDS` | `1800` | 对象存储视频流式 GET/PUT 总超时，防止连接永久占用 Worker |
 | `NATS_JOB_REPLICAS` | `1` | JetStream stream 副本数；三节点生产集群设为 `3` |
 | `NATS_JOB_MAX_BYTES` | `10737418240` | stream 最大磁盘字节数，达到上限时拒绝新消息而不是删除未 ACK 的旧任务 |
 | `NATS_JOB_ACK_WAIT_SECONDS` | `120` | 未收到 ACK/progress ACK 后的重投等待时间 |
 | `NATS_JOB_MAX_DELIVER` | `20` | 单条消息最大 JetStream 投递次数；数据库 `max_attempts` 仍是业务重试上限 |
 | `NATS_JOB_MAX_ACK_PENDING` | `32` | durable consumer 允许的最大未 ACK 消息数 |
 
-Worker 提供 `/livez` 和 `/readyz`。负载均衡器或编排器应使用 `/readyz`，它必须在 PostgreSQL、JetStream、MinIO 和 FFmpeg 链路可用后才返回成功。网关与 worker 必须共享 PostgreSQL 和 MinIO，所有 worker 必须共享 JetStream；视频吞吐量由 worker 副本数及 `TOON_WORKER_CONCURRENCY` 决定。当前 Agent/Workflow 仍有进程内运行协调，Gateway 暂时必须保持单副本，不能把 HTTP 无状态路由误当成整个 Gateway 已可横向扩容。
+Worker 提供 `/livez` 和 `/readyz`。负载均衡器或编排器应使用 `/readyz`，它必须在 PostgreSQL、JetStream、对象存储和 FFmpeg 链路可用后才返回成功。网关与 worker 必须共享 PostgreSQL 和对象存储，所有 worker 必须共享 JetStream；视频吞吐量由 worker 副本数及 `TOON_WORKER_CONCURRENCY` 决定。当前 Agent/Workflow 仍有进程内运行协调，Gateway 暂时必须保持单副本，不能把 HTTP 无状态路由误当成整个 Gateway 已可横向扩容。
 
 网关提供三个探针：`/health` 保留旧版固定 200 及 `checked_at` 响应字段，`/livez` 只确认进程存活，`/readyz` 检查 PostgreSQL 以及按上述开关要求的 Redis、对象存储、FFmpeg 和 FFprobe。依赖探针均有超时，生产负载均衡应使用 `/readyz`，旧监控或进程管理器可继续使用 `/health`，新部署建议使用 `/livez`。
 
@@ -265,7 +267,7 @@ Vite 和生产 Nginx 都去掉浏览器路径最前面的一个 `/api`；业务 
 | postgres | `postgres:18` | `5432` | 用户/密码/库均为 `rust_toon`，数据卷 `rust-toon-postgres` |
 | redis | `redis:8` | `6379` | 无认证 |
 | nats | `nats:2` | `4222`、`8222` | 已启用 JetStream，文件存储卷 `rust-toon-nats`；8222 为监控端口 |
-| minio | `minio/minio:RELEASE.2025-04-22T22-12-26Z` | `9000`（S3）、`9001`（控制台） | root 账号 `rust_toon` / `rust_toon_password`，数据卷 `rust-toon-minio` |
+| rustfs | `rustfs/rustfs:1.0.0` | `9000`（S3）、`9001`（控制台） | 账号 `rust_toon` / `rust_toon_password`，数据卷 `rust-toon-rustfs` |
 | rnacos | `qingpan/rnacos:v0.8.6` | `8848`（SDK）、`9848`（gRPC）、`10848`（控制台） | 本地账号 `rust_toon` / `rust_toon_nacos_password`，数据卷 `rust-toon-rnacos` |
 
 启动：`docker compose -f script/docker/docker-compose.yml up -d`。注意不要把 `sql/postgresql` 挂载进 PostgreSQL 初始化目录——数据库初始化由网关的 SQLx 迁移负责。
