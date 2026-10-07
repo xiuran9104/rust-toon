@@ -152,8 +152,6 @@ Gateway 与 Toon Worker 默认在各自监听端口暴露 `GET /metrics`，使�
 | `TEST_POSTGRES_PORT` | `55432` | 迁移测试脚本起临时 PostgreSQL 容器所用端口 | `script/test-database-migrations.sh` |
 | `AI_REQUEST_TIMEOUT_SECONDS` | `120` | AI Provider 单次 HTTP 请求总超时，实际限制在 5～900 秒；连接超时固定为 15 秒 | `ai-server/src/provider.rs` |
 | `AI_REQUEST_RETRIES` | `2` | AI Provider 失败重试次数，实际最多 5 次；连接失败、超时、408/409/425/429 和 5xx 会指数退避重试，支持上游 `Retry-After` | `ai-server/src/provider.rs` |
-| `PIREN_SIDECAR_URL` | `http://127.0.0.1:7750` | AgentEngine 平台的 Agent 引擎 sidecar 地址（`AgentEngine` 模型配置的平台字符串为 `AgentEngine`，亦接受 `agent-engine`）；请求路径固定为 `/sidecar/v1/turn`，超时与重试复用 `AI_REQUEST_TIMEOUT_SECONDS` / `AI_REQUEST_RETRIES` | `ai-server/src/provider/agent_engine.rs` |
-| `PIREN_SIDECAR_SECRET` | 无 | AgentEngine 代理 JWT 的 HS256 签名密钥，**至少 32 字节**；未设置或过短时 AgentEngine 调用在首次使用时失败。仅用于 sidecar 代理令牌（`iss=rust-toon`、`aud=piren-sidecar`、有效期 300 秒），与用户登录 `JWT_SECRET` 相互独立 | `ai-server/src/provider/agent_engine.rs` |
 | `AI_VIDEO_POLL_INTERVAL_SECONDS` | `5` | 异步视频任务轮询间隔 | `toon-server/src/ai_client.rs` |
 | `AI_VIDEO_POLL_TIMEOUT_SECONDS` | `600` | 异步视频任务最长等待时间 | `toon-server/src/ai_client.rs` |
 

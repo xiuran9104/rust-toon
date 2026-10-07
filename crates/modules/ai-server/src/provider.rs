@@ -239,12 +239,10 @@ fn ai_resilience_error(error: rust_toon_framework_resilience::ResilienceError) -
     .encoded()
 }
 
-mod agent_engine;
 mod anthropic;
 mod azure;
 mod gemini;
 mod volcengine;
-pub use agent_engine::AgentEngineProvider;
 pub use anthropic::AnthropicProvider;
 pub use azure::AzureOpenAiProvider;
 pub use gemini::GeminiProvider;

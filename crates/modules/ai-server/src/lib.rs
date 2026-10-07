@@ -267,7 +267,7 @@ async fn resolve_api_key(
     }
     if matches!(
         AiPlatform::parse(&request.platform),
-        Some(AiPlatform::Ollama | AiPlatform::AgentEngine)
+        Some(AiPlatform::Ollama)
     ) {
         return Ok(String::new());
     }

@@ -25,11 +25,6 @@ pub enum AiPlatform {
     Suno,
     Grok,
     OpenAICompatible,
-    /// External agent-engine sidecar (piren). The platform string stored in
-    /// `ai.model_configs.platform` is the verbatim variant name `AgentEngine`;
-    /// `agent-engine` is accepted as a deserialization/matching alias.
-    #[serde(alias = "agent-engine")]
-    AgentEngine,
 }
 
 impl AiPlatform {
@@ -56,7 +51,6 @@ impl AiPlatform {
         Self::Suno,
         Self::Grok,
         Self::OpenAICompatible,
-        Self::AgentEngine,
     ];
     pub fn code(self) -> &'static str {
         match self {
@@ -82,14 +76,9 @@ impl AiPlatform {
             Self::Suno => "Suno",
             Self::Grok => "Grok",
             Self::OpenAICompatible => "OpenAICompatible",
-            Self::AgentEngine => "AgentEngine",
         }
     }
     pub fn parse(value: &str) -> Option<Self> {
-        if value == "agent-engine" {
-            // Kebab-case alias accepted for hand-written rows and configs.
-            return Some(Self::AgentEngine);
-        }
         Self::ALL.iter().copied().find(|item| item.code() == value)
     }
 
@@ -117,7 +106,6 @@ impl AiPlatform {
             Self::Suno => "Suno 音乐",
             Self::Grok => "Grok",
             Self::OpenAICompatible => "OpenAI 兼容平台",
-            Self::AgentEngine => "AgentEngine 智能体引擎",
         }
     }
 
@@ -141,7 +129,6 @@ impl AiPlatform {
             Self::Ollama => "http://127.0.0.1:11434/v1",
             Self::StableDiffusion => "http://127.0.0.1:7860",
             Self::Grok => "https://api.x.ai/v1",
-            Self::AgentEngine => "http://127.0.0.1:7750",
             Self::AzureOpenAI | Self::Midjourney | Self::Suno | Self::OpenAICompatible => "",
         }
     }
@@ -179,7 +166,6 @@ impl AiPlatform {
             | Self::BaiChuan
             | Self::AzureOpenAI
             | Self::Anthropic => &[Chat],
-            Self::AgentEngine => &[Chat],
         }
     }
 
@@ -293,16 +279,6 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     pub temperature: Option<f64>,
     pub max_tokens: Option<u32>,
-    /// Authenticated chat context threaded from the chat handlers for the
-    /// AgentEngine sidecar platform; ignored by every other platform.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub conversation_id: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub user_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tenant_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub system_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -352,18 +328,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn agent_engine_accepts_variant_name_and_kebab_alias() {
-        assert_eq!(
-            AiPlatform::parse("AgentEngine"),
-            Some(AiPlatform::AgentEngine)
-        );
-        assert_eq!(
-            AiPlatform::parse("agent-engine"),
-            Some(AiPlatform::AgentEngine)
-        );
-        assert_eq!(AiPlatform::AgentEngine.code(), "AgentEngine");
-    }
 
     #[test]
     fn model_type_aliases_are_supported() {
