@@ -312,7 +312,7 @@ async fn project_content_storyboard_and_video_export_form_a_complete_pipeline() 
             script_id,
             data: vec![toonflow::SaveStoryboardRequest {
                 id: None,
-                prompt: "主角站在雨夜站台中景".into(),
+                prompt: "@图1 的雨夜车站笼罩雨幕，主角站在站台中景".into(),
                 duration: Some(1),
                 state: "未生成".into(),
                 video_desc: Some("镜头缓慢推进".into()),
