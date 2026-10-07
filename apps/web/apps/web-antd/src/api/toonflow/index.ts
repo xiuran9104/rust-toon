@@ -110,6 +110,8 @@ export namespace ToonflowApi {
     state?: string;
     track?: string;
     videoDesc?: string;
+    shotSize?: string;
+    cameraMove?: string;
     shouldGenerateImage: number | boolean;
     associateAssetsIds: number[];
     describe?: string;
@@ -634,7 +636,7 @@ export function removeStoryboard(id: number) {
   return requestClient.post('/toonflow/production/storyboard/removeFrame', { id });
 }
 
-export function editStoryboardInfo(data: Pick<ToonflowApi.Storyboard, 'associateAssetsIds' | 'duration' | 'id' | 'prompt' | 'sceneKey' | 'sceneStateDescription' | 'sceneStateId' | 'sceneStateKey' | 'sceneStateParentKey' | 'shouldGenerateImage' | 'track' | 'videoDesc'>) {
+export function editStoryboardInfo(data: Pick<ToonflowApi.Storyboard, 'associateAssetsIds' | 'cameraMove' | 'duration' | 'id' | 'prompt' | 'sceneKey' | 'sceneStateDescription' | 'sceneStateId' | 'sceneStateKey' | 'sceneStateParentKey' | 'shouldGenerateImage' | 'shotSize' | 'track' | 'videoDesc'>) {
   return requestClient.post('/toonflow/production/storyboard/editStoryboardInfo', data);
 }
 

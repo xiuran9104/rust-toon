@@ -1074,6 +1074,8 @@ struct StructuredStoryboardRow {
     video_desc: Option<String>,
     prompt: String,
     duration: Option<String>,
+    shot_size: Option<String>,
+    camera_move: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1093,6 +1095,10 @@ struct StructuredShotDescription {
     sequence: i32,
     scene_key: Option<String>,
     scene_state_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shot_size: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    camera_move: Option<String>,
     duration_seconds: f64,
     description: String,
     references: Vec<StructuredShotReference>,
@@ -1135,7 +1141,8 @@ async fn load_structured_shot_descriptions(
     let rows = sqlx::query_as::<_, StructuredStoryboardRow>(
         r#"SELECT storyboard.id,storyboard.index,storyboard.scene_key,
                   scene_state.state_key AS scene_state_key,
-                  storyboard.video_desc,storyboard.prompt,storyboard.duration
+                  storyboard.video_desc,storyboard.prompt,storyboard.duration,
+                  storyboard.shot_size,storyboard.camera_move
            FROM toonflow.storyboards storyboard
            LEFT JOIN toonflow.scene_states scene_state ON scene_state.id=storyboard.scene_state_id
            WHERE storyboard.project_id=$1 AND storyboard.script_id=$2
@@ -1198,6 +1205,29 @@ async fn load_structured_shot_descriptions(
             }
             let duration =
                 parse_shot_duration(row.duration.as_deref().unwrap_or_default(), position + 1)?;
+            let shot_size = row.shot_size.filter(|value| !value.trim().is_empty());
+            let camera_move = row.camera_move.filter(|value| !value.trim().is_empty());
+            let references = assets_by_storyboard.remove(&row.id).unwrap_or_default();
+            // P0.5：特写/近景通常只承载一个必需主体，多主体特写几乎必然
+            // 生成失败，必须在提交前拦下。
+            if matches!(shot_size.as_deref(), Some("特写") | Some("近景")) {
+                let required_subjects = references
+                    .iter()
+                    .filter(|reference| {
+                        matches!(
+                            reference.asset_type.as_str(),
+                            "role" | "character"
+                        )
+                    })
+                    .count();
+                if required_subjects > 1 {
+                    return Err(format!(
+                        "第 {} 个分镜是{}，但绑定了 {required_subjects} 个必需人物主体；请改用中景/全景或减少出镜人物",
+                        position + 1,
+                        shot_size.as_deref().unwrap_or_default(),
+                    ));
+                }
+            }
             Ok(StructuredShotDescription {
                 storyboard_id: row.id,
                 sequence: row.index.unwrap_or(position as i32 + 1),
@@ -1205,9 +1235,11 @@ async fn load_structured_shot_descriptions(
                 scene_state_key: row
                     .scene_state_key
                     .filter(|value| !value.trim().is_empty()),
+                shot_size,
+                camera_move,
                 duration_seconds: duration,
                 description,
-                references: assets_by_storyboard.remove(&row.id).unwrap_or_default(),
+                references,
             })
         })
         .collect()
