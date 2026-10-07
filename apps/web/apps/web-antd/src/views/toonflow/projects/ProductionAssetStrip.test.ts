@@ -36,26 +36,40 @@ vi.mock('ant-design-vue', () => {
   });
   const modal = defineComponent({
     props: ['open'],
-    emits: ['ok', 'update:open'],
     setup:
-      (props, { emit, slots }) =>
+      (props, { slots }) =>
       () =>
-        props.open
-          ? h('div', [
-              slots.default?.(),
-              h(
-                'button',
-                { class: 'modal-ok', onClick: () => emit('ok') },
-                '保存',
-              ),
-            ])
-          : null,
+        props.open ? h('div', [slots.default?.(), slots.footer?.()]) : null,
+  });
+  const select = defineComponent({
+    props: ['value', 'options'],
+    setup:
+      (props) =>
+      () =>
+        h('select', { 'aria-label': '造型状态' }, (props.options ?? []).map(() => null)),
+  });
+  const button = defineComponent({
+    props: ['loading', 'disabled'],
+    setup:
+      (props, { slots }) =>
+      () =>
+        h('button', { disabled: props.disabled || props.loading }, slots.default?.()),
+  });
+  const dropdown = defineComponent({
+    setup:
+      (_, { slots }) =>
+      () =>
+        h('div', [slots.default?.(), slots.overlay?.()]),
   });
   return {
+    Button: button,
+    Dropdown: dropdown,
     Empty: Object.assign({ ...box }, { PRESENTED_IMAGE_SIMPLE: 'simple' }),
     Form: Object.assign({ ...box }, { Item: box }),
     Input: { TextArea: textArea },
+    Menu: Object.assign({ ...box }, { Item: button }),
     Modal: modal,
+    Select: select,
     Tag: box,
     message: { error: vi.fn(), success, warning: vi.fn() },
   };
@@ -112,7 +126,7 @@ describe('production derived asset prompts', () => {
     await flush();
 
     const editButton = [...host.querySelectorAll('button')].find(
-      (button) => button.textContent?.trim() === '编辑',
+      (button) => button.textContent?.trim() === '编辑造型',
     )!;
     editButton.click();
     await flush();
@@ -122,7 +136,9 @@ describe('production derived asset prompts', () => {
     description!.dispatchEvent(new Event('input'));
     prompt!.value = '人工调整后的生成提示词';
     prompt!.dispatchEvent(new Event('input'));
-    host.querySelector<HTMLButtonElement>('.modal-ok')!.click();
+    [...host.querySelectorAll('button')]
+      .find((button) => button.textContent?.trim() === '保存造型')!
+      .click();
     await flush();
 
     expect(api.saveAsset).toHaveBeenCalledWith(
@@ -133,7 +149,7 @@ describe('production derived asset prompts', () => {
         prompt: '人工调整后的生成提示词',
       }),
     );
-    expect(success).toHaveBeenCalledWith('“雨夜换装”的造型描述和生成提示词已保存');
+    expect(success).toHaveBeenCalledWith('“雨夜换装”的造型已保存');
     expect(refresh).toHaveBeenCalledOnce();
   });
 
@@ -182,7 +198,7 @@ describe('production derived asset prompts', () => {
     await flush();
 
     const editButton = [...host.querySelectorAll('button')].find((button) =>
-      button.textContent?.trim() === '编辑',
+      button.textContent?.trim() === '编辑造型',
     )!;
     editButton.click();
     await flush();
@@ -201,7 +217,9 @@ describe('production derived asset prompts', () => {
     description!.dispatchEvent(new Event('input'));
     prompt!.value = '黑色夜行衣，正面全身立绘';
     prompt!.dispatchEvent(new Event('input'));
-    host.querySelector<HTMLButtonElement>('.modal-ok')!.click();
+    [...host.querySelectorAll('button')]
+      .find((button) => button.textContent?.trim() === '保存造型')!
+      .click();
     await flush();
 
     expect(api.saveAsset).toHaveBeenCalledWith(expect.objectContaining({
@@ -273,7 +291,7 @@ describe('production derived asset prompts', () => {
 
     const buttons = () => [...host.querySelectorAll('button')];
     const aiButtons = buttons().filter(
-      (button) => button.textContent?.trim() === 'AI 提示词',
+      (button) => button.textContent?.trim() === 'AI 生成提示词',
     );
     expect(aiButtons).toHaveLength(2);
     aiButtons[0]!.click();
@@ -373,7 +391,7 @@ describe('production derived asset prompts', () => {
     generateButton.click();
     await flush();
     expect(generateButton.disabled).toBe(true);
-    expect(generateButton.textContent?.trim()).toBe('生成中…');
+    expect(generateButton.textContent?.trim()).toBe('生成中');
     generateButton.click();
     expect(api.executeAgentTool).toHaveBeenCalledOnce();
 

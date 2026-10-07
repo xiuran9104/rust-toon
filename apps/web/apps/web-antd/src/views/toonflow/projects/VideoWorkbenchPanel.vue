@@ -84,13 +84,15 @@ const snapshotReferences = computed(() => videoReferenceManifest(snapshotVideo.v
 const snapshotShots = computed(() => videoStructuredShots(snapshotVideo.value));
 
 function snapshotRoleLabel(reference: any) {
-  return {
+  const key: string = reference?.role ?? reference?.kind ?? '';
+  const labels: Record<string, string> = {
     environment_reference: '场景参考',
     first_frame: '首帧',
     last_frame: '尾帧',
     reference_image: '普通参考',
     required_subject: '必需主体',
-  }[reference?.role ?? reference?.kind] ?? reference?.role ?? reference?.kind ?? '参考图';
+  };
+  return labels[key] || key || '参考图';
 }
 
 async function inspectVideo(video: any) {
