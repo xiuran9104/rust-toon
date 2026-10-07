@@ -195,6 +195,32 @@ pub(crate) fn asset_image_expectations(
     )
 }
 
+/// 从分镜结构化输入编译质检期望说明：画面描述、景别/运镜（若有）与
+/// 必须一致的参考资产清单。空字段不产生条目。
+pub(crate) fn storyboard_expectations(
+    description: &str,
+    shot_size: &str,
+    camera_move: &str,
+    assets: &[(&str, &str)],
+) -> String {
+    let mut sections = vec![format!("画面描述：{description}")];
+    if !shot_size.is_empty() {
+        sections.push(format!("景别：{shot_size}"));
+    }
+    if !camera_move.is_empty() {
+        sections.push(format!("运镜：{camera_move}"));
+    }
+    if !assets.is_empty() {
+        let list = assets
+            .iter()
+            .map(|(name, kind)| format!("{name}（{kind}）"))
+            .collect::<Vec<_>>()
+            .join("、");
+        sections.push(format!("人物与场景必须与以下参考资产一致：{list}"));
+    }
+    sections.join("\n")
+}
+
 /// 对一张生成图执行视觉质检。期望说明由调用方从结构化输入编译
 /// （资产/造型描述、参考图清单、镜头约束等）。
 pub(crate) async fn evaluate_image(
@@ -237,6 +263,22 @@ mod tests {
         .unwrap();
         assert!(report.passed);
         assert!(repair_instructions(&report).is_none());
+    }
+
+    #[test]
+    fn builds_storyboard_expectations_with_optional_framing() {
+        let full = storyboard_expectations(
+            "沈辞推门进入机房",
+            "近景",
+            "跟镜",
+            &[("沈辞", "role"), ("机房", "scene")],
+        );
+        assert!(full.contains("画面描述：沈辞推门进入机房"));
+        assert!(full.contains("景别：近景"));
+        assert!(full.contains("运镜：跟镜"));
+        assert!(full.contains("沈辞（role）、机房（scene）"));
+        let minimal = storyboard_expectations("空镜扫过桌面", "", "", &[]);
+        assert_eq!(minimal, "画面描述：空镜扫过桌面");
     }
 
     #[test]

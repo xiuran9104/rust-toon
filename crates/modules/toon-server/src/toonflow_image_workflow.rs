@@ -516,41 +516,75 @@ async fn generate_storyboard_job(
     let generation_prompt = reference_plan.apply_to_prompt(
         crate::toonflow_asset_prompt::storyboard_generation_prompt(&job.prompt),
     );
-    let result = async {
-        let size = storyboard_image_size(&quality, &ratio)?;
-        ai_client::image_with_references_for_project(
-            &pool,
-            Some(project_id),
-            &model,
-            &generation_prompt,
-            &size,
-            references,
-            false,
-        )
+    // P1 视觉质检：与资产图片同构的闭环（初始 + 最多 2 次定向重试，
+    // 仍失败保留最后一版）。质检不可用时不阻断生成。
+    let framing: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT coalesce(video_desc,''),coalesce(shot_size,''),coalesce(camera_move,'') FROM toonflow.storyboards WHERE id=$1",
+    )
+    .bind(job.id)
+    .fetch_optional(&pool)
+    .await
+    .ok()
+    .flatten();
+    let (framing_desc, shot_size, camera_move) =
+        framing.unwrap_or_else(|| (String::new(), String::new(), String::new()));
+    let description = if framing_desc.trim().is_empty() {
+        job.prompt.clone()
+    } else {
+        framing_desc
+    };
+    let asset_summary = prompt_assets
+        .iter()
+        .map(|asset| (asset.name.as_str(), asset.kind.as_str()))
+        .collect::<Vec<_>>();
+    let expectations = crate::toonflow_visual_qc::storyboard_expectations(
+        &description,
+        &shot_size,
+        &camera_move,
+        &asset_summary,
+    );
+    let mut qc_attempts: Vec<Value> = Vec::new();
+    let mut submitted_prompt = generation_prompt.clone();
+    let mut final_path: Option<String> = None;
+    for attempt in 0..=crate::toonflow_visual_qc::MAX_VISUAL_QC_RETRIES {
+        let generated = match async {
+            let size = storyboard_image_size(&quality, &ratio)?;
+            ai_client::image_with_references_for_project(
+                &pool,
+                Some(project_id),
+                &model,
+                &submitted_prompt,
+                &size,
+                references.clone(),
+                false,
+            )
+            .await
+        }
         .await
-    }
-    .await;
-    match result {
-        Ok(url) => {
-            let object_name = format!("storyboard-{}-{}", job.id, uuid::Uuid::new_v4());
+        {
+            Ok(url) => url,
+            Err(reason) => {
+                let _ = sqlx::query(
+                    "UPDATE toonflow.storyboards SET state='生成失败',reason=$2 WHERE id=$1",
+                )
+                .bind(job.id)
+                .bind(reason)
+                .execute(&pool)
+                .await;
+                return false;
+            }
+        };
+        let object_name = format!("storyboard-{}-{}", job.id, uuid::Uuid::new_v4());
+        let file_path =
             match crate::toonflow_storage::persist_remote_project_image(
-                &url,
+                &generated,
                 project_id,
                 "storyboards",
                 &object_name,
             )
             .await
             {
-                Ok(file_path) => sqlx::query(
-                    "UPDATE toonflow.storyboards SET file_path=$2,state='已完成',reason=NULL,generated_scene_state_id=$3,scene_generation_context=$4 WHERE id=$1 AND state='生成中'",
-                )
-                .bind(job.id)
-                .bind(file_path)
-                .bind(reference_plan.scene_state_id)
-                .bind(reference_plan.generation_context)
-                .execute(&pool)
-                .await
-                .is_ok_and(|result| result.rows_affected() == 1),
+                Ok(file_path) => file_path,
                 Err(reason) => {
                     let reason = format!("分镜图片持久化失败：{reason}");
                     let _ = sqlx::query(
@@ -560,21 +594,56 @@ async fn generate_storyboard_job(
                     .bind(reason)
                     .execute(&pool)
                     .await;
-                    false
+                    return false;
+                }
+            };
+        match crate::toonflow_visual_qc::evaluate_image(&pool, project_id, &file_path, &expectations)
+            .await
+        {
+            Ok(report) => {
+                let attempt_entry = if report.passed {
+                    json!({"attempt": attempt + 1, "passed": true, "summary": report.summary})
+                } else {
+                    json!({
+                        "attempt": attempt + 1,
+                        "passed": false,
+                        "summary": report.summary,
+                        "failures": report.failures,
+                        "imagePath": file_path,
+                    })
+                };
+                qc_attempts.push(attempt_entry);
+                if report.passed || attempt >= crate::toonflow_visual_qc::MAX_VISUAL_QC_RETRIES {
+                    final_path = Some(file_path);
+                    break;
+                }
+                if let Some(repair) = crate::toonflow_visual_qc::repair_instructions(&report) {
+                    submitted_prompt = format!("{generation_prompt}\n{repair}");
                 }
             }
-        }
-        Err(reason) => {
-            let _ = sqlx::query(
-                "UPDATE toonflow.storyboards SET state='生成失败',reason=$2 WHERE id=$1",
-            )
-            .bind(job.id)
-            .bind(reason)
-            .execute(&pool)
-            .await;
-            false
+            Err(_) => {
+                final_path = Some(file_path);
+                break;
+            }
         }
     }
+    let Some(file_path) = final_path else {
+        return false;
+    };
+    let mut generation_context = reference_plan.generation_context;
+    if !qc_attempts.is_empty() {
+        generation_context["visualQcHistory"] = json!(qc_attempts);
+    }
+    sqlx::query(
+        "UPDATE toonflow.storyboards SET file_path=$2,state='已完成',reason=NULL,generated_scene_state_id=$3,scene_generation_context=$4 WHERE id=$1 AND state='生成中'",
+    )
+    .bind(job.id)
+    .bind(file_path)
+    .bind(reference_plan.scene_state_id)
+    .bind(generation_context)
+    .execute(&pool)
+    .await
+    .is_ok_and(|result| result.rows_affected() == 1)
 }
 
 pub(crate) async fn run_storyboard_generation(
