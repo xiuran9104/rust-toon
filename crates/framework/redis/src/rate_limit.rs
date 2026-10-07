@@ -24,6 +24,7 @@ pub struct RateLimitConfig {
     pub namespace: String,
     pub max_requests: u64,
     pub window: Duration,
+    pub trust_proxy_headers: bool,
 }
 
 impl Default for RateLimitConfig {
@@ -32,6 +33,7 @@ impl Default for RateLimitConfig {
             namespace: "rate-limit".to_string(),
             max_requests: 300,
             window: Duration::from_secs(60),
+            trust_proxy_headers: false,
         }
     }
 }
@@ -50,6 +52,9 @@ impl RateLimitConfig {
                     .and_then(|value| value.parse().ok())
                     .unwrap_or(60),
             ),
+            trust_proxy_headers: env::var("RATE_LIMIT_TRUST_PROXY_HEADERS")
+                .ok()
+                .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE")),
         }
     }
 }
@@ -87,7 +92,7 @@ pub async fn rate_limit(
     // Clone the complete snapshot before any await so one request never mixes
     // values from two configuration revisions.
     let config = state.config.borrow().clone();
-    let actor = client_key(&request);
+    let actor = client_key(&request, config.trust_proxy_headers);
     let key = state
         .redis
         .key(&config.namespace, format!("{}:{}:{}", actor, method, path));
@@ -109,15 +114,20 @@ pub async fn rate_limit(
     }
 }
 
-fn client_key(request: &Request) -> String {
-    request
-        .headers()
-        .get("x-forwarded-for")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(',').next())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
+fn client_key(request: &Request, trust_proxy_headers: bool) -> String {
+    let forwarded = if trust_proxy_headers {
+        request
+            .headers()
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(',').next())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    } else {
+        None
+    };
+    forwarded
         .or_else(|| {
             request
                 .extensions()
@@ -154,7 +164,8 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        assert_eq!(client_key(&request), "10.0.0.1");
+        assert_eq!(client_key(&request, true), "10.0.0.1");
+        assert_eq!(client_key(&request, false), "unknown");
     }
 
     #[test]
@@ -167,7 +178,7 @@ mod tests {
             .header("authorization", "Bearer second")
             .body(Body::empty())
             .unwrap();
-        assert_ne!(client_key(&first), client_key(&second));
-        assert!(client_key(&first).starts_with("auth-"));
+        assert_ne!(client_key(&first, false), client_key(&second, false));
+        assert!(client_key(&first, false).starts_with("auth-"));
     }
 }

@@ -138,11 +138,13 @@ fn project_rate_limit_config(
     defaults: RateLimitConfig,
 ) -> watch::Receiver<RateLimitConfig> {
     let namespace = defaults.namespace;
+    let trust_proxy_headers = defaults.trust_proxy_headers;
     let current = dynamic.current();
     let (sender, receiver) = watch::channel(RateLimitConfig {
         namespace: namespace.clone(),
         max_requests: current.rate_limit.max_requests,
         window: Duration::from_secs(current.rate_limit.window_seconds),
+        trust_proxy_headers,
     });
     let mut source = dynamic.receiver();
     tokio::spawn(async move {
@@ -152,6 +154,7 @@ fn project_rate_limit_config(
                 namespace: namespace.clone(),
                 max_requests: current.rate_limit.max_requests,
                 window: Duration::from_secs(current.rate_limit.window_seconds),
+                trust_proxy_headers,
             });
         }
     });
