@@ -16,9 +16,15 @@ Rust Toon 文档按职责拆分。完整步骤和详细规则只在一个权威�
 ## 专题与计划
 
 - [媒体生成稳定性计划](media-generation-stability-plan.md)
-- [分镜同步计划](storyboard-sync-plan.md)
+- [Toonflow Agent 与内容链路对齐方案](toonflow-agent-alignment-plan.md)
+- [剧本 Agent 原著核实与自动修订](script-agent-quality-improvements.md)（已落地行为说明）
+- [通用真人影视基底参考图](live-action-base-reference.md)
 
 计划文档记录阶段性目标，不作为当前运行行为或部署参数的权威来源。若计划描述与代码、迁移或上述权威文档冲突，以当前代码和迁移为准，并同步修正文档。
+
+## 历史归档
+
+一次性审查快照与已完成的阶段性计划移入 [archive/](archive/)，仅作过程记录，不代表当前代码状态。
 
 ## 维护规则
 
