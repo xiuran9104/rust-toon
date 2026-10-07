@@ -56,6 +56,7 @@ mod toonflow_video_compilers;
 mod toonflow_video_continuity;
 mod toonflow_video_export;
 mod toonflow_video_quality;
+mod toonflow_visual_qc;
 mod toonflow_workflow;
 mod toonflow_workflow_control;
 mod toonflow_workflow_definition;
