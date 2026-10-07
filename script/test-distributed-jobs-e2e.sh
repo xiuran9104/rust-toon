@@ -93,13 +93,14 @@ for _ in $(seq 1 45); do
   sleep 1
 done
 curl -fsS "http://127.0.0.1:${s3_port}/health" >/dev/null
-# RustFS does not bundle an S3 client; run mc in a sidecar sharing the storage
-# container's network namespace so 127.0.0.1:9000 reaches the S3 API.
-mc_image="${S3_MC_IMAGE:-minio/mc:RELEASE.2025-04-16T18-13-26Z}"
-docker pull "$mc_image" >/dev/null
-MC_HOST_local="http://rust_toon:rust_toon_password@127.0.0.1:9000" \
-  docker run --rm --network "container:$s3_container" "$mc_image" \
-  mb --ignore-existing local/rust-toon >/dev/null
+# RustFS does not bundle an S3 client; use the in-repo s3ctl against the
+# published port to prepare the bucket.
+cargo build -q -p rust-toon-s3ctl
+S3_ENDPOINT="http://127.0.0.1:${s3_port}" \
+S3_ACCESS_KEY=rust_toon \
+S3_SECRET_KEY=rust_toon_password \
+S3_BUCKET=rust-toon \
+  "$(cd "$(dirname "$0")/.." && pwd)/target/debug/s3ctl" make-bucket >/dev/null
 
 cargo build -p rust-toon-gateway -p rust-toon-worker
 

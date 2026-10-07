@@ -144,7 +144,7 @@ READINESS_REQUIRE_OBJECT_STORAGE=true
 
 `JWT_SECRET` 必须 ≥ 32 字节，否则启动失败。当前版本不支持 `BOOTSTRAP_ADMIN_USERNAME` / `BOOTSTRAP_ADMIN_PASSWORD`；不要把它们写入环境文件。全新数据库会由基线迁移创建 `admin`，应在首次受控登录后立即修改其密码。当前上传、生成片段和最终成片统一进入对象存储；旧版本遗留的 `storage/uploads` 应先用 `script/migrate-local-uploads-to-s3.sh` 迁移。AI 密钥落库加密可通过 `SECRET_ENCRYPTION_KEY` 独立指定（缺省回退 `JWT_SECRET`）。
 
-对象存储后端已从 MinIO 换成 RustFS（MinIO 社区版已停止维护），应用侧只依赖标准 S3 数据面接口。升级注意：环境变量已从 `MINIO_*` 整体更名为 `S3_*`（`READINESS_REQUIRE_MINIO` → `READINESS_REQUIRE_OBJECT_STORAGE`），现有部署的环境文件需同步重命名；本地 Docker 卷中的历史对象用 `script/migrate-minio-to-rustfs.sh` 迁移，该脚本只读取旧卷、绝不删除。
+对象存储后端已从 MinIO 换成 RustFS（MinIO 社区版已停止维护），应用侧只依赖标准 S3 数据面接口，仓库内也不再依赖任何 MinIO 组件——备份与测试使用自带的 `s3ctl` 客户端。升级注意：环境变量已从 `MINIO_*` 整体更名为 `S3_*`（`READINESS_REQUIRE_MINIO` → `READINESS_REQUIRE_OBJECT_STORAGE`），现有部署的环境文件需同步重命名。历史 MinIO 卷迁移脚本已随 MinIO 依赖一并移除；如仍有旧卷数据需要搬迁，请自行用任一 S3 客户端按对象复制。
 
 ### 4.3 构建与试运行
 
@@ -352,19 +352,17 @@ Kubernetes 环境的 PostgreSQL/对象备份优先使用托管服务 PITR、CSI 
 - `script/database/backup-consistent-set.sh`：生产定时备份入口。它按反向依赖顺序优雅停止 `BACKUP_SYSTEMD_UNITS` 中当时正在运行的 Worker/Gateway，等待写入完全静止，以同一个 `BACKUP_SET_ID` 依次执行 PostgreSQL 与对象存储备份并原子发布 set manifest，最后只恢复原先运行的服务。任一组件失败也会执行恢复服务的 trap，且不会发布完整 set manifest。
 - `script/database/backup-postgres.sh`：一致性协调器使用的 `pg_dump` 组件，也可在已人工停写时单独执行；要求 `DATABASE_URL`。`BACKUP_DIR`（默认 `/var/backups/rust-toon/postgresql`）、`BACKUP_RETENTION_DAYS`（默认 14）控制目录与保留天数。
 - `script/database/restore-postgres.sh`：恢复，`--backup FILE --database-url URL --confirm`。
-- `script/database/backup-s3.sh`：一致性协调器使用的对象组件，使用 S3 客户端 `mc` 镜像对象桶并生成逐对象 SHA-256 清单；配置 `S3_ENDPOINT`、`S3_ACCESS_KEY`、`S3_SECRET_KEY`、`S3_BUCKET` 和 `S3_BACKUP_DIR`，宿主机还需提供 `jq`。
+- `script/database/backup-s3.sh`：一致性协调器使用的对象组件，使用仓库自带 `s3ctl` 客户端镜像对象桶并生成逐对象 SHA-256 清单；配置 `S3_ENDPOINT`、`S3_ACCESS_KEY`、`S3_SECRET_KEY`、`S3_BUCKET` 和 `S3_BACKUP_DIR`，宿主机还需提供 `jq`。
 - `script/database/restore-s3.sh`：严格校验 manifest 版本、bucket、普通文件全集和 SHA-256 清单后恢复对象；跨 bucket 恢复必须额外传入 `--allow-bucket-mismatch`。默认保留目标端额外对象，只有显式传入 `--delete-extra --confirm` 才执行镜像删除。
 - `deploy/systemd/rust-toon-consistent-backup.service` + `.timer`：每日 03:15 触发唯一的一致性恢复集；旧的两个错峰 timer 已移除。单组件 service 仅供已人工停写后的诊断/补备份使用，不能把不同时间的组件产物拼成生产恢复集。
 
 r-nacos 的 Raft 数据不属于 PostgreSQL + 对象存储业务一致性恢复集。Compose 部署应通过带 `RNACOS_BACKUP_TOKEN` 的 r-nacos 备份接口另存配置中心备份；Kubernetes 优先对三份 PVC 做协调快照或使用 r-nacos 备份接口，并定期演练配置历史恢复。即使配置中心备份暂时不可用，Gateway/Worker 仍保留 SDK 磁盘缓存和环境变量默认值，但这不能替代配置历史备份。
 
-systemd 样例以 `rust-toon` 用户运行，启用前需安装 `mc`、创建可写目录并保护包含凭据的环境文件。以下示例为 Linux amd64；其他架构请从 MinIO mc 官方下载目录选择对应二进制：
+systemd 样例以 `rust-toon` 用户运行，启用前需构建仓库自带的 `s3ctl`（对象存储客户端，随发布二进制一起构建）、安装 `jq`、创建可写目录并保护包含凭据的环境文件：
 
 ```bash
 sudo apt-get update && sudo apt-get install -y jq
-curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/archive/mc.RELEASE.2025-04-16T18-13-26Z \
-  -o /tmp/rust-toon-mc
-sudo install -o root -g root -m 0755 /tmp/rust-toon-mc /usr/local/bin/mc
+cargo build --release -p rust-toon-s3ctl
 sudo install -d -o root -g root -m 0700 \
   /var/backups/rust-toon/postgresql /var/backups/rust-toon/s3 /var/backups/rust-toon/sets
 sudo install -d -o root -g rust-toon -m 0750 /etc/rust-toon

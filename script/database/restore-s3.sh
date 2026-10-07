@@ -65,7 +65,15 @@ if [[ ! -d "$backup_path/objects" || -L "$backup_path/objects" \
   exit 1
 fi
 
-command -v mc >/dev/null || { echo "S3 client (mc) is required" >&2; exit 1; }
+repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
+s3ctl_bin="${S3CTL_BIN:-$repo_root/target/release/s3ctl}"
+if [[ ! -x "$s3ctl_bin" ]]; then
+  s3ctl_bin="$repo_root/target/debug/s3ctl"
+fi
+[[ -x "$s3ctl_bin" ]] || {
+  echo "s3ctl is required; build it with: cargo build --release -p rust-toon-s3ctl" >&2
+  exit 1
+}
 command -v cmp >/dev/null || { echo "cmp is required" >&2; exit 1; }
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
 command -v sha256sum >/dev/null || { echo "sha256sum is required" >&2; exit 1; }
@@ -117,12 +125,8 @@ if [[ "$manifest_bucket_json" != "$target_bucket_json" && "$allow_bucket_mismatc
 fi
 
 validation_dir="$(mktemp -d)"
-mc_config_dir=""
 cleanup() {
   rm -rf -- "$validation_dir"
-  if [[ -n "$mc_config_dir" ]]; then
-    rm -rf -- "$mc_config_dir"
-  fi
 }
 trap cleanup EXIT
 
@@ -149,17 +153,19 @@ if ! cmp -s -- "$validation_dir/declared.sorted" "$validation_dir/actual.sorted"
   exit 1
 fi
 
-mc_config_dir="$(mktemp -d)"
+s3ctl() {
+  S3_ENDPOINT="$s3_endpoint" \
+  S3_ACCESS_KEY="$s3_access_key" \
+  S3_SECRET_KEY="$s3_secret_key" \
+  S3_BUCKET="$s3_bucket" \
+    "$s3ctl_bin" "$@"
+}
+s3ctl make-bucket >/dev/null
 
-MC_CONFIG_DIR="$mc_config_dir" mc alias set rust-toon-target \
-  "$s3_endpoint" "$s3_access_key" "$s3_secret_key" >/dev/null
-MC_CONFIG_DIR="$mc_config_dir" mc mb --ignore-existing "rust-toon-target/$s3_bucket" >/dev/null
-
-mirror_args=(--quiet --overwrite --preserve)
+mirror_args=()
 if [[ "$delete_extra" == true ]]; then
-  mirror_args+=(--remove)
+  mirror_args+=(--remove-missing)
 fi
-MC_CONFIG_DIR="$mc_config_dir" mc mirror "${mirror_args[@]}" \
-  "$backup_path/objects" "rust-toon-target/$s3_bucket" >/dev/null
+s3ctl mirror-from "$backup_path/objects" "${mirror_args[@]}"
 
 echo "Object storage restore completed. Run /readyz and an object-reference audit before enabling traffic."

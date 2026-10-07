@@ -22,6 +22,7 @@ members = [
     "crates/modules/system-server",
     "crates/modules/toon-api",
     "crates/modules/toon-server",
+    "crates/tools/s3ctl",
     "services/gateway",
     "services/toon-worker",
 ]

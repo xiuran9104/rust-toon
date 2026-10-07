@@ -67,7 +67,15 @@ case "$backup_dir" in
     ;;
 esac
 
-command -v mc >/dev/null || { echo "S3 client (mc) is required" >&2; exit 1; }
+repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
+s3ctl_bin="${S3CTL_BIN:-$repo_root/target/release/s3ctl}"
+if [[ ! -x "$s3ctl_bin" ]]; then
+  s3ctl_bin="$repo_root/target/debug/s3ctl"
+fi
+[[ -x "$s3ctl_bin" ]] || {
+  echo "s3ctl is required; build it with: cargo build --release -p rust-toon-s3ctl" >&2
+  exit 1
+}
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
 command -v sha256sum >/dev/null || { echo "sha256sum is required" >&2; exit 1; }
 
@@ -78,15 +86,11 @@ final_path="$backup_dir/rust-toon-s3-$backup_set_id"
 publish_lock="$backup_dir/.rust-toon-s3-$backup_set_id.lock"
 created_at="$(date -u +%Y%m%dT%H%M%SZ)"
 temporary_path=""
-mc_config_dir=""
 owns_publish_lock=false
 
 cleanup() {
   if [[ -n "$temporary_path" ]]; then
     rm -rf -- "$temporary_path"
-  fi
-  if [[ -n "$mc_config_dir" ]]; then
-    rm -rf -- "$mc_config_dir"
   fi
   if [[ "$owns_publish_lock" == "true" ]]; then
     rmdir -- "$publish_lock" >/dev/null 2>&1 || true
@@ -105,14 +109,16 @@ if [[ -e "$final_path" || -L "$final_path" ]]; then
 fi
 
 temporary_path="$(mktemp -d "$backup_dir/.rust-toon-s3-$backup_set_id.XXXXXX")"
-mc_config_dir="$(mktemp -d)"
-
-MC_CONFIG_DIR="$mc_config_dir" mc alias set rust-toon-source \
-  "$s3_endpoint" "$s3_access_key" "$s3_secret_key" >/dev/null
-MC_CONFIG_DIR="$mc_config_dir" mc stat "rust-toon-source/$s3_bucket" >/dev/null
+s3ctl() {
+  S3_ENDPOINT="$s3_endpoint" \
+  S3_ACCESS_KEY="$s3_access_key" \
+  S3_SECRET_KEY="$s3_secret_key" \
+  S3_BUCKET="$s3_bucket" \
+    "$s3ctl_bin" "$@"
+}
+s3ctl stat-bucket >/dev/null
 mkdir -p "$temporary_path/objects"
-MC_CONFIG_DIR="$mc_config_dir" mc mirror --quiet --preserve \
-  "rust-toon-source/$s3_bucket" "$temporary_path/objects" >/dev/null
+s3ctl mirror-to "$temporary_path/objects"
 
 jq -cn --arg bucket "$s3_bucket" --arg created_at "$created_at" --arg set_id "$backup_set_id" \
   '{formatVersion: 1, bucket: $bucket, createdAt: $created_at, setId: $set_id}' \

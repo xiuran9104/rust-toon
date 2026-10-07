@@ -2,18 +2,16 @@
 set -euo pipefail
 
 s3_container="rust-toon-s3-backup-test"
-mc_container="rust-toon-mc-backup-test"
 s3_port="${TEST_S3_BACKUP_PORT:-59010}"
 s3_image="${S3_IMAGE:-rustfs/rustfs:1.0.0}"
-mc_image="${S3_MC_IMAGE:-minio/mc:RELEASE.2025-04-16T18-13-26Z}"
 test_dir="$(mktemp -d)"
 
 cleanup() {
-  docker rm -f "$s3_container" "$mc_container" >/dev/null 2>&1 || true
+  docker rm -f "$s3_container" >/dev/null 2>&1 || true
   rm -rf -- "$test_dir"
 }
 trap cleanup EXIT
-docker rm -f "$s3_container" "$mc_container" >/dev/null 2>&1 || true
+docker rm -f "$s3_container" >/dev/null 2>&1 || true
 
 for command_name in cmp cp curl docker jq sha256sum; do
   command -v "$command_name" >/dev/null || {
@@ -22,12 +20,10 @@ for command_name in cmp cp curl docker jq sha256sum; do
   }
 done
 
-# Keep mc out of the host and CI runner: copy the official client binary into
-# this test's private temporary directory.
-docker pull "$mc_image" >/dev/null
-docker create --name "$mc_container" "$mc_image" --help >/dev/null
-docker cp "$mc_container:/usr/bin/mc" "$test_dir/mc" >/dev/null
-chmod 700 "$test_dir/mc"
+# The in-repo s3ctl client keeps this test free of any external S3 CLI.
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+cargo build -q -p rust-toon-s3ctl
+s3ctl="$repo_root/target/debug/s3ctl"
 
 docker run -d --name "$s3_container" \
   -e RUSTFS_ACCESS_KEY=rust_toon \
@@ -40,13 +36,19 @@ for _ in $(seq 1 45); do
 done
 curl -fsS "http://127.0.0.1:${s3_port}/health" >/dev/null
 
-export PATH="$test_dir:$PATH"
-export MC_CONFIG_DIR="$test_dir/mc-client"
-mc alias set backup-test "http://127.0.0.1:${s3_port}" \
-  rust_toon rust_toon_password >/dev/null
-mc mb --ignore-existing backup-test/rust-toon >/dev/null
+export S3_ENDPOINT="http://127.0.0.1:${s3_port}"
+export S3_ACCESS_KEY=rust_toon
+export S3_SECRET_KEY=rust_toon_password
+# RustFS can answer /health a moment before the S3 layer accepts writes.
+for attempt in $(seq 1 10); do
+  if S3_BUCKET=rust-toon "$s3ctl" make-bucket >/dev/null 2>&1; then
+    break
+  fi
+  [[ "$attempt" == 10 ]] && { S3_BUCKET=rust-toon "$s3ctl" make-bucket; }
+  sleep 1
+done
 printf '%s' 'merged-episode-render' | \
-  mc pipe backup-test/rust-toon/episodes/episode-1-v1.mp4 >/dev/null
+  S3_BUCKET=rust-toon "$s3ctl" put episodes/episode-1-v1.mp4
 
 run_restore() {
   S3_ENDPOINT="http://127.0.0.1:${s3_port}" \
@@ -185,7 +187,7 @@ expect_restore_failure bucket-mismatch \
   --backup "$backup_path" --bucket restored-copy --confirm
 run_restore --backup "$backup_path" --bucket restored-copy \
   --allow-bucket-mismatch --confirm >/dev/null
-copied_restore="$(mc cat backup-test/restored-copy/episodes/episode-1-v1.mp4)"
+copied_restore="$(S3_BUCKET=restored-copy "$s3ctl" get episodes/episode-1-v1.mp4)"
 if [[ "$copied_restore" != "merged-episode-render" ]]; then
   echo "explicit cross-bucket restore did not match its source" >&2
   exit 1
@@ -224,17 +226,17 @@ rm -f -- "$absent_file_backup/objects/episodes/episode-1-v1.mp4"
 expect_restore_failure absent-file \
   --backup "$absent_file_backup" --confirm
 
-mc rm backup-test/rust-toon/episodes/episode-1-v1.mp4 >/dev/null
+S3_BUCKET=rust-toon "$s3ctl" delete episodes/episode-1-v1.mp4 >/dev/null
 run_restore --backup "$backup_path" --confirm >/dev/null
 
-restored="$(mc cat backup-test/rust-toon/episodes/episode-1-v1.mp4)"
+restored="$(S3_BUCKET=rust-toon "$s3ctl" get episodes/episode-1-v1.mp4)"
 if [[ "$restored" != "merged-episode-render" ]]; then
   echo "restored object did not match its source" >&2
   exit 1
 fi
 
 # An empty object bucket still has a checksummed manifest and must remain restorable.
-mc rm backup-test/rust-toon/episodes/episode-1-v1.mp4 >/dev/null
+S3_BUCKET=rust-toon "$s3ctl" delete episodes/episode-1-v1.mp4 >/dev/null
 empty_backup_path="$(
   S3_ENDPOINT="http://127.0.0.1:${s3_port}" \
   S3_ACCESS_KEY=rust_toon \

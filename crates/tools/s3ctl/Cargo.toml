@@ -1,0 +1,20 @@
+[package]
+name = "rust-toon-s3ctl"
+description = "Minimal S3-compatible storage client used by backup and e2e scripts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "s3ctl"
+path = "src/main.rs"
+
+[dependencies]
+hex.workspace = true
+hmac.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "io-util", "fs"] }
