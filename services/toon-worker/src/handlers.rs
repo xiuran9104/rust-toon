@@ -97,9 +97,10 @@ impl JobHandler for ScheduledInfraHandler {
         } else {
             let timeout =
                 Duration::from_millis(payload.monitor_timeout_millis.clamp(1, 86_400_000));
-            tokio::time::timeout(timeout, execution)
-                .await
-                .map_err(|_| format!("定时任务执行超时（{} 毫秒）", timeout.as_millis()))?
+            match tokio::time::timeout(timeout, execution).await {
+                Ok(result) => result,
+                Err(_) => Err(format!("定时任务执行超时（{} 毫秒）", timeout.as_millis())),
+            }
         };
         finish_job_log(store, log_id, started_at, &result).await?;
         result

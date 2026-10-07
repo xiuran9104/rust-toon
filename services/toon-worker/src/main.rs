@@ -239,6 +239,10 @@ async fn main() -> anyhow::Result<()> {
     };
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut tasks = JoinSet::new();
+    // `TOON_WORKER_CONCURRENCY` is an instance-wide capacity limit. All job
+    // kinds share it so adding a handler cannot silently multiply FFmpeg/CPU
+    // load for the process.
+    let execution_permits = Arc::new(tokio::sync::Semaphore::new(settings.concurrency));
 
     tasks.spawn(run_dispatcher(
         store.clone(),
@@ -273,6 +277,7 @@ async fn main() -> anyhow::Result<()> {
             broker.clone(),
             settings.clone(),
             handler,
+            execution_permits.clone(),
             metrics.clone(),
             shutdown_rx.clone(),
         ));
@@ -313,7 +318,12 @@ async fn main() -> anyhow::Result<()> {
         warn!(%error, "failed to persist worker draining state");
     }
     let _ = shutdown_tx.send(true);
+    let drain_permits = execution_permits.clone();
+    let permit_count = u32::try_from(settings.concurrency).unwrap_or(u32::MAX);
     let drain = async {
+        // Detached delivery tasks each own one permit. Taking the entire
+        // process-wide semaphore waits for every handler kind to finish.
+        let _all_permits = drain_permits.acquire_many_owned(permit_count).await;
         while let Some(outcome) = tasks.join_next().await {
             if let Err(error) = outcome {
                 warn!(%error, "worker subsystem did not shut down cleanly");
@@ -589,12 +599,12 @@ async fn run_consumer(
     broker: Broker,
     settings: WorkerSettings,
     handler: Arc<dyn JobHandler>,
+    semaphore: Arc<tokio::sync::Semaphore>,
     metrics: Metrics,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let kind = handler.kind();
     let durable_name = durable_name(kind);
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(settings.concurrency));
     loop {
         if *shutdown.borrow() {
             break;
@@ -692,10 +702,8 @@ async fn run_consumer(
             });
         }
     }
-    // Every spawned handler owns exactly one permit. Acquiring the full set
-    // therefore drains all in-flight work before this process exits.
-    let permits = u32::try_from(settings.concurrency).unwrap_or(u32::MAX);
-    let _drained = semaphore.acquire_many_owned(permits).await?;
+    // In-flight jobs retain their permits and are drained by the process-level
+    // shutdown path shared by all consumers.
     Ok(())
 }
 
