@@ -1279,10 +1279,17 @@ async fn build_reference_manifest(
         .map(|(index, reference)| {
             let kind = reference_kind(mode, index, references.len());
             let asset = reference.as_str().and_then(|path| assets.get(path));
+            // P0.2：文本模式下未命中资产的附加参考是“非主体身份参考”，
+            // 不与镜头主体的 required_subject 混用；帧模式的角色保持不变。
+            let fallback_role = if mode == "text" {
+                "identity_reference"
+            } else {
+                kind
+            };
             json!({
                 "index": index + 1,
                 "kind": kind,
-                "role": asset.map(|item| asset_reference_role(&item.asset_type)).unwrap_or(kind),
+                "role": asset.map(|item| asset_reference_role(&item.asset_type)).unwrap_or(fallback_role),
                 "url": reference,
                 "reference": reference,
                 "assetId": asset.map(|item| item.asset_id),
@@ -1292,6 +1299,65 @@ async fn build_reference_manifest(
             })
         })
         .collect())
+}
+
+/// P0.5：供应商提交前确认参考图 URL 可访问，避免付费任务因供应商拉取
+/// 失败而作废。只检查 http(s) 引用；本地相对路径与模拟供应商不受影响。
+/// HEAD 被拒（405/403）说明资源存在但服务器限制方法，视为可达。
+async fn preflight_reference_reachability(
+    references: Option<&Vec<Value>>,
+) -> Result<(), String> {
+    let Some(references) = references else {
+        return Ok(());
+    };
+    let urls = references
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if urls.is_empty() {
+        return Ok(());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(4))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let mut checks = JoinSet::new();
+    for url in urls {
+        let client = client.clone();
+        checks.spawn(async move {
+            let outcome = client.head(&url).send().await;
+            (url, outcome)
+        });
+    }
+    let mut failures = Vec::new();
+    while let Some(joined) = checks.join_next().await {
+        let Ok((url, outcome)) = joined else {
+            continue;
+        };
+        match outcome {
+            Ok(response)
+                if response.status().is_success()
+                    || response.status().is_redirection()
+                    || response.status().as_u16() == 405 =>
+            {
+                continue;
+            }
+            Ok(response) => {
+                failures.push(format!("{url}（HTTP {}）", response.status().as_u16()));
+            }
+            Err(error) => failures.push(format!("{url}（{error}）")),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "参考图无法访问，供应商将读取失败：{}",
+            failures.join("；")
+        ))
+    }
 }
 
 async fn generate_with_snapshot(
@@ -1347,6 +1413,7 @@ async fn generate_with_snapshot(
     if updated.rows_affected() != 1 {
         return Err("视频任务已取消或删除".into());
     }
+    preflight_reference_reachability(payload["references"].as_array()).await?;
     let submission = ai_client::video_submit(pool, model, payload).await?;
     if let Some(url) = submission.url {
         return Ok(url);

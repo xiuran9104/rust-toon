@@ -517,6 +517,13 @@ pub async fn video_submit(
     payload: Value,
 ) -> Result<VideoSubmission, String> {
     let model_id = validate_video_request(pool, configured, &payload).await?;
+    // P0.3 family layer: the DB capability fields stay authoritative; this
+    // guard catches model families that can never serve the requested mode.
+    crate::toonflow_video_compilers::validate_family_request(
+        configured,
+        payload["mode"].as_str().unwrap_or("text"),
+        payload["references"].as_array().map_or(0, Vec::len),
+    )?;
     let factory = rust_toon_ai_server::AiModelFactory::new(pool.clone());
     let response = factory
         .video(model_id, payload)

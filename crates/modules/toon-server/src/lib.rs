@@ -52,6 +52,7 @@ mod toonflow_storyboard_prompt_validation;
 mod toonflow_storyboard_references;
 mod toonflow_storyboard_table_validation;
 mod toonflow_video;
+mod toonflow_video_compilers;
 mod toonflow_video_continuity;
 mod toonflow_video_export;
 mod toonflow_video_quality;

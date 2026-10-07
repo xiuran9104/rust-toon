@@ -92,6 +92,7 @@ function snapshotRoleLabel(reference: any) {
     first_frame: '首帧',
     last_frame: '尾帧',
     reference_image: '普通参考',
+    identity_reference: '身份参考',
     required_subject: '必需主体',
   };
   return labels[key] || key || '参考图';
