@@ -29,6 +29,7 @@ import { defaultVideoGenerationMode, videoFrameRole } from './video-generation-m
 import { groupVideoTracksByScene } from './video-scene-groups';
 import {
   hasVideoGenerationSnapshot,
+  videoDroppedReferences,
   videoGenerationRequest,
   videoReferenceManifest,
   videoStructuredShots,
@@ -81,6 +82,7 @@ const snapshotVideo = ref<any>();
 const inspectingVideoIds = ref<number[]>([]);
 const snapshotRequest = computed(() => videoGenerationRequest(snapshotVideo.value));
 const snapshotReferences = computed(() => videoReferenceManifest(snapshotVideo.value));
+const snapshotDroppedReferences = computed(() => videoDroppedReferences(snapshotVideo.value));
 const snapshotShots = computed(() => videoStructuredShots(snapshotVideo.value));
 
 function snapshotRoleLabel(reference: any) {
@@ -1028,6 +1030,15 @@ onActivated(() => {
             </article>
           </div>
           <Empty v-else :image="Empty.PRESENTED_IMAGE_SIMPLE" description="该任务没有参考图快照" />
+          <div v-if="snapshotDroppedReferences.length" class="snapshot-dropped-references">
+            <header><b>已舍弃的参考图</b><span>{{ snapshotDroppedReferences.length }} 张 · 按上限策略未发送</span></header>
+            <ul>
+              <li v-for="(reference, index) in snapshotDroppedReferences" :key="`${reference.name ?? reference.filePath}-${index}`">
+                <b>{{ reference.name || reference.filePath || '未命名参考' }}</b>
+                <small>{{ reference.reason || '超出参考图上限，按优先级舍弃' }}</small>
+              </li>
+            </ul>
+          </div>
         </section>
         <section>
           <header><b>结构化镜头</b><span>{{ snapshotShots.length }} 个镜头</span></header>
@@ -1140,6 +1151,12 @@ onActivated(() => {
 .snapshot-reference-list article > div { display: grid; min-width: 0; align-content: start; gap: 3px; }
 .snapshot-reference-list span, .snapshot-reference-list small { color: var(--ant-color-text-secondary); font-size: 11px; }
 .snapshot-url { overflow: hidden; color: var(--ant-color-text-tertiary) !important; text-overflow: ellipsis; white-space: nowrap; }
+.snapshot-dropped-references { margin-top: 10px; padding: 10px; border: 1px dashed var(--ant-color-border); border-radius: 8px; }
+.snapshot-dropped-references header { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.snapshot-dropped-references header span { color: var(--ant-color-text-tertiary); font-size: 11px; }
+.snapshot-dropped-references ul { margin: 8px 0 0; padding: 0; list-style: none; display: grid; gap: 4px; }
+.snapshot-dropped-references li { display: grid; gap: 2px; }
+.snapshot-dropped-references small { color: var(--ant-color-text-tertiary); font-size: 11px; }
 .snapshot-shot-list article { padding: 10px; border-left: 3px solid var(--ant-color-primary); border-radius: 5px; background: var(--ant-color-bg-container); }
 .snapshot-shot-heading { display: flex; align-items: center; gap: 8px; }
 .snapshot-shot-heading > span:last-child { margin-left: auto; color: var(--ant-color-text-tertiary); font-size: 11px; }

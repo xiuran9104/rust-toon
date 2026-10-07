@@ -184,6 +184,64 @@ pub async fn load_track_asset_references(
         .collect())
 }
 
+/// P0.4 参考图上限策略：当前镜头主体 > 关键道具 > 场景参考。同类内保持分镜
+/// 首现顺序，被舍弃的引用连同原因返回，写入生成快照供任务详情展示。
+pub async fn load_track_asset_reference_selection(
+    pool: &sqlx::PgPool,
+    project_id: i64,
+    script_id: i64,
+    track_id: i64,
+    cap: usize,
+) -> Result<(Vec<TrackAssetReference>, Vec<Value>), sqlx::Error> {
+    let manifest = load_track_asset_reference_manifest(pool, project_id, script_id, track_id).await?;
+    Ok(select_references_within_cap(manifest, cap))
+}
+
+fn reference_priority(asset_type: &str) -> u8 {
+    match asset_type {
+        "role" | "character" => 0,
+        "scene" => 2,
+        _ => 1,
+    }
+}
+
+pub(crate) fn select_references_within_cap(
+    references: Vec<TrackAssetReference>,
+    cap: usize,
+) -> (Vec<TrackAssetReference>, Vec<Value>) {
+    if references.len() <= cap {
+        return (references, Vec::new());
+    }
+    let mut ranked: Vec<(u8, usize)> = references
+        .iter()
+        .enumerate()
+        .map(|(position, reference)| (reference_priority(&reference.asset_type), position))
+        .collect();
+    ranked.sort_unstable();
+    let kept: std::collections::HashSet<usize> = ranked
+        .into_iter()
+        .take(cap)
+        .map(|(_, position)| position)
+        .collect();
+    let mut selected = Vec::with_capacity(cap);
+    let mut dropped = Vec::new();
+    for (position, reference) in references.into_iter().enumerate() {
+        if kept.contains(&position) {
+            selected.push(reference);
+        } else {
+            dropped.push(json!({
+                "assetId": reference.asset_id,
+                "imageId": reference.image_id,
+                "name": reference.asset_name,
+                "assetType": reference.asset_type,
+                "filePath": reference.file_path,
+                "reason": "参考图超过上限，按优先级保留镜头主体、关键道具和场景参考后舍弃",
+            }));
+        }
+    }
+    (selected, dropped)
+}
+
 /// Loads the canonical video-reference manifest in storyboard first-use order.
 pub async fn load_track_asset_reference_manifest(
     pool: &sqlx::PgPool,

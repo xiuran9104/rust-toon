@@ -9,6 +9,15 @@ export interface VideoReferenceSnapshot {
   url?: string;
 }
 
+export interface DroppedReferenceSnapshot {
+  assetId?: number;
+  assetType?: string;
+  filePath?: string;
+  imageId?: number;
+  name?: string;
+  reason?: string;
+}
+
 export interface StructuredShotSnapshot {
   description?: string;
   durationSeconds?: number;
@@ -38,6 +47,11 @@ export function videoGenerationRequest(video: any) {
 export function videoReferenceManifest(video: any): VideoReferenceSnapshot[] {
   const request = videoGenerationRequest(video);
   const value = request.referenceManifest ?? request.references;
+  return Array.isArray(value) ? value : [];
+}
+
+export function videoDroppedReferences(video: any): DroppedReferenceSnapshot[] {
+  const value = videoGenerationRequest(video).droppedReferences;
   return Array.isArray(value) ? value : [];
 }
 

@@ -924,8 +924,15 @@ pub struct Generate {
 }
 
 /// Combines canonical asset images with caller-provided frames. Assets stay first so the
-/// server-owned `@图N` manifest has the same order as the provider payload.
-fn merge_references(upload_data: Value, asset_references: Vec<String>) -> Result<Value, String> {
+const VIDEO_REFERENCE_CAP: usize = 4;
+
+/// Asset references arrive pre-selected by the P0.4 priority policy, so only
+/// trailing upload references can overflow here; the cut drops the newest
+/// extras and reports them instead of failing the whole generation.
+fn merge_references(
+    upload_data: Value,
+    asset_references: Vec<String>,
+) -> Result<(Value, Vec<String>), String> {
     let mut references = asset_references
         .into_iter()
         .filter(|reference| !reference.is_empty())
@@ -947,20 +954,23 @@ fn merge_references(upload_data: Value, asset_references: Vec<String>) -> Result
     );
     let mut seen = HashSet::new();
     references.retain(|reference| seen.insert(reference.as_str().unwrap_or_default().to_string()));
-    if references.len() > 4 {
-        return Err(format!(
-            "当前视频参考图上限为 4 张，实际 {} 张；请减少参考素材后重试，系统不会静默丢弃参考图",
-            references.len()
-        ));
-    }
-    Ok(json!(references))
+    let dropped_uploads = if references.len() > VIDEO_REFERENCE_CAP {
+        references
+            .split_off(VIDEO_REFERENCE_CAP)
+            .into_iter()
+            .filter_map(|value| value.as_str().map(str::to_string))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Ok((json!(references), dropped_uploads))
 }
 
 fn references_for_mode(
     upload_data: Value,
     asset_references: Vec<String>,
     mode: &Value,
-) -> Result<Value, String> {
+) -> Result<(Value, Vec<String>), String> {
     let mode = mode.as_str().unwrap_or("text");
     if mode == "text" {
         return merge_references(upload_data, asset_references);
@@ -994,12 +1004,15 @@ fn references_for_mode(
         "startEndRequired" | "endFrameOptional" | "startFrameOptional"
     ) && frames.len() > 1
     {
-        return Ok(json!([
-            frames.first().cloned().unwrap(),
-            frames.last().cloned().unwrap()
-        ]));
+        return Ok((
+            json!([
+                frames.first().cloned().unwrap(),
+                frames.last().cloned().unwrap()
+            ]),
+            Vec::new(),
+        ));
     }
-    Ok(json!(frames.into_iter().take(1).collect::<Vec<_>>()))
+    Ok((json!(frames.into_iter().take(1).collect::<Vec<_>>()), Vec::new()))
 }
 
 fn validate_prompt_references(prompt: &str, count: usize) -> Result<(), String> {
@@ -1286,6 +1299,7 @@ async fn generate_with_snapshot(
     video_id: i64,
     model: &str,
     payload: Value,
+    dropped_references: Vec<Value>,
 ) -> Result<String, String> {
     let references = payload["references"]
         .as_array()
@@ -1327,6 +1341,7 @@ async fn generate_with_snapshot(
             // Keep the old key during the snapshot schema transition so existing
             // task-detail consumers can continue to render reference entries.
             "references":manifest,
+            "droppedReferences":dropped_references,
         }))
         .execute(pool).await.map_err(|e| format!("保存视频生成快照失败：{e}"))?;
     if updated.rows_affected() != 1 {
@@ -1388,6 +1403,7 @@ pub(crate) struct WorkflowVideoJob {
     resolution: String,
     audio: bool,
     references: Value,
+    dropped_references: Vec<Value>,
     transition_settings: TrackTransitionSettings,
 }
 
@@ -1485,13 +1501,41 @@ pub(crate) async fn prepare_workflow_video_generation(
         .fetch_all(pool)
         .await
         .map_err(|_| AppError::internal("failed to load workflow video frames"))?;
-        let asset_references = crate::toonflow_asset_context::load_track_asset_references(
-            pool, project_id, script_id, track_id,
-        )
-        .await
-        .map_err(|_| AppError::internal("failed to load video asset references"))?;
-        let references = references_for_mode(json!(frames), asset_references, &json!(mode))
-            .map_err(AppError::bad_request)?;
+        let (asset_references, dropped_references) = if mode == "text" {
+            let (manifest, drops) =
+                crate::toonflow_asset_context::load_track_asset_reference_selection(
+                    pool,
+                    project_id,
+                    script_id,
+                    track_id,
+                    VIDEO_REFERENCE_CAP,
+                )
+                .await
+                .map_err(|_| AppError::internal("failed to load video asset references"))?;
+            (
+                manifest
+                    .into_iter()
+                    .map(|reference| reference.file_path)
+                    .collect::<Vec<_>>(),
+                drops,
+            )
+        } else {
+            (
+                crate::toonflow_asset_context::load_track_asset_references(
+                    pool, project_id, script_id, track_id,
+                )
+                .await
+                .map_err(|_| AppError::internal("failed to load video asset references"))?,
+                Vec::new(),
+            )
+        };
+        let (references, dropped_uploads) =
+            references_for_mode(json!(frames), asset_references, &json!(mode))
+                .map_err(AppError::bad_request)?;
+        let mut dropped_references = dropped_references;
+        dropped_references.extend(dropped_uploads.into_iter().map(|file_path| {
+            json!({"filePath": file_path, "reason": "参考图超过上限，优先保留资产参考，舍弃附加参考图"})
+        }));
         prepared_jobs.push(WorkflowVideoJob {
             previous_video_id: None,
             id: 0,
@@ -1509,6 +1553,7 @@ pub(crate) async fn prepare_workflow_video_generation(
             resolution: input.resolution.clone(),
             audio: input.audio,
             references,
+            dropped_references,
             transition_settings: TrackTransitionSettings {
                 transition_type,
                 frame_policy,
@@ -1660,7 +1705,8 @@ async fn run_workflow_video_job(
             mark_video_generation_failed(&pool, job.id, "视频生成并发控制不可用".into()).await;
             return (track_id, false);
         };
-        generate_with_snapshot(&pool, job.id, &job.model, payload).await
+        generate_with_snapshot(&pool, job.id, &job.model, payload, job.dropped_references.clone())
+            .await
     };
     let succeeded = match provider_result {
         Ok(url) => store_generated_video(&pool, job.id, project_id, &url).await,
@@ -1798,16 +1844,44 @@ pub async fn generate_video(
         &transition_settings.frame_policy,
     )
     .map_err(AppError::bad_request)?;
-    let asset_references = crate::toonflow_asset_context::load_track_asset_references(
-        &state.pool,
-        req.project_id,
-        req.script_id,
-        req.track_id,
-    )
-    .await
-    .map_err(|_| AppError::internal("failed to load video asset references"))?;
-    let references = references_for_mode(req.upload_data, asset_references, &req.mode)
-        .map_err(AppError::bad_request)?;
+    let generation_mode = req.mode.as_str().unwrap_or("text").to_string();
+    let (asset_references, mut dropped_references) = if generation_mode == "text" {
+        let (manifest, drops) =
+            crate::toonflow_asset_context::load_track_asset_reference_selection(
+                &state.pool,
+                req.project_id,
+                req.script_id,
+                req.track_id,
+                VIDEO_REFERENCE_CAP,
+            )
+            .await
+            .map_err(|_| AppError::internal("failed to load video asset references"))?;
+        (
+            manifest
+                .into_iter()
+                .map(|reference| reference.file_path)
+                .collect::<Vec<_>>(),
+            drops,
+        )
+    } else {
+        (
+            crate::toonflow_asset_context::load_track_asset_references(
+                &state.pool,
+                req.project_id,
+                req.script_id,
+                req.track_id,
+            )
+            .await
+            .map_err(|_| AppError::internal("failed to load video asset references"))?,
+            Vec::new(),
+        )
+    };
+    let (references, dropped_uploads) =
+        references_for_mode(req.upload_data, asset_references, &req.mode)
+            .map_err(AppError::bad_request)?;
+    dropped_references.extend(dropped_uploads.into_iter().map(|file_path| {
+        json!({"filePath": file_path, "reason": "参考图超过上限，优先保留资产参考，舍弃附加参考图"})
+    }));
     let generation_task_permit = try_acquire_video_generation_task()?;
     let id: Option<i64> = sqlx::query_scalar(
         "INSERT INTO toonflow.videos(
@@ -1880,7 +1954,7 @@ pub async fn generate_video(
                 mark_video_generation_failed(&pool, id, "视频生成并发控制不可用".into()).await;
                 return;
             };
-            generate_with_snapshot(&pool, id, &req.model, payload).await
+            generate_with_snapshot(&pool, id, &req.model, payload, dropped_references).await
         };
         match provider_result {
             Ok(url) => {
@@ -2246,33 +2320,19 @@ pub(crate) async fn create_prompt(
     let (from_scene_key, transition_description) =
         transition_context.unwrap_or_else(|| (String::new(), String::new()));
     let reference_manifest = if mode == "text" {
-        crate::toonflow_asset_context::load_track_asset_reference_manifest(
+        crate::toonflow_asset_context::load_track_asset_reference_selection(
             pool,
             project_id,
             script_id,
             track_id,
+            VIDEO_REFERENCE_CAP,
         )
         .await
         .map_err(|error| error.to_string())?
+        .0
     } else {
         Vec::new()
     };
-    if reference_manifest.len() > 4 {
-        let reason = format!(
-            "当前视频参考图上限为 4 张，实际 {} 张；请减少参考素材后重试，系统不会静默丢弃参考图",
-            reference_manifest.len()
-        );
-        let _ = sqlx::query(
-            "UPDATE toonflow.video_tracks SET state='生成失败',reason=$2
-             WHERE id=$1 AND project_id=$3",
-        )
-        .bind(track_id)
-        .bind(&reason)
-        .bind(project_id)
-        .execute(pool)
-        .await;
-        return Err(reason);
-    }
     let reference_manifest_xml = reference_manifest
         .iter()
         .enumerate()
@@ -2439,6 +2499,7 @@ mod prompt_tests {
             resolution: "1080p".into(),
             audio: false,
             references: json!([]),
+            dropped_references: Vec::new(),
             transition_settings: TrackTransitionSettings {
                 transition_type: "continuous".into(),
                 frame_policy: frame_policy.into(),
@@ -2533,7 +2594,7 @@ mod prompt_tests {
 
     #[test]
     fn places_unique_canonical_assets_before_storyboard_media() {
-        let references = merge_references(
+        let (references, dropped) = merge_references(
             json!([
                 {"id": 1, "src": "https://example.com/storyboard.png"},
                 "https://example.com/direct.png"
@@ -2552,15 +2613,72 @@ mod prompt_tests {
                 "https://example.com/storyboard.png",
             ])
         );
+        assert!(dropped.is_empty());
     }
 
     #[test]
-    fn rejects_excess_references_without_silently_dropping_assets() {
-        let references = merge_references(
+    fn drops_excess_upload_references_and_reports_them() {
+        let (references, dropped) = merge_references(
             json!(["frame-1", "frame-2"]),
             vec!["role-1".into(), "scene-1".into(), "tool-1".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            references,
+            json!(["role-1", "scene-1", "tool-1", "frame-1"])
         );
-        assert!(references.unwrap_err().contains("实际 5 张"));
+        assert_eq!(dropped, vec!["frame-2".to_string()]);
+    }
+
+    fn track_reference(name: &str, asset_type: &str) -> TrackAssetReference {
+        TrackAssetReference {
+            asset_id: 0,
+            asset_name: name.into(),
+            asset_type: asset_type.into(),
+            image_id: 0,
+            file_path: format!("{name}.png"),
+        }
+    }
+
+    #[test]
+    fn selects_references_by_priority_and_keeps_first_use_order() {
+        let references = vec![
+            track_reference("S1", "scene"),
+            track_reference("R1", "role"),
+            track_reference("P1", "prop"),
+            track_reference("S2", "scene"),
+            track_reference("R2", "character"),
+            track_reference("P2", "prop"),
+        ];
+        let (selected, dropped) =
+            crate::toonflow_asset_context::select_references_within_cap(references, 4);
+        let names = selected
+            .iter()
+            .map(|reference| reference.asset_name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["R1", "P1", "R2", "P2"]);
+        let dropped_names = dropped
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(dropped_names, vec!["S1", "S2"]);
+        assert!(dropped
+            .iter()
+            .all(|entry| entry["reason"].as_str().unwrap().contains("上限")));
+    }
+
+    #[test]
+    fn keeps_all_references_within_the_cap() {
+        let references = vec![
+            track_reference("R1", "role"),
+            track_reference("S1", "scene"),
+            track_reference("P1", "prop"),
+            track_reference("R2", "role"),
+        ];
+        let (selected, dropped) =
+            crate::toonflow_asset_context::select_references_within_cap(references, 4);
+        assert_eq!(selected.len(), 4);
+        assert!(dropped.is_empty());
     }
 
     #[test]
@@ -2569,26 +2687,37 @@ mod prompt_tests {
         let assets = vec!["role".into(), "scene".into()];
         assert_eq!(
             references_for_mode(frames.clone(), assets.clone(), &json!("startEndRequired"))
-                .unwrap(),
+                .unwrap()
+                .0,
             json!(["first", "last"])
         );
         assert_eq!(
             references_for_mode(frames.clone(), assets.clone(), &json!("endFrameOptional"))
-                .unwrap(),
+                .unwrap()
+                .0,
             json!(["first", "last"])
         );
         assert_eq!(
             references_for_mode(frames.clone(), assets.clone(), &json!("startFrameOptional"))
-                .unwrap(),
+                .unwrap()
+                .0,
             json!(["first", "last"])
         );
         assert_eq!(
-            references_for_mode(frames.clone(), assets.clone(), &json!("singleImage")).unwrap(),
+            references_for_mode(frames.clone(), assets.clone(), &json!("singleImage"))
+                .unwrap()
+                .0,
             json!(["first"])
         );
-        assert!(references_for_mode(frames, assets, &json!("text")).is_err());
+        // Text mode keeps assets ahead of frame media and reports the cut.
+        let (references, dropped) =
+            references_for_mode(frames, assets, &json!("text")).unwrap();
+        assert_eq!(references, json!(["role", "scene", "first", "middle"]));
+        assert_eq!(dropped, vec!["last".to_string()]);
         assert_eq!(
-            references_for_mode(json!(["only"]), Vec::new(), &json!("startFrameOptional")).unwrap(),
+            references_for_mode(json!(["only"]), Vec::new(), &json!("startFrameOptional"))
+                .unwrap()
+                .0,
             json!(["only"])
         );
     }
@@ -2601,7 +2730,8 @@ mod prompt_tests {
                 vec![],
                 &json!("startEndRequired")
             )
-            .unwrap(),
+            .unwrap()
+            .0,
             json!(["1", "5"])
         );
         assert!(references_for_mode(json!(["1"]), vec![], &json!("startEndRequired")).is_err());
@@ -2786,6 +2916,8 @@ pub struct VideoBatchItem {
     duration: i32,
     #[serde(skip)]
     transition_settings: Option<TrackTransitionSettings>,
+    #[serde(skip)]
+    dropped_references: Vec<Value>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2890,16 +3022,45 @@ pub async fn batch_videos(
                 .map_err(AppError::bad_request)?;
             }
         }
-        let asset_references = crate::toonflow_asset_context::load_track_asset_references(
-            &state.pool,
-            req.project_id,
-            req.script_id,
-            track.track_id,
-        )
-        .await
-        .map_err(|_| AppError::internal("failed to load video asset references"))?;
-        track.upload_data = references_for_mode(track.upload_data, asset_references, &req.mode)
-            .map_err(AppError::bad_request)?;
+        let (asset_references, mut dropped_references) = if req.mode.as_str() == Some("text") {
+            let (manifest, drops) =
+                crate::toonflow_asset_context::load_track_asset_reference_selection(
+                    &state.pool,
+                    req.project_id,
+                    req.script_id,
+                    track.track_id,
+                    VIDEO_REFERENCE_CAP,
+                )
+                .await
+                .map_err(|_| AppError::internal("failed to load video asset references"))?;
+            (
+                manifest
+                    .into_iter()
+                    .map(|reference| reference.file_path)
+                    .collect::<Vec<_>>(),
+                drops,
+            )
+        } else {
+            (
+                crate::toonflow_asset_context::load_track_asset_references(
+                    &state.pool,
+                    req.project_id,
+                    req.script_id,
+                    track.track_id,
+                )
+                .await
+                .map_err(|_| AppError::internal("failed to load video asset references"))?,
+                Vec::new(),
+            )
+        };
+        let (references, dropped_uploads) =
+            references_for_mode(track.upload_data, asset_references, &req.mode)
+                .map_err(AppError::bad_request)?;
+        dropped_references.extend(dropped_uploads.into_iter().map(|file_path| {
+            json!({"filePath": file_path, "reason": "参考图超过上限，优先保留资产参考，舍弃附加参考图"})
+        }));
+        track.upload_data = references;
+        track.dropped_references = dropped_references;
         prepared_tracks.push(track);
     }
     let mut tx = state
@@ -2965,6 +3126,7 @@ pub async fn batch_videos(
                 resolution: req.resolution.clone(),
                 audio: req.audio.unwrap_or(false),
                 references: track.upload_data,
+                dropped_references: track.dropped_references,
                 transition_settings: track.transition_settings.expect("prepared track settings"),
             })
             .collect();
