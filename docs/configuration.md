@@ -48,6 +48,7 @@ Redis 为**可选**：`REDIS_URL` 未设置或连接失败时，缓存与限流�
 | `RATE_LIMIT_NAMESPACE` | `rate-limit` | 限流键命名空间 |
 | `RATE_LIMIT_MAX_REQUESTS` | `300` | 窗口内最大请求数（按 IP+方法+路径） |
 | `RATE_LIMIT_WINDOW_SECONDS` | `60` | 限流窗口（秒） |
+| `RATE_LIMIT_TRUST_PROXY_HEADERS` | `false` | 是否信任入口代理重写后的 `X-Forwarded-For`；仅在 Gateway 只能由受控代理访问时启用 |
 
 ### 1.5 r-nacos 动态配置（`crates/framework/dynamic-config`）
 
@@ -146,7 +147,7 @@ Gateway 与 Toon Worker 默认在各自监听端口暴露 `GET /metrics`，使�
 | `READINESS_REQUIRE_REDIS` | 设置了 `REDIS_URL` 时为 `true` | Redis 不可用时让 `/readyz` 返回 503 | `gateway/src/readiness.rs` |
 | `READINESS_REQUIRE_OBJECT_STORAGE` | 生产环境或设置了 `S3_ENDPOINT` 时为 `true` | 使用生产链路同款签名 S3 请求验证凭据和 bucket；不可访问时让 `/readyz` 返回 503 | `gateway/src/readiness.rs` |
 | `READINESS_REQUIRE_FFMPEG` | `false` | 仅在承担成片导出的节点上启用；缺少或无法执行 FFmpeg/FFprobe 时让 `/readyz` 返回 503 | `gateway/src/readiness.rs` |
-| `SECRET_ENCRYPTION_KEY` | 回退 `JWT_SECRET`，再回退内置常量 `rust-toon-local-secret` | AI 模型 api_key、文件配置等敏感字段落库时的对称加密密钥（`enc:v1:` 前缀格式） | `system-server/src/management/compat.rs`、`infra-server/src/lib.rs` |
+| `SECRET_ENCRYPTION_KEY` | 无默认值，至少 32 字节 | 邮件、短信、OAuth 与数据源等敏感字段的独立 AES-256-GCM 密钥（新写入为 `enc:v2:`；旧 `enc:v1:` 数据保持兼容） | `framework/security/src/secret.rs` |
 | `TEST_DATABASE_URL` | 无 | 仅测试使用：迁移测试与分镜数据库集成测试 | `toon-server/src/lib.rs` 测试、`script/test-database-migrations.sh` |
 | `TEST_POSTGRES_PORT` | `55432` | 迁移测试脚本起临时 PostgreSQL 容器所用端口 | `script/test-database-migrations.sh` |
 | `AI_REQUEST_TIMEOUT_SECONDS` | `120` | AI Provider 单次 HTTP 请求总超时，实际限制在 5～900 秒；连接超时固定为 15 秒 | `ai-server/src/provider.rs` |

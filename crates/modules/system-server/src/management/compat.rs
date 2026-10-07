@@ -1,4 +1,4 @@
-use std::{collections::HashMap, env};
+use std::collections::HashMap;
 
 use crate::{
     SystemState,
@@ -15,10 +15,9 @@ use axum::{
     Json,
     extract::{Query, State},
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, Utc};
 use rust_toon_framework_common::ApiResponse;
-use rust_toon_framework_security::CurrentUser;
+use rust_toon_framework_security::{CurrentUser, seal_secret};
 use rust_toon_framework_web::AppError;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1149,7 +1148,7 @@ async fn yudao_create(
     spec: YudaoSpec,
     payload: Value,
 ) -> Result<Json<ApiResponse<String>>, AppError> {
-    let db_payload = seal_sensitive_payload(spec.table, camel_payload_to_snake(payload), false);
+    let db_payload = seal_sensitive_payload(spec.table, camel_payload_to_snake(payload), false)?;
     let columns = writable_columns(pool, spec.table, &db_payload, false).await?;
     if columns.is_empty() {
         return Err(AppError::bad_request("no writable fields"));
@@ -1178,7 +1177,7 @@ async fn yudao_update(
     payload: Value,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
     let id = parse_i64_value(&payload["id"])?;
-    let db_payload = seal_sensitive_payload(spec.table, camel_payload_to_snake(payload), true);
+    let db_payload = seal_sensitive_payload(spec.table, camel_payload_to_snake(payload), true)?;
     let columns = writable_columns(pool, spec.table, &db_payload, true).await?;
     if columns.is_empty() {
         return Ok(Json(ApiResponse::new(())));
@@ -1304,9 +1303,9 @@ fn camel_payload_to_snake(value: Value) -> Value {
     Value::Object(mapped)
 }
 
-fn seal_sensitive_payload(table: &str, value: Value, skip_masked: bool) -> Value {
+fn seal_sensitive_payload(table: &str, value: Value, skip_masked: bool) -> Result<Value, AppError> {
     let Value::Object(mut object) = value else {
-        return json!({});
+        return Ok(json!({}));
     };
     let fields: &[&str] = match table {
         "system_mail_account" => &["password"],
@@ -1323,9 +1322,10 @@ fn seal_sensitive_payload(table: &str, value: Value, skip_masked: bool) -> Value
             object.remove(*field);
             continue;
         }
-        object.insert((*field).to_owned(), Value::String(seal_secret(current)));
+        let sealed = seal_secret(current).map_err(|error| AppError::internal(error.to_string()))?;
+        object.insert((*field).to_owned(), Value::String(sealed));
     }
-    Value::Object(object)
+    Ok(Value::Object(object))
 }
 
 fn is_sensitive_column(column: &str) -> bool {
@@ -1341,23 +1341,6 @@ fn mask_secret_value(value: Value) -> Value {
         Value::String(value) if value.is_empty() => Value::String(String::new()),
         _ => Value::String("******".to_owned()),
     }
-}
-
-fn seal_secret(value: &str) -> String {
-    if value.starts_with("enc:v1:") {
-        return value.to_owned();
-    }
-    let key = env::var("SECRET_ENCRYPTION_KEY")
-        .or_else(|_| env::var("JWT_SECRET"))
-        .unwrap_or_else(|_| "rust-toon-local-secret".to_owned());
-    let key = key.as_bytes();
-    let sealed = value
-        .as_bytes()
-        .iter()
-        .enumerate()
-        .map(|(index, byte)| byte ^ key[index % key.len()])
-        .collect::<Vec<_>>();
-    format!("enc:v1:{}", BASE64.encode(sealed))
 }
 
 fn snake_to_camel(value: &str) -> String {

@@ -54,6 +54,7 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = ["
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] }
 prometheus-client = "0.25"
 rand_core = { version = "0.6", features = ["getrandom"] }
+ring = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 redis = { version = "0.32", default-features = false, features = ["aio", "tokio-comp"] }
 rust_xlsxwriter = "0.96"

@@ -2686,10 +2686,12 @@ version = "0.1.0"
 dependencies = [
  "argon2",
  "axum",
+ "base64",
  "bcrypt",
  "chrono",
  "jsonwebtoken",
  "rand_core 0.6.4",
+ "ring",
  "rust-toon-framework-common",
  "serde",
  "tokio",
@@ -2777,7 +2779,6 @@ name = "rust-toon-infra-server"
 version = "0.1.0"
 dependencies = [
  "axum",
- "base64",
  "chrono",
  "hex",
  "hmac 0.12.1",
@@ -2840,7 +2841,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
- "base64",
  "calamine",
  "chrono",
  "rust-toon-framework-common",

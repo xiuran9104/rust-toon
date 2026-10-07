@@ -8,7 +8,6 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
-base64.workspace = true
 calamine.workspace = true
 chrono.workspace = true
 rust-toon-framework-common.workspace = true

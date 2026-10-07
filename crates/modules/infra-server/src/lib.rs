@@ -11,14 +11,15 @@ use axum::{
     response::Response,
     routing::{delete, get, post, put},
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::Utc;
 use rust_toon_framework_common::ApiResponse;
 use rust_toon_framework_database::PgPool;
 use rust_toon_framework_jobs::{
     INFRA_SCHEDULED_JOB_KIND, ScheduledJobPayload, next_occurrence, next_occurrences, validate_cron,
 };
-use rust_toon_framework_security::{CurrentUser, Permission, TokenService, authenticate};
+use rust_toon_framework_security::{
+    CurrentUser, Permission, TokenService, authenticate, seal_secret,
+};
 use rust_toon_framework_telemetry::{current_trace_context, current_trace_id};
 use rust_toon_framework_web::AppError;
 use rust_toon_infra_api::InfraCapability;
@@ -632,7 +633,8 @@ async fn data_source_create(
     State(state): State<InfraState>,
     Json(payload): Json<Value>,
 ) -> Result<Json<ApiResponse<String>>, AppError> {
-    let password = seal_secret(&str_field(&payload, "password"));
+    let password = seal_secret(&str_field(&payload, "password"))
+        .map_err(|error| AppError::internal(error.to_string()))?;
     let id = sqlx::query_scalar::<_, i64>("INSERT INTO infra_data_source_config (id, name, url, username, password) VALUES (nextval('infra_data_source_config_seq'),$1,$2,$3,$4) RETURNING id")
         .bind(str_field(&payload, "name")).bind(str_field(&payload, "url")).bind(str_field(&payload, "username")).bind(password)
         .fetch_one(&state.pool).await.map_err(|_| AppError::internal("failed to create data source"))?;
@@ -645,7 +647,9 @@ async fn data_source_update(
 ) -> Result<Json<ApiResponse<()>>, AppError> {
     let password = opt_str_field(&payload, "password")
         .filter(|value| value != "******")
-        .map(|value| seal_secret(&value));
+        .map(|value| seal_secret(&value))
+        .transpose()
+        .map_err(|error| AppError::internal(error.to_string()))?;
     sqlx::query("UPDATE infra_data_source_config SET name=$2,url=$3,username=$4,password=COALESCE($5,password),update_time=now() WHERE id=$1 AND deleted=0")
         .bind(i64_field(&payload, "id", 0)).bind(str_field(&payload, "name")).bind(str_field(&payload, "url")).bind(str_field(&payload, "username")).bind(password)
         .execute(&state.pool).await.map_err(|_| AppError::internal("failed to update data source"))?;
@@ -2160,23 +2164,6 @@ fn opt_i64_field(value: &Value, key: &str) -> Option<i64> {
 
 fn bool_field(value: &Value, key: &str, default: bool) -> bool {
     value.get(key).and_then(Value::as_bool).unwrap_or(default)
-}
-
-fn seal_secret(value: &str) -> String {
-    if value.is_empty() || value.starts_with("enc:v1:") {
-        return value.to_owned();
-    }
-    let key = env::var("SECRET_ENCRYPTION_KEY")
-        .or_else(|_| env::var("JWT_SECRET"))
-        .unwrap_or_else(|_| "rust-toon-local-secret".to_owned());
-    let key = key.as_bytes();
-    let sealed = value
-        .as_bytes()
-        .iter()
-        .enumerate()
-        .map(|(index, byte)| byte ^ key[index % key.len()])
-        .collect::<Vec<_>>();
-    format!("enc:v1:{}", BASE64.encode(sealed))
 }
 
 fn table_value(value: Value) -> Value {
