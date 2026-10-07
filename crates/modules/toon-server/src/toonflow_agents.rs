@@ -1473,6 +1473,97 @@ async fn recover_stale(state: &ToonState) {
     let _=sqlx::query("UPDATE toonflow.agent_runs SET state='interrupted',error_reason='服务重启导致任务中断',finish_time=$1 WHERE state='running' AND NOT(id=ANY($2))").bind(now_ms()).bind(active).execute(&state.pool).await;
 }
 
+/// 对齐方案 P1 断点续跑：从数据库产物推断已完成阶段。全部为零时返回
+/// None，走全新运行；有任何产物时构建恢复指令注入重试请求。
+fn build_resume_directive(
+    script_name: Option<&str>,
+    script_chars: usize,
+    derive_count: i64,
+    storyboards_total: i64,
+    storyboard_done: i64,
+    storyboard_failed: i64,
+) -> Option<String> {
+    if script_chars == 0 && storyboards_total == 0 && derive_count == 0 {
+        return None;
+    }
+    let mut completed = Vec::new();
+    if script_chars > 0 {
+        completed.push(format!(
+            "- 剧本《{}》已存在（{script_chars} 字）",
+            script_name.unwrap_or("未命名")
+        ));
+    }
+    if derive_count > 0 {
+        completed.push(format!("- 已创建 {derive_count} 套衍生造型"));
+    }
+    if storyboards_total > 0 {
+        let pending = storyboards_total - storyboard_done - storyboard_failed;
+        completed.push(format!(
+            "- 分镜表已写入 {storyboards_total} 条：{storyboard_done} 张图片已完成，{storyboard_failed} 张失败，{pending} 张未生成"
+        ));
+    }
+    let next_step = if storyboard_failed > 0 {
+        "先用分镜图片生成工具逐条重试『生成失败』的分镜；失败原因见分镜行 reason。"
+    } else if storyboards_total > storyboard_done {
+        "生成分镜表中仍为『未生成』的分镜图片。"
+    } else if storyboards_total > 0 {
+        "分镜图片已齐：核对分镜表完整性与视频轨道，继续后续阶段（视频提示词、候选视频），不要重复出图。"
+    } else {
+        "从衍生造型确认后的下一阶段继续，不要重新提取资产或重建剧本。"
+    };
+    Some(format!(
+        "【断点续跑恢复指令】\n上一轮运行已完成以下阶段，产物已持久化，禁止重做或删除重建：\n{}\n请从第一个未完成阶段继续：{next_step}\n不得重新生成剧本，不得清空分镜表；现有分镜数量与分镜表一致时只能调用 update_storyboard。",
+        completed.join("\n")
+    ))
+}
+
+async fn production_resume_context(
+    pool: &sqlx::PgPool,
+    project_id: Option<i64>,
+    script_id: Option<i64>,
+) -> Option<String> {
+    let (project_id, script_id) = (project_id?, script_id?);
+    let script: Option<(Option<String>, i64)> = sqlx::query_as(
+        "SELECT name,char_length(coalesce(content,'')) FROM toonflow.scripts WHERE id=$1 AND project_id=$2",
+    )
+    .bind(script_id)
+    .bind(project_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    let (script_name, script_chars) = script?;
+    let derive_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM toonflow.assets WHERE project_id=$1 AND script_id=$2 AND parent_asset_id IS NOT NULL",
+    )
+    .bind(project_id)
+    .bind(script_id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+    let boards: Option<(i64, i64, i64)> = sqlx::query_as(
+        "SELECT count(*),
+                count(*) FILTER (WHERE state='已完成'),
+                count(*) FILTER (WHERE state='生成失败')
+         FROM toonflow.storyboards WHERE project_id=$1 AND script_id=$2",
+    )
+    .bind(project_id)
+    .bind(script_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    let (total, done, failed) = boards.unwrap_or((0, 0, 0));
+    build_resume_directive(
+        script_name.as_deref(),
+        script_chars as usize,
+        derive_count,
+        total,
+        done,
+        failed,
+    )
+}
+
 pub async fn retry(
     user: CurrentUser,
     State(state): State<ToonState>,
@@ -1482,8 +1573,17 @@ pub async fn retry(
     authorize_run(&state, &user, source.id).await?;
     recover_stale(&state).await;
     let row:Option<RetryRunRow>=sqlx::query_as("SELECT agent_type,isolation_key,project_id,script_id,input,think,think_level FROM toonflow.agent_runs WHERE id=$1 AND state IN('failed','canceled','interrupted')").bind(source.id).fetch_optional(&state.pool).await.map_err(|_|AppError::internal("failed to load retry run"))?;
-    let (agent_type, isolation_key, project_id, script_id, content, think, think_level) =
+    let (agent_type, isolation_key, project_id, script_id, mut content, think, think_level) =
         row.ok_or_else(|| AppError::bad_request("仅失败、中止或中断的运行可重试"))?;
+    // 对齐方案 P1 断点续跑：生产 Agent 重试时注入已完成阶段与继续点，
+    // 避免整单重放（重做剧本/重建分镜表/重复出图）。
+    if agent_type == "productionAgent" {
+        if let Some(resume) =
+            production_resume_context(&state.pool, Some(project_id), script_id).await
+        {
+            content = format!("{content}\n\n{resume}");
+        }
+    }
     let request = ChatRequest {
         agent_type,
         isolation_key,
@@ -1655,8 +1755,8 @@ pub(crate) async fn clear_memory_records(
 #[cfg(test)]
 mod tests {
     use super::{
-        format_chapter_ranges, parse_native_tool_arguments, parse_tool_calls, pipeline_rule,
-        stop_run_after_tool_failure, tool_names,
+        build_resume_directive, format_chapter_ranges, parse_native_tool_arguments,
+        parse_tool_calls, pipeline_rule, stop_run_after_tool_failure, tool_names,
     };
 
     #[test]
@@ -1732,5 +1832,28 @@ mod tests {
     fn invalid_native_tool_arguments_can_be_returned_to_the_model_for_repair() {
         assert!(parse_native_tool_arguments(r#"{"key":"assets"}"#).is_ok());
         assert!(parse_native_tool_arguments(r#"{"key":"assets""#).is_err());
+    }
+
+    #[test]
+    fn resume_directive_skips_fresh_projects_and_targets_failed_images() {
+        // 全新项目：无产物，走全新运行。
+        assert!(build_resume_directive(None, 0, 0, 0, 0, 0).is_none());
+        // 有失败分镜：指令要求先重试失败项。
+        let directive = build_resume_directive(Some("第1集"), 1200, 3, 8, 5, 2).unwrap();
+        assert!(directive.contains("剧本《第1集》已存在（1200 字）"));
+        assert!(directive.contains("已创建 3 套衍生造型"));
+        assert!(directive.contains("分镜表已写入 8 条：5 张图片已完成，2 张失败，1 张未生成"));
+        assert!(directive.contains("逐条重试『生成失败』的分镜"));
+        assert!(directive.contains("禁止重做或删除重建"));
+    }
+
+    #[test]
+    fn resume_directive_advances_when_images_complete() {
+        let directive = build_resume_directive(Some("第2集"), 800, 0, 4, 4, 0).unwrap();
+        assert!(directive.contains("分镜图片已齐"));
+        assert!(directive.contains("不要重复出图"));
+        // 只有剧本、没有分镜：从衍生后的阶段继续。
+        let early = build_resume_directive(Some("第3集"), 600, 1, 0, 0, 0).unwrap();
+        assert!(early.contains("从衍生造型确认后的下一阶段继续"));
     }
 }
