@@ -1117,6 +1117,29 @@ fn parse_shot_duration(value: &str, position: usize) -> Result<f64, String> {
     Ok(duration)
 }
 
+/// P0.5：特写/近景通常只承载一个必需主体，多主体特写几乎必然生成
+/// 失败，必须在提交前拦下。
+fn validate_shot_framing_subjects(
+    shot_size: Option<&str>,
+    references: &[StructuredShotReference],
+    position: usize,
+) -> Result<(), String> {
+    if !matches!(shot_size, Some("特写") | Some("近景")) {
+        return Ok(());
+    }
+    let required_subjects = references
+        .iter()
+        .filter(|reference| matches!(reference.asset_type.as_str(), "role" | "character"))
+        .count();
+    if required_subjects > 1 {
+        return Err(format!(
+            "第 {position} 个分镜是{}，但绑定了 {required_subjects} 个必需人物主体；请改用中景/全景或减少出镜人物",
+            shot_size.unwrap_or_default(),
+        ));
+    }
+    Ok(())
+}
+
 async fn load_structured_shot_descriptions(
     pool: &sqlx::PgPool,
     project_id: i64,
@@ -1208,26 +1231,7 @@ async fn load_structured_shot_descriptions(
             let shot_size = row.shot_size.filter(|value| !value.trim().is_empty());
             let camera_move = row.camera_move.filter(|value| !value.trim().is_empty());
             let references = assets_by_storyboard.remove(&row.id).unwrap_or_default();
-            // P0.5：特写/近景通常只承载一个必需主体，多主体特写几乎必然
-            // 生成失败，必须在提交前拦下。
-            if matches!(shot_size.as_deref(), Some("特写") | Some("近景")) {
-                let required_subjects = references
-                    .iter()
-                    .filter(|reference| {
-                        matches!(
-                            reference.asset_type.as_str(),
-                            "role" | "character"
-                        )
-                    })
-                    .count();
-                if required_subjects > 1 {
-                    return Err(format!(
-                        "第 {} 个分镜是{}，但绑定了 {required_subjects} 个必需人物主体；请改用中景/全景或减少出镜人物",
-                        position + 1,
-                        shot_size.as_deref().unwrap_or_default(),
-                    ));
-                }
-            }
+            validate_shot_framing_subjects(shot_size.as_deref(), &references, position + 1)?;
             Ok(StructuredShotDescription {
                 storyboard_id: row.id,
                 sequence: row.index.unwrap_or(position as i32 + 1),
@@ -3234,4 +3238,183 @@ pub async fn batch_videos(
         run_workflow_video_generation(pool, req.project_id, jobs, 2, 0).await;
     });
     Ok(Json(ApiResponse::new(response)))
+}
+
+#[cfg(test)]
+mod regression_corpus {
+    //! P1 固定回归样例集：单人、双人、场景、关键道具、特写（单/多主体）、
+    //! 空镜、首帧、首尾帧九类固定样例贯穿参考选择、提示词编译、镜头
+    //! 校验与模型家族校验链。改动任一环节时，这些样例的期望必须保持
+    //! 不变；“背影”类角度样例需要先扩展运镜/机位字段再纳入。
+
+    use super::{
+        StructuredShotReference, compile_video_prompt_with_manifest, merge_references,
+        references_for_mode, validate_prompt_references, validate_shot_framing_subjects,
+    };
+    use crate::toonflow_asset_context::{TrackAssetReference, select_references_within_cap};
+    use crate::toonflow_video_compilers::validate_family_request;
+    use serde_json::json;
+
+    fn reference(name: &str, asset_type: &str) -> TrackAssetReference {
+        TrackAssetReference {
+            asset_id: 0,
+            asset_name: name.into(),
+            asset_type: asset_type.into(),
+            image_id: 0,
+            file_path: format!("{name}.png"),
+        }
+    }
+
+    fn shot_reference(asset_type: &str) -> StructuredShotReference {
+        StructuredShotReference {
+            index: Some(1),
+            asset_id: 0,
+            asset_type: asset_type.into(),
+            name: String::new(),
+        }
+    }
+
+    #[test]
+    fn single_character_track() {
+        let (selected, dropped) = select_references_within_cap(vec![reference("沈辞", "role")], 4);
+        assert_eq!(selected.len(), 1);
+        assert!(dropped.is_empty());
+        let prompt = compile_video_prompt_with_manifest("@图1 走向镜头", &selected).unwrap();
+        assert!(prompt.starts_with("参考图清单：@图1 为沈辞"));
+        assert!(validate_prompt_references("@图1", 1).is_ok());
+        assert!(validate_family_request("seedance-1-5", "text", 1).is_ok());
+    }
+
+    #[test]
+    fn two_character_track_requires_both_references() {
+        let references = vec![reference("沈辞", "role"), reference("林晚", "role")];
+        let (selected, dropped) = select_references_within_cap(references.clone(), 4);
+        assert_eq!(selected.len(), 2);
+        assert!(dropped.is_empty());
+        let prompt =
+            compile_video_prompt_with_manifest("@图1 与 @图2 对峙", &selected).unwrap();
+        assert!(prompt.contains("@图1 为沈辞"));
+        assert!(prompt.contains("@图2 为林晚"));
+        // 双人样例必须同时引用两张图；漏引即失败。
+        assert!(compile_video_prompt_with_manifest("@图1 独白", &selected)
+            .unwrap_err()
+            .contains("缺少服务端参考清单中的 @图2"));
+        // 双人镜头不能是特写/近景。
+        assert!(validate_shot_framing_subjects(Some("特写"), &[shot_reference("role"), shot_reference("role")], 1)
+            .is_err());
+    }
+
+    #[test]
+    fn scene_reference_survives_behind_subjects_when_capped() {
+        let references = vec![
+            reference("沈辞", "role"),
+            reference("林晚", "role"),
+            reference("扳手", "tool"),
+            reference("机房", "scene"),
+            reference("天台", "scene"),
+        ];
+        let (selected, dropped) = select_references_within_cap(references, 4);
+        let names = selected
+            .iter()
+            .map(|item| item.asset_name.as_str())
+            .collect::<Vec<_>>();
+        // 保留集维持分镜首现顺序，被舍弃的是优先级最低的第二个场景。
+        assert_eq!(names, vec!["沈辞", "林晚", "扳手", "机房"]);
+        assert_eq!(
+            dropped
+                .iter()
+                .map(|entry| entry["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["天台"]
+        );
+    }
+
+    #[test]
+    fn key_prop_outranks_environment_references() {
+        let references = vec![
+            reference("机房", "scene"),
+            reference("扳手", "tool"),
+            reference("天台", "scene"),
+            reference("怀表", "tool"),
+        ];
+        let (selected, dropped) = select_references_within_cap(references, 3);
+        let names = selected
+            .iter()
+            .map(|item| item.asset_name.as_str())
+            .collect::<Vec<_>>();
+        // 道具优先于场景入选，但输出保持首现顺序：机房(pos0) 先于两个道具。
+        assert_eq!(names, vec!["机房", "扳手", "怀表"]);
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0]["name"].as_str().unwrap(), "天台");
+    }
+
+    #[test]
+    fn close_up_with_single_subject_is_allowed() {
+        assert!(validate_shot_framing_subjects(Some("特写"), &[shot_reference("role")], 1).is_ok());
+        assert!(validate_shot_framing_subjects(Some("近景"), &[shot_reference("role")], 3).is_ok());
+        // 非人物资产不占用特写单主体名额。
+        assert!(validate_shot_framing_subjects(
+            Some("特写"),
+            &[shot_reference("role"), shot_reference("tool")],
+            1
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn close_up_with_multiple_subjects_is_rejected_with_guidance() {
+        let error = validate_shot_framing_subjects(
+            Some("特写"),
+            &[shot_reference("role"), shot_reference("character")],
+            2,
+        )
+        .unwrap_err();
+        assert!(error.contains("第 2 个分镜"));
+        assert!(error.contains("2 个必需人物主体"));
+        assert!(error.contains("中景/全景"));
+    }
+
+    #[test]
+    fn empty_shot_keeps_environment_only_context() {
+        // 空镜：无人物主体，纯场景；任何景别都不触发单主体规则。
+        assert!(validate_shot_framing_subjects(Some("全景"), &[], 1).is_ok());
+        assert!(validate_shot_framing_subjects(
+            Some("远景"),
+            &[shot_reference("scene")],
+            1
+        )
+        .is_ok());
+        let (selected, _) = select_references_within_cap(vec![reference("天台", "scene")], 4);
+        assert_eq!(selected.len(), 1);
+    }
+
+    #[test]
+    fn first_frame_mode_selects_exactly_one_frame() {
+        let (references, dropped) =
+            references_for_mode(json!(["frame-a.png", "frame-b.png", "frame-c.png"]), vec![], &json!("singleImage"))
+                .unwrap();
+        assert_eq!(references, json!(["frame-a.png"]));
+        assert!(dropped.is_empty());
+        assert!(validate_family_request("wan2.2-i2v", "singleImage", 1).is_ok());
+        // 缺帧必须明确失败。
+        assert!(references_for_mode(json!([]), vec![], &json!("singleImage")).is_err());
+    }
+
+    #[test]
+    fn first_and_last_frame_mode_selects_endpoints() {
+        let (references, _) = references_for_mode(
+            json!(["first.png", "middle.png", "last.png"]),
+            vec![],
+            &json!("startEndRequired"),
+        )
+        .unwrap();
+        assert_eq!(references, json!(["first.png", "last.png"]));
+        assert!(validate_family_request("seedance-1-5", "startEndRequired", 2).is_ok());
+        // 尾帧模式家族校验先于供应商失败。
+        assert!(validate_family_request("wan2.2-i2v", "startEndRequired", 2)
+            .unwrap_err()
+            .contains("不支持尾帧参考模式"));
+        // 帧数不足必须明确失败。
+        assert!(references_for_mode(json!(["only.png"]), vec![], &json!("startEndRequired")).is_err());
+    }
 }
