@@ -304,6 +304,7 @@ impl AgentEngineProvider {
         }
         let mut stream = response.bytes_stream();
         let mut buffer = String::new();
+        let mut pending_utf8 = Vec::new();
         let mut content = String::new();
         let mut reasoning = String::new();
         let mut usage = json!({});
@@ -311,9 +312,8 @@ impl AgentEngineProvider {
         let mut event_name = String::new();
         let mut event_data = String::new();
         while let Some(chunk) = stream.next().await {
-            buffer.push_str(&String::from_utf8_lossy(
-                &chunk.map_err(|error| super::transport_error(&error))?,
-            ));
+            let chunk = chunk.map_err(|error| super::transport_error(&error))?;
+            super::append_utf8_chunk(&mut buffer, &mut pending_utf8, &chunk)?;
             while let Some(pos) = buffer.find('\n') {
                 let line = buffer[..pos].trim().to_string();
                 buffer.drain(..=pos);
@@ -342,6 +342,7 @@ impl AgentEngineProvider {
                 }
             }
         }
+        super::finish_utf8_stream(&pending_utf8)?;
         if !event_data.is_empty() {
             finished = apply_event(
                 &event_name,

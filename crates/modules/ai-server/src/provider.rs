@@ -10,6 +10,41 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::OnceLock;
 
+fn append_utf8_chunk(
+    buffer: &mut String,
+    pending: &mut Vec<u8>,
+    chunk: &[u8],
+) -> Result<(), String> {
+    pending.extend_from_slice(chunk);
+    loop {
+        match std::str::from_utf8(pending) {
+            Ok(text) => {
+                buffer.push_str(text);
+                pending.clear();
+                return Ok(());
+            }
+            Err(error) if error.error_len().is_none() => {
+                let valid = error.valid_up_to();
+                if valid > 0 {
+                    let text = std::str::from_utf8(&pending[..valid]).map_err(|e| e.to_string())?;
+                    buffer.push_str(text);
+                    pending.drain(..valid);
+                }
+                return Ok(());
+            }
+            Err(error) => return Err(format!("模型流包含无效 UTF-8：{error}")),
+        }
+    }
+}
+
+fn finish_utf8_stream(pending: &[u8]) -> Result<(), String> {
+    if pending.is_empty() {
+        Ok(())
+    } else {
+        Err("模型流在 UTF-8 字符中途结束".into())
+    }
+}
+
 fn merge_tool_call_delta(target: &mut Value, part: &Value) {
     // Ark sends empty IDs and names on argument-only chunks. These must not
     // erase the metadata from the first chunk. Function names can also arrive
@@ -317,20 +352,25 @@ impl OpenAiCompatibleProvider {
         }
         let mut stream = response.bytes_stream();
         let mut buffer = String::new();
+        let mut pending_utf8 = Vec::new();
         let mut content = String::new();
         let mut tool_calls: Vec<Value> = Vec::new();
         let mut usage = json!({});
+        let mut completed = false;
         while let Some(chunk) = stream.next().await {
-            buffer.push_str(&String::from_utf8_lossy(
-                &chunk.map_err(|error| transport_error(&error))?,
-            ));
+            let chunk = chunk.map_err(|error| transport_error(&error))?;
+            append_utf8_chunk(&mut buffer, &mut pending_utf8, &chunk)?;
             while let Some(pos) = buffer.find('\n') {
                 let line = buffer[..pos].trim().to_string();
                 buffer.drain(..=pos);
                 let Some(data) = line.strip_prefix("data:").map(str::trim) else {
                     continue;
                 };
-                if data == "[DONE]" || data.is_empty() {
+                if data == "[DONE]" {
+                    completed = true;
+                    continue;
+                }
+                if data.is_empty() {
                     continue;
                 }
                 let value: Value = serde_json::from_str(data).map_err(|e| e.to_string())?;
@@ -355,6 +395,10 @@ impl OpenAiCompatibleProvider {
                 }
                 on_delta(delta).await?;
             }
+        }
+        finish_utf8_stream(&pending_utf8)?;
+        if !completed {
+            return Err("模型流在完成事件前结束".into());
         }
         let mut message = json!({"role":"assistant","content":content});
         if !tool_calls.is_empty() {
@@ -476,11 +520,12 @@ impl OpenAiCompatibleProvider {
         }
         let mut stream = response.bytes_stream();
         let mut buffer = String::new();
+        let mut pending_utf8 = Vec::new();
         let mut content = String::new();
+        let mut completed = false;
         while let Some(chunk) = stream.next().await {
-            buffer.push_str(&String::from_utf8_lossy(
-                &chunk.map_err(|error| transport_error(&error))?,
-            ));
+            let chunk = chunk.map_err(|error| transport_error(&error))?;
+            append_utf8_chunk(&mut buffer, &mut pending_utf8, &chunk)?;
             while let Some(pos) = buffer.find('\n') {
                 let line = buffer[..pos].trim().to_string();
                 buffer.drain(..=pos);
@@ -488,6 +533,7 @@ impl OpenAiCompatibleProvider {
                     continue;
                 };
                 if data == "[DONE]" {
+                    completed = true;
                     continue;
                 }
                 let value: Value = serde_json::from_str(data).map_err(|e| e.to_string())?;
@@ -499,6 +545,10 @@ impl OpenAiCompatibleProvider {
                     on_delta(delta.into()).await?
                 }
             }
+        }
+        finish_utf8_stream(&pending_utf8)?;
+        if !completed {
+            return Err("模型流在完成事件前结束".into());
         }
         if content.is_empty() {
             return Err("模型未返回流式文本".into());
@@ -961,7 +1011,8 @@ impl ChatProvider for OpenAiCompatibleProvider {
 #[cfg(test)]
 mod structured_error_tests {
     use super::{
-        ProviderError, merge_tool_call_delta, provider_app_error, retryable_status, upstream_error,
+        ProviderError, append_utf8_chunk, finish_utf8_stream, merge_tool_call_delta,
+        provider_app_error, retryable_status, upstream_error,
     };
     use reqwest::StatusCode;
     use serde_json::json;
@@ -1005,6 +1056,26 @@ mod structured_error_tests {
         assert_eq!(call["id"], "call_2");
         assert_eq!(call["function"]["name"], "get_novel_events");
         assert_eq!(call["function"]["arguments"], "{}");
+    }
+
+    #[test]
+    fn stream_decoder_preserves_multibyte_characters_across_chunks() {
+        let bytes = "data: 你好\n\n".as_bytes();
+        let split = bytes.iter().position(|byte| *byte >= 0x80).unwrap() + 1;
+        let mut output = String::new();
+        let mut pending = Vec::new();
+        append_utf8_chunk(&mut output, &mut pending, &bytes[..split]).unwrap();
+        append_utf8_chunk(&mut output, &mut pending, &bytes[split..]).unwrap();
+        finish_utf8_stream(&pending).unwrap();
+        assert_eq!(output, "data: 你好\n\n");
+    }
+
+    #[test]
+    fn stream_decoder_rejects_truncated_utf8() {
+        let mut output = String::new();
+        let mut pending = Vec::new();
+        append_utf8_chunk(&mut output, &mut pending, &[0xe4]).unwrap();
+        assert!(finish_utf8_stream(&pending).is_err());
     }
 
     #[test]
