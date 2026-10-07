@@ -1,6 +1,6 @@
 # 图片与视频生成稳定性优化计划
 
-> 状态：P0 已全部收口；P1 视觉质检引擎与资产/分镜图片完成路径已落地（自动质检 + ≤2 次定向重试），视频抽帧质检仍待完善
+> 状态：P0 已全部收口；P1 视觉质检全部落地（引擎 + 资产图片 + 分镜图片自动质检重试，视频抽帧质检为建议性结论），视频质检的自动重试待成本策略确认
 > 范围：Toonflow 资产图片、分镜图片、视频提示词和供应商请求链路
 
 ## P1 视觉质检引擎（2026-10-07 第四批）
@@ -9,8 +9,8 @@
 - 失败项自动生成定向修复指令（只修复失败维度，保持其余构图不变），供 ≤2 次自动重试使用（`MAX_VISUAL_QC_RETRIES=2`，两次仍失败保留快照交人工）。
 - 供应商调用复用 `project_text_tools` 多模态通道（`image_url` 分片 + `productionAgent:visualQcAgent` 路由键），`image_data_url` 注入生成图。启用质检需在模型配置中把该键映射到任一多模态模型；未配置或调用失败时质检优雅降级，不阻断生成。
 - **资产图片完成路径已接入**（`toonflow_asset_ai.make_image_inner`）：生成 → 质检 → 不合格带修复指令重试（初始 + 最多 2 次）→ 仍失败保留最后一版；每次质检结论（含失败明细、快照路径）写入该次生成任务的 `promptProvenance.visualQcHistory`，任务中心“原始输入”可查。图片契约回归在无视觉模型环境下验证了降级路径。
-- **分镜图片完成路径已接入**（`toonflow_image_workflow.generate_storyboard_job`）：与资产图片同构的闭环；期望说明由分镜结构化输入编译（画面描述、景别/运镜、参考资产清单），质检历史写入分镜行的 `scene_generation_context.visualQcHistory`。空库迁移链与数据库专项回归通过。
-- 待后续批次：视频抽帧质检（帧抽取需走 worker 的 FFmpeg，参考 `toonflow_video_quality` 分布式作业模式）。
+- **分镜图片完成路径已接入**（`toonflow_image_workflow.generate_storyboard_job`）：与资产图片同构的闭环；期望说明由分镜结构化输入编译（画面描述、景别/运镜、参考资产清单），质检历史写入分镜行的 `scene_generation_context.visualQcHistory`。空库迁移链和数据库专项回归通过。
+- **视频抽帧质检已接入**（`toonflow_video_quality` 分布式作业）：技术检查通过后，worker 用 FFmpeg 抽 4 帧等距内点，上传 `video-frames` 留档，并对帧执行多模态质检（六个视频维度：首帧相似度、身份稳定性、动作方向、镜头运动、闪烁形变、文字水印）。期望说明由生成快照编译（镜头描述含景别、去重运镜、首帧模式的首帧参考）。结论记录在 `quality.metadata.visualQc` 与 `frames`，**为建议性结论**：不改变技术判定，不自动重试——视频重新生成成本高，自动重试编排待成本策略确认后接入（图片侧已自动重试 ≤2 次）。质检不可用（未配置 `productionAgent:visualQcAgent`）时帧仍留档，结论标记 unavailable。
 
 ## P0 收口·景别与运镜（2026-10-07 第三批）
 

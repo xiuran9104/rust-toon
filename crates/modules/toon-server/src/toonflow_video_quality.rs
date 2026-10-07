@@ -7,6 +7,7 @@ use std::{
 };
 
 use axum::{Json, extract::State};
+use base64::Engine as _;
 use rust_toon_framework_common::ApiResponse;
 use rust_toon_framework_security::CurrentUser;
 use rust_toon_framework_web::AppError;
@@ -399,8 +400,166 @@ pub async fn execute_distributed_quality(
     let file = dir.0.join("source.mp4");
     crate::toonflow_storage::copy_asset_to_file(&payload.file_path, &file, 512 * 1024 * 1024)
         .await?;
-    let report = inspect_file(&file, &payload.expectations).await?;
+    let mut report = inspect_file(&file, &payload.expectations).await?;
+    append_visual_qc(pool, &mut report, &payload, &file, &dir.0, task_id).await;
     finish(pool, job_id, task_id, lease_token, &payload, &report).await
+}
+
+/// P1 视觉质检（视频侧）：技术检查通过后抽取等距帧，上传留档并对帧执行
+/// 多模态质检。结论是建议性的——记录在 quality.metadata.visualQc，不改
+/// 变技术判定；自动重试编排待成本策略确认后接入。
+async fn append_visual_qc(
+    pool: &sqlx::PgPool,
+    report: &mut QualityReport,
+    payload: &QualityPayload,
+    source: &Path,
+    dir: &Path,
+    task_id: i64,
+) {
+    if report.state != "passed" {
+        return;
+    }
+    let Some(duration) = number(&report.metadata["duration"]) else {
+        return;
+    };
+    let frames = match extract_frames(source, dir, duration).await {
+        Ok(frames) if !frames.is_empty() => frames,
+        _ => return,
+    };
+    let mut stored_paths = Vec::new();
+    let mut data_urls = Vec::new();
+    for (index, frame) in frames.iter().enumerate() {
+        let Ok(bytes) = tokio::fs::read(frame).await else {
+            continue;
+        };
+        data_urls.push(format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&bytes)
+        ));
+        if let Ok(path) = crate::toonflow_storage::persist_asset_bytes_named(
+            payload.project_id,
+            "video-frames",
+            &format!("video-{}-{task_id}-{index}", payload.video_id),
+            "png",
+            bytes,
+        )
+        .await
+        {
+            stored_paths.push(path);
+        }
+    }
+    if data_urls.is_empty() {
+        return;
+    }
+    let expectations = video_expectations_from_context(pool, payload.video_id).await;
+    let verdict = crate::toonflow_visual_qc::evaluate_frames(
+        pool,
+        payload.project_id,
+        data_urls,
+        &expectations,
+    )
+    .await;
+    report.metadata["frames"] = json!(stored_paths);
+    report.metadata["visualQc"] = match verdict {
+        Ok(visual) => serde_json::to_value(&visual)
+            .unwrap_or_else(|_| json!({"state": "unavailable"})),
+        Err(reason) => json!({"state": "unavailable", "reason": reason}),
+    };
+}
+
+/// 抽取 4 帧等距内点（10%/37%/63%/90%）。个别时间点失败只跳过该帧。
+async fn extract_frames(source: &Path, dir: &Path, duration: f64) -> Result<Vec<PathBuf>, String> {
+    let mut frames = Vec::new();
+    for (index, ratio) in [0.1_f64, 0.37, 0.63, 0.9].into_iter().enumerate() {
+        let output = dir.join(format!("qc-frame-{index}.png"));
+        let status = tokio::process::Command::new("ffmpeg")
+            .arg("-hide_banner")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-ss")
+            .arg(format!("{:.3}", duration * ratio))
+            .arg("-i")
+            .arg(source)
+            .arg("-frames:v")
+            .arg("1")
+            .arg("-y")
+            .arg(&output)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map_err(|error| format!("启动 FFmpeg 失败：{error}"))?;
+        if status.success()
+            && tokio::fs::metadata(&output)
+                .await
+                .is_ok_and(|metadata| metadata.len() > 0)
+        {
+            frames.push(output);
+        }
+    }
+    Ok(frames)
+}
+
+/// 从视频生成快照编译视频质检期望：镜头描述（含景别）汇总、去重运镜、
+/// 首帧模式下的首帧参考。快照缺失时返回空串，质检仍可运行。
+async fn video_expectations_from_context(pool: &sqlx::PgPool, video_id: i64) -> String {
+    let request: Option<Value> = sqlx::query_scalar(
+        "SELECT generation_context->'request' FROM toonflow.videos WHERE id=$1",
+    )
+    .bind(video_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    let Some(request) = request else {
+        return String::new();
+    };
+    let shots = request["structuredShots"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let shots_summary = shots
+        .iter()
+        .map(|shot| {
+            let description = shot["description"].as_str().unwrap_or_default();
+            match shot["shotSize"].as_str().filter(|value| !value.is_empty()) {
+                Some(size) => format!("{description}（{size}）"),
+                None => description.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("；");
+    let mut camera_moves = shots
+        .iter()
+        .filter_map(|shot| shot["cameraMove"].as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    camera_moves.sort();
+    camera_moves.dedup();
+    let first_frame_summary = request["referenceManifest"]
+        .as_array()
+        .and_then(|references| {
+            references
+                .iter()
+                .find(|reference| reference["kind"] == "first_frame")
+                .or_else(|| {
+                    references
+                        .iter()
+                        .find(|reference| reference["role"] == "first_frame")
+                })
+        })
+        .and_then(|reference| {
+            reference["name"]
+                .as_str()
+                .or_else(|| reference["url"].as_str())
+        })
+        .unwrap_or_default();
+    crate::toonflow_visual_qc::video_frame_expectations(
+        &shots_summary,
+        &camera_moves.join("、"),
+        first_frame_summary,
+    )
 }
 
 #[derive(Deserialize)]

@@ -15,7 +15,7 @@ pub(crate) const MAX_VISUAL_QC_RETRIES: usize = 2;
 
 pub(crate) const VISUAL_QC_AGENT_KEY: &str = "productionAgent:visualQcAgent";
 
-/// 质检维度与中文说明。新增维度前先确认提示词与修复指令都能消费它。
+/// 图片质检维度与中文说明。新增维度前先确认提示词与修复指令都能消费它。
 pub(crate) fn qc_check_catalog() -> Vec<(&'static str, &'static str)> {
     vec![
         ("character_count", "画面人物数量与预期出镜主体一致"),
@@ -26,6 +26,22 @@ pub(crate) fn qc_check_catalog() -> Vec<(&'static str, &'static str)> {
         ("proportion", "人体比例与透视正常，无肢体畸变"),
         ("text_watermark", "画面没有乱码文字或水印"),
     ]
+}
+
+/// 视频抽帧质检维度（对照结构化镜头与首帧参考）。
+pub(crate) fn video_qc_check_catalog() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("first_frame_similarity", "首帧与参考清单中的首帧内容一致"),
+        ("identity_stability", "人物身份与造型在所有帧之间保持一致"),
+        ("motion_direction", "人物动作方向与画面描述一致且连贯"),
+        ("camera_movement", "镜头运动符合指定的运镜要求"),
+        ("flicker_distortion", "无闪烁、形变、肢体畸变或画面抖动"),
+        ("text_watermark", "画面没有乱码文字或水印"),
+    ]
+}
+
+fn catalog_names<'a>(catalog: &'a [(&'a str, &'a str)]) -> Vec<&'a str> {
+    catalog.iter().map(|(name, _)| *name).collect()
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -44,25 +60,21 @@ pub(crate) struct VisualQcReport {
     pub(crate) summary: String,
 }
 
-fn qc_system_prompt() -> String {
-    let checks = qc_check_catalog()
-        .into_iter()
+fn qc_system_prompt_for(catalog: &[(&str, &str)]) -> String {
+    let checks = catalog
+        .iter()
         .map(|(name, description)| format!("- {name}: {description}"))
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "你是动画生成内容的视觉质检员。对照期望说明逐项检查图片，只能使用以下维度：\n{checks}\n\
+        "你是动画生成内容的视觉质检员。对照期望说明逐项检查提供的图片，只能使用以下维度：\n{checks}\n\
          必须调用 submit_visual_qc 提交结论：每个不通过的维度给出 evidence（指明画面中具体哪里不符，\
          不得泛泛而谈）与 0 到 1 的 confidence；全部通过时 failures 为空数组并在 summary 说明。\
          不得发明维度，不得因为偏好风格而判失败。"
     )
 }
 
-fn qc_tool() -> Value {
-    let check_names = qc_check_catalog()
-        .into_iter()
-        .map(|(name, _)| json!(name))
-        .collect::<Vec<_>>();
+fn qc_tool_for(catalog: &[(&str, &str)]) -> Value {
     json!({
         "type":"function",
         "function":{
@@ -78,7 +90,7 @@ fn qc_tool() -> Value {
                         "items":{
                             "type":"object",
                             "properties":{
-                                "check":{"type":"string","enum":check_names},
+                                "check":{"type":"string","enum":catalog_names(catalog)},
                                 "evidence":{"type":"string"},
                                 "confidence":{"type":"number"}
                             },
@@ -95,10 +107,18 @@ fn qc_tool() -> Value {
 /// 解析模型提交的质检结论。维度名、置信度范围与 passed 一致性都严格校验：
 /// 质检结论驱动自动重试，坏数据宁可拒绝也不能放行。
 pub(crate) fn parse_qc_verdict(value: &Value) -> Result<VisualQcReport, String> {
-    let valid_checks = qc_check_catalog()
-        .into_iter()
-        .map(|(name, _)| name)
-        .collect::<Vec<_>>();
+    parse_verdict_for(value, &qc_check_catalog())
+}
+
+pub(crate) fn parse_video_qc_verdict(value: &Value) -> Result<VisualQcReport, String> {
+    parse_verdict_for(value, &video_qc_check_catalog())
+}
+
+fn parse_verdict_for(
+    value: &Value,
+    catalog: &[(&str, &str)],
+) -> Result<VisualQcReport, String> {
+    let valid_checks = catalog_names(catalog);
     let passed = value
         .get("passed")
         .and_then(Value::as_bool)
@@ -157,10 +177,16 @@ pub(crate) fn parse_qc_verdict(value: &Value) -> Result<VisualQcReport, String> 
 
 /// 从失败项生成定向修复指令，只针对失败维度，避免重试时重写全部要求。
 pub(crate) fn repair_instructions(report: &VisualQcReport) -> Option<String> {
+    repair_instructions_for(report, &qc_check_catalog())
+}
+
+pub(crate) fn repair_instructions_for(
+    report: &VisualQcReport,
+    catalog: &[(&str, &str)],
+) -> Option<String> {
     if report.passed || report.failures.is_empty() {
         return None;
     }
-    let catalog = qc_check_catalog();
     let items = report
         .failures
         .iter()
@@ -221,6 +247,22 @@ pub(crate) fn storyboard_expectations(
     sections.join("\n")
 }
 
+/// 视频抽帧质检的期望说明：镜头描述汇总、运镜与首帧参考摘要。
+pub(crate) fn video_frame_expectations(
+    shots_summary: &str,
+    camera_moves: &str,
+    first_frame_summary: &str,
+) -> String {
+    let mut sections = vec![format!("镜头内容：{shots_summary}")];
+    if !camera_moves.is_empty() {
+        sections.push(format!("运镜要求：{camera_moves}"));
+    }
+    if !first_frame_summary.is_empty() {
+        sections.push(format!("首帧参考：{first_frame_summary}（视频首帧应与其内容一致）"));
+    }
+    sections.join("\n")
+}
+
 /// 对一张生成图执行视觉质检。期望说明由调用方从结构化输入编译
 /// （资产/造型描述、参考图清单、镜头约束等）。
 pub(crate) async fn evaluate_image(
@@ -231,22 +273,65 @@ pub(crate) async fn evaluate_image(
 ) -> Result<VisualQcReport, String> {
     let data_url =
         crate::toonflow_storage::image_data_url(image_path).await?;
+    evaluate_image_parts(
+        pool,
+        project_id,
+        vec![data_url],
+        expectations,
+        &qc_check_catalog(),
+    )
+    .await
+}
+
+/// 对视频抽出的多帧执行视觉质检。帧以 data URL 传入（worker 从本地
+/// 抽帧文件直接编码，不依赖对象存储回读）。
+pub(crate) async fn evaluate_frames(
+    pool: &PgPool,
+    project_id: i64,
+    frame_data_urls: Vec<String>,
+    expectations: &str,
+) -> Result<VisualQcReport, String> {
+    evaluate_image_parts(
+        pool,
+        project_id,
+        frame_data_urls,
+        expectations,
+        &video_qc_check_catalog(),
+    )
+    .await
+}
+
+async fn evaluate_image_parts(
+    pool: &PgPool,
+    project_id: i64,
+    image_data_urls: Vec<String>,
+    expectations: &str,
+    catalog: &[(&str, &str)],
+) -> Result<VisualQcReport, String> {
+    if image_data_urls.is_empty() {
+        return Err("没有可质检的图片".into());
+    }
+    let mut content = vec![
+        json!({"type":"text","text":format!("期望说明：\n{expectations}")}),
+    ];
+    content.extend(
+        image_data_urls
+            .iter()
+            .map(|url| json!({"type":"image_url","image_url":{"url":url,"detail":"high"}})),
+    );
     let messages = vec![
-        json!({"role":"system","content":qc_system_prompt()}),
-        json!({"role":"user","content":json!([
-            {"type":"text","text":format!("期望说明：\n{expectations}")},
-            {"type":"image_url","image_url":{"url":data_url,"detail":"high"}}
-        ])}),
+        json!({"role":"system","content":qc_system_prompt_for(catalog)}),
+        json!({"role":"user","content":json!(content)}),
     ];
     let value = crate::ai_client::project_text_tools(
         pool,
         VISUAL_QC_AGENT_KEY,
         project_id,
         messages,
-        vec![qc_tool()],
+        vec![qc_tool_for(catalog)],
     )
     .await?;
-    parse_qc_verdict(&value)
+    parse_verdict_for(&value, catalog)
 }
 
 #[cfg(test)]
@@ -279,6 +364,38 @@ mod tests {
         assert!(full.contains("沈辞（role）、机房（scene）"));
         let minimal = storyboard_expectations("空镜扫过桌面", "", "", &[]);
         assert_eq!(minimal, "画面描述：空镜扫过桌面");
+    }
+
+    #[test]
+    fn video_catalog_is_enforced_separately_from_images() {
+        let verdict = parse_video_qc_verdict(&json!({
+            "passed": false, "summary": "首帧不一致",
+            "failures": [{"check":"first_frame_similarity","evidence":"首帧人物朝向与参考相反","confidence":0.88}]
+        }))
+        .unwrap();
+        let repair = repair_instructions_for(&verdict, &video_qc_check_catalog()).unwrap();
+        assert!(repair.contains("首帧与参考清单中的首帧内容一致"));
+        // 图片维度不得混入视频结论。
+        assert!(parse_video_qc_verdict(&json!({
+            "passed": false, "summary": "",
+            "failures": [{"check":"costume","evidence":"不对","confidence":0.9}]
+        }))
+        .unwrap_err()
+        .contains("未知质检维度"));
+    }
+
+    #[test]
+    fn builds_video_frame_expectations_with_optional_sections() {
+        let full = video_frame_expectations(
+            "沈辞推门（近景）→ 环视机房（全景）",
+            "推镜、跟镜",
+            "沈辞站姿全身，黑色雨衣",
+        );
+        assert!(full.contains("镜头内容："));
+        assert!(full.contains("运镜要求：推镜、跟镜"));
+        assert!(full.contains("首帧参考：沈辞站姿全身，黑色雨衣"));
+        let minimal = video_frame_expectations("空镜扫过桌面", "", "");
+        assert_eq!(minimal, "镜头内容：空镜扫过桌面");
     }
 
     #[test]
