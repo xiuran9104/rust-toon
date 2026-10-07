@@ -6,7 +6,7 @@
 //! 接入点按批次落地：先资产/分镜图片完成路径，后视频抽帧（需 worker
 //! 侧 FFmpeg，见 `toonflow_video_quality` 的分布式作业模式）。
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 
@@ -44,7 +44,7 @@ fn catalog_names<'a>(catalog: &'a [(&'a str, &'a str)]) -> Vec<&'a str> {
     catalog.iter().map(|(name, _)| *name).collect()
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct VisualQcFailure {
     pub(crate) check: String,
@@ -52,7 +52,7 @@ pub(crate) struct VisualQcFailure {
     pub(crate) confidence: f64,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct VisualQcReport {
     pub(crate) passed: bool,

@@ -1,0 +1,8 @@
+# cargo-audit 豁免记录：每条 id 上方的注释即不可达理由，上游修复后移除。
+[advisories]
+ignore = [
+    # rsa 仅由 sqlx-mysql 引入（sqlx macros 编译期解析），cargo tree -e normal/build
+    # 均不可达；运行时只链接 PostgreSQL 驱动，MySQL 认证的 RSA 时序路径不存在于
+    # 任何发布二进制中。上游无修复版本（RUSTSEC-2023-0071，Marvin Attack）。
+    "RUSTSEC-2023-0071",
+]

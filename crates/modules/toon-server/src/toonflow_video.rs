@@ -169,6 +169,87 @@ fn ensure_internal_references_in_project(value: &Value, project_id: i64) -> Resu
     Ok(())
 }
 
+/// P1 视觉质检自动重试：首轮归档并质检后，若结论为失败且重试预算未用完，
+/// 以定向修复指令重提同一视频行（初始 + 最多 MAX_VISUAL_QC_RETRIES 次）。
+/// 技术质检失败、视觉质检不可用或预算耗尽时保持原结果。
+async fn finalize_video_with_visual_qc_retries(
+    pool: &sqlx::PgPool,
+    video_id: i64,
+    project_id: i64,
+    model: &str,
+    first_url: String,
+) -> bool {
+    let mut url = first_url;
+    loop {
+        let stored = store_generated_video(pool, video_id, project_id, &url).await;
+        if !stored {
+            return false;
+        }
+        let Some((payload, repair)) = visual_qc_retry_decision(pool, video_id).await else {
+            return true;
+        };
+        tracing::info!(video_id, %repair, "visual QC failed; retrying video generation");
+        match generate_with_snapshot(pool, video_id, model, payload, Vec::new()).await {
+            Ok(next_url) => url = next_url,
+            Err(reason) => {
+                mark_video_generation_failed(pool, video_id, reason).await;
+                return false;
+            }
+        }
+    }
+}
+
+/// 返回（带修复指令的完整 payload，修复指令）；None 表示无需或不能重试。
+async fn visual_qc_retry_decision(
+    pool: &sqlx::PgPool,
+    video_id: i64,
+) -> Option<(Value, String)> {
+    let context: Value = sqlx::query_scalar(
+        "SELECT generation_context FROM toonflow.videos WHERE id=$1",
+    )
+    .bind(video_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()?;
+    // 技术质检未通过时视频已判失败，不属于视觉重试范围。
+    if context["quality"]["state"].as_str() != Some("passed") {
+        return None;
+    }
+    let report: crate::toonflow_visual_qc::VisualQcReport =
+        serde_json::from_value(context["quality"]["metadata"]["visualQc"].clone()).ok()?;
+    if report.passed {
+        return None;
+    }
+    let retries = context["visualQcRetries"].as_i64().unwrap_or(0);
+    if retries >= crate::toonflow_visual_qc::MAX_VISUAL_QC_RETRIES as i64 {
+        return None;
+    }
+    let repair = crate::toonflow_visual_qc::repair_instructions_for(
+        &report,
+        &crate::toonflow_visual_qc::video_qc_check_catalog(),
+    )?;
+    let mut payload = context["request"]["payload"].clone();
+    let base_prompt = payload["prompt"].as_str().unwrap_or_default().to_string();
+    payload["prompt"] = json!(format!("{base_prompt}\n{repair}"));
+    let reset = sqlx::query(
+        "UPDATE toonflow.videos SET state='生成中',error_reason=NULL,
+         generation_context=generation_context || jsonb_build_object(
+           'visualQcRetries', $2::bigint, 'visualQcRepair', $3::jsonb)
+         WHERE id=$1 AND state='生成成功'",
+    )
+    .bind(video_id)
+    .bind(retries + 1)
+    .bind(json!(repair))
+    .execute(pool)
+    .await
+    .ok()?;
+    if reset.rows_affected() != 1 {
+        return None;
+    }
+    Some((payload, repair))
+}
+
 async fn store_generated_video(
     pool: &sqlx::PgPool,
     video_id: i64,
@@ -255,7 +336,8 @@ pub async fn resume_interrupted_video_generations(pool: &sqlx::PgPool) -> u64 {
             };
             match ai_client::video_poll_task(&pool, &model, &task_id).await {
                 Ok(url) => {
-                    store_generated_video(&pool, video_id, project_id, &url).await;
+                    finalize_video_with_visual_qc_retries(&pool, video_id, project_id, &model, url)
+                        .await;
                 }
                 Err(reason) => {
                     mark_video_generation_failed(&pool, video_id, reason).await;
@@ -1812,7 +1894,10 @@ async fn run_workflow_video_job(
             .await
     };
     let succeeded = match provider_result {
-        Ok(url) => store_generated_video(&pool, job.id, project_id, &url).await,
+        Ok(url) => {
+            finalize_video_with_visual_qc_retries(&pool, job.id, project_id, &job.model, url)
+                .await
+        }
         Err(reason) => {
             mark_video_generation_failed(&pool, job.id, reason).await;
             false
@@ -2061,7 +2146,8 @@ pub async fn generate_video(
         };
         match provider_result {
             Ok(url) => {
-                store_generated_video(&pool, id, req.project_id, &url).await;
+                finalize_video_with_visual_qc_retries(&pool, id, req.project_id, &req.model, url)
+                    .await;
             }
             Err(reason) => {
                 mark_video_generation_failed(&pool, id, reason).await;
