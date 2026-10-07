@@ -704,42 +704,89 @@ async fn make_image_inner(
         })).collect::<Vec<_>>(),
         "layoutControlReferenceAppended": item.type_ == "role",
     });
-    match ai_client::image_with_provenance_for_project(
-        pool,
-        Some(project_id),
-        model,
-        &prompt,
-        &canvas.size(),
-        references,
-        item.type_ == "role",
-        Some(provenance),
-    )
-    .await
-    {
-        Ok(path) => {
-            let path = persist_remote_image(&path, item.id).await?;
-            let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
-            let updated = sqlx::query("UPDATE toonflow.images SET file_path=$2,state='已完成',error_reason=NULL WHERE id=$1 AND state='生成中'")
-                .bind(image_id)
-                .bind(&path)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| e.to_string())?;
-            if updated.rows_affected() == 0 {
-                return Err("生成任务已取消".into());
-            }
-            sqlx::query("UPDATE toonflow.assets SET image_id=$2 WHERE id=$1 AND project_id=$3")
-                .bind(item.id)
-                .bind(image_id)
-                .bind(project_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| e.to_string())?;
-            tx.commit().await.map_err(|error| error.to_string())?;
-            Ok(path)
+    // P1 视觉质检闭环：生成 → 质检 → 不合格时带定向修复指令重试，最多
+    // MAX_VISUAL_QC_RETRIES 次；两次重试仍失败保留最后一版交人工。质检
+    // 不可用（未配置视觉模型或调用失败）不阻断生成，按原行为完成。
+    let mut qc_attempts: Vec<Value> = Vec::new();
+    let mut submitted_prompt = prompt.clone();
+    let mut final_path: Option<String> = None;
+    let expectations = crate::toonflow_visual_qc::asset_image_expectations(
+        &item.type_,
+        effective_source,
+        &appearance,
+        &style,
+    );
+    for attempt in 0..=crate::toonflow_visual_qc::MAX_VISUAL_QC_RETRIES {
+        let mut attempt_provenance = provenance.clone();
+        if !qc_attempts.is_empty() {
+            attempt_provenance["visualQcHistory"] = json!(qc_attempts);
         }
-        Err(reason) => Err(reason),
+        let generated = match ai_client::image_with_provenance_for_project(
+            pool,
+            Some(project_id),
+            model,
+            &submitted_prompt,
+            &canvas.size(),
+            references.clone(),
+            item.type_ == "role",
+            Some(attempt_provenance),
+        )
+        .await
+        {
+            Ok(path) => path,
+            Err(reason) => return Err(reason),
+        };
+        let path = persist_remote_image(&generated, item.id).await?;
+        match crate::toonflow_visual_qc::evaluate_image(pool, project_id, &path, &expectations)
+            .await
+        {
+            Ok(report) => {
+                let attempt_entry = if report.passed {
+                    json!({"attempt": attempt + 1, "passed": true, "summary": report.summary})
+                } else {
+                    json!({
+                        "attempt": attempt + 1,
+                        "passed": false,
+                        "summary": report.summary,
+                        "failures": report.failures,
+                        "imagePath": path,
+                    })
+                };
+                qc_attempts.push(attempt_entry);
+                if report.passed || attempt >= crate::toonflow_visual_qc::MAX_VISUAL_QC_RETRIES {
+                    final_path = Some(path);
+                    break;
+                }
+                if let Some(repair) = crate::toonflow_visual_qc::repair_instructions(&report) {
+                    submitted_prompt = format!("{prompt}\n{repair}");
+                }
+            }
+            Err(_) => {
+                final_path = Some(path);
+                break;
+            }
+        }
     }
+    let path = final_path.ok_or_else(|| "视觉质检后未取得图片".to_string())?;
+    let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
+    let updated = sqlx::query("UPDATE toonflow.images SET file_path=$2,state='已完成',error_reason=NULL WHERE id=$1 AND state='生成中'")
+        .bind(image_id)
+        .bind(&path)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    if updated.rows_affected() == 0 {
+        return Err("生成任务已取消".into());
+    }
+    sqlx::query("UPDATE toonflow.assets SET image_id=$2 WHERE id=$1 AND project_id=$3")
+        .bind(item.id)
+        .bind(image_id)
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    tx.commit().await.map_err(|error| error.to_string())?;
+    Ok(path)
 }
 
 pub(crate) async fn schedule_asset_generation(

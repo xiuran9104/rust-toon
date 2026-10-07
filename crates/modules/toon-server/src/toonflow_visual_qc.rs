@@ -182,6 +182,19 @@ pub(crate) fn repair_instructions(report: &VisualQcReport) -> Option<String> {
     ))
 }
 
+/// 从资产结构化输入编译质检期望说明。画风只约束技法：质检员不得因为
+/// 风格偏好判失败，这与生成侧“用户事实优先、画风只约束审美”一致。
+pub(crate) fn asset_image_expectations(
+    asset_type: &str,
+    description: &str,
+    appearance_anchor: &str,
+    style: &str,
+) -> String {
+    format!(
+        "资产类型：{asset_type}\n内容要求：{description}\n{appearance_anchor}\n画风：{style}（只约束绘画技法与整体观感，不得改变上述内容事实）"
+    )
+}
+
 /// 对一张生成图执行视觉质检。期望说明由调用方从结构化输入编译
 /// （资产/造型描述、参考图清单、镜头约束等）。
 pub(crate) async fn evaluate_image(
