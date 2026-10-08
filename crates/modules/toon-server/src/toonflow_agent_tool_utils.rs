@@ -2,10 +2,6 @@ use rust_toon_framework_web::AppError;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::{
-    collections::HashMap,
-    sync::{LazyLock, Mutex},
-};
 
 pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
@@ -14,22 +10,37 @@ pub(crate) fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-static FLOW_DATA_CACHE: LazyLock<Mutex<HashMap<String, String>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-pub(crate) fn changed_flow_data(isolation_key: &str, key: &str, value: Value) -> Value {
-    let cache_key = format!("{isolation_key}:{key}");
+/// durable 迁移第一阶段：流数据变化检测用数据库缓存（0026），
+/// 多副本网关对“数据未变化”的判定保持一致。
+pub(crate) async fn changed_flow_data(
+    pool: &PgPool,
+    isolation_key: &str,
+    key: &str,
+    value: Value,
+) -> Value {
     let serialized = value.to_string();
-    let mut cache = FLOW_DATA_CACHE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if cache
-        .get(&cache_key)
-        .is_some_and(|previous| previous == &serialized)
-    {
+    let previous: Option<String> =
+        sqlx::query_scalar("SELECT value FROM toonflow.agent_flow_cache WHERE isolation_key=$1 AND key=$2")
+            .bind(isolation_key)
+            .bind(key)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+    if previous.as_deref() == Some(serialized.as_str()) {
         return json!(format!("{key} 数据未变化，无需更新"));
     }
-    cache.insert(cache_key, serialized);
+    let _ = sqlx::query(
+        "INSERT INTO toonflow.agent_flow_cache(isolation_key,key,value,update_time)
+         VALUES($1,$2,$3,$4)
+         ON CONFLICT(isolation_key,key) DO UPDATE SET value=excluded.value,update_time=excluded.update_time",
+    )
+    .bind(isolation_key)
+    .bind(key)
+    .bind(&serialized)
+    .bind(now_ms())
+    .execute(pool)
+    .await;
     value
 }
 

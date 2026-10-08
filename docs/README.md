@@ -16,6 +16,7 @@ Rust Toon 文档按职责拆分。完整步骤和详细规则只在一个权威�
 ## 专题与计划
 
 - [媒体生成稳定性计划](media-generation-stability-plan.md)
+- [Durable Worker 迁移方案](durable-worker-migration.md)（第一阶段已落地）
 - [Toonflow Agent 与内容链路对齐方案](toonflow-agent-alignment-plan.md)
 - [剧本 Agent 原著核实与自动修订](script-agent-quality-improvements.md)（已落地行为说明）
 - [通用真人影视基底参考图](live-action-base-reference.md)

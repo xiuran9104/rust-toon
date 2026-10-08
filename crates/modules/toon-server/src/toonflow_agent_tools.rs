@@ -893,7 +893,7 @@ pub(crate) async fn execute_inner(
                 } else {
                     assets
                 };
-                return Ok(changed_flow_data(&request.isolation_key, key, value));
+                return Ok(changed_flow_data(&state.pool, &request.isolation_key, key, value).await);
             }
             if key == "storyboard" {
                 let data = crate::toonflow_video::load_generate_data(
@@ -903,10 +903,12 @@ pub(crate) async fn execute_inner(
                 )
                 .await?;
                 return Ok(changed_flow_data(
+                    &state.pool,
                     &request.isolation_key,
                     key,
                     data["storyboardList"].clone(),
-                ));
+                )
+                .await);
             }
             let data:Option<Value>=sqlx::query_scalar("SELECT data FROM toonflow.agent_work_data WHERE project_id=$1 AND episodes_id=$2 AND key='productionAgent'").bind(request.project_id).bind(script_id).fetch_optional(&state.pool).await.map_err(|_|AppError::internal("failed to get flow data"))?;
             let data = data.unwrap_or_else(|| json!({}));
@@ -915,7 +917,7 @@ pub(crate) async fn execute_inner(
             } else {
                 data.get(key).cloned().unwrap_or(Value::Null)
             };
-            Ok(changed_flow_data(&request.isolation_key, key, value))
+            Ok(changed_flow_data(&state.pool, &request.isolation_key, key, value).await)
         }
         ("productionAgent", "get_video_workbench") => {
             let script_id = request

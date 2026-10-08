@@ -6,7 +6,7 @@ use axum::{
     routing::{delete, get, post, put},
 };
 use futures_util::stream;
-use rust_toon_ai_api::{AiPlatform, ChatMessage, ChatRequest, ChatResponse};
+use rust_toon_ai_api::{ChatMessage, ChatRequest, ChatResponse};
 use rust_toon_framework_common::ApiResponse;
 use rust_toon_framework_security::CurrentUser;
 use rust_toon_framework_web::AppError;
