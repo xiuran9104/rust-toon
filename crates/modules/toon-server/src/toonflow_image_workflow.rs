@@ -518,16 +518,22 @@ async fn generate_storyboard_job(
     );
     // P1 视觉质检：与资产图片同构的闭环（初始 + 最多 2 次定向重试，
     // 仍失败保留最后一版）。质检不可用时不阻断生成。
-    let framing: Option<(String, String, String)> = sqlx::query_as(
-        "SELECT coalesce(video_desc,''),coalesce(shot_size,''),coalesce(camera_move,'') FROM toonflow.storyboards WHERE id=$1",
+    let framing: Option<(String, String, String, String)> = sqlx::query_as(
+        "SELECT coalesce(video_desc,''),coalesce(shot_size,''),coalesce(camera_move,''),coalesce(time_of_day,'') FROM toonflow.storyboards WHERE id=$1",
     )
     .bind(job.id)
     .fetch_optional(&pool)
     .await
     .ok()
     .flatten();
-    let (framing_desc, shot_size, camera_move) =
-        framing.unwrap_or_else(|| (String::new(), String::new(), String::new()));
+    let (framing_desc, shot_size, camera_move, time_of_day) = framing
+        .unwrap_or_else(|| (String::new(), String::new(), String::new(), String::new()));
+    // 对齐方案 P1 场景日夜状态：昼夜影响光线与氛围，注入生成提示词。
+    let generation_prompt = if !time_of_day.trim().is_empty() {
+        format!("{generation_prompt}\n时间氛围：{time_of_day}。光线、色温与阴影必须与该时间一致，不得出现矛盾光源。")
+    } else {
+        generation_prompt
+    };
     let description = if framing_desc.trim().is_empty() {
         job.prompt.clone()
     } else {
@@ -541,6 +547,7 @@ async fn generate_storyboard_job(
         &description,
         &shot_size,
         &camera_move,
+        &time_of_day,
         &asset_summary,
     );
     let mut qc_attempts: Vec<Value> = Vec::new();

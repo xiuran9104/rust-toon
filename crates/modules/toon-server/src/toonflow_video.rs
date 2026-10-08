@@ -1158,6 +1158,7 @@ struct StructuredStoryboardRow {
     duration: Option<String>,
     shot_size: Option<String>,
     camera_move: Option<String>,
+    time_of_day: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1181,6 +1182,8 @@ struct StructuredShotDescription {
     shot_size: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     camera_move: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_of_day: Option<String>,
     duration_seconds: f64,
     description: String,
     references: Vec<StructuredShotReference>,
@@ -1247,7 +1250,7 @@ async fn load_structured_shot_descriptions(
         r#"SELECT storyboard.id,storyboard.index,storyboard.scene_key,
                   scene_state.state_key AS scene_state_key,
                   storyboard.video_desc,storyboard.prompt,storyboard.duration,
-                  storyboard.shot_size,storyboard.camera_move
+                  storyboard.shot_size,storyboard.camera_move,storyboard.time_of_day
            FROM toonflow.storyboards storyboard
            LEFT JOIN toonflow.scene_states scene_state ON scene_state.id=storyboard.scene_state_id
            WHERE storyboard.project_id=$1 AND storyboard.script_id=$2
@@ -1312,6 +1315,7 @@ async fn load_structured_shot_descriptions(
                 parse_shot_duration(row.duration.as_deref().unwrap_or_default(), position + 1)?;
             let shot_size = row.shot_size.filter(|value| !value.trim().is_empty());
             let camera_move = row.camera_move.filter(|value| !value.trim().is_empty());
+            let time_of_day = row.time_of_day.filter(|value| !value.trim().is_empty());
             let references = assets_by_storyboard.remove(&row.id).unwrap_or_default();
             validate_shot_framing_subjects(shot_size.as_deref(), &references, position + 1)?;
             Ok(StructuredShotDescription {
@@ -1323,6 +1327,7 @@ async fn load_structured_shot_descriptions(
                     .filter(|value| !value.trim().is_empty()),
                 shot_size,
                 camera_move,
+                time_of_day,
                 duration_seconds: duration,
                 description,
                 references,

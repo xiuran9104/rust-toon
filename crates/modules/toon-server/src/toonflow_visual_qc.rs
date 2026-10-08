@@ -227,6 +227,7 @@ pub(crate) fn storyboard_expectations(
     description: &str,
     shot_size: &str,
     camera_move: &str,
+    time_of_day: &str,
     assets: &[(&str, &str)],
 ) -> String {
     let mut sections = vec![format!("画面描述：{description}")];
@@ -235,6 +236,9 @@ pub(crate) fn storyboard_expectations(
     }
     if !camera_move.is_empty() {
         sections.push(format!("运镜：{camera_move}"));
+    }
+    if !time_of_day.is_empty() {
+        sections.push(format!("时间：{time_of_day}（光线、色温与阴影必须与该时间一致）"));
     }
     if !assets.is_empty() {
         let list = assets
@@ -356,13 +360,15 @@ mod tests {
             "沈辞推门进入机房",
             "近景",
             "跟镜",
+            "夜",
             &[("沈辞", "role"), ("机房", "scene")],
         );
         assert!(full.contains("画面描述：沈辞推门进入机房"));
         assert!(full.contains("景别：近景"));
         assert!(full.contains("运镜：跟镜"));
         assert!(full.contains("沈辞（role）、机房（scene）"));
-        let minimal = storyboard_expectations("空镜扫过桌面", "", "", &[]);
+        assert!(full.contains("时间：夜"));
+        let minimal = storyboard_expectations("空镜扫过桌面", "", "", "", &[]);
         assert_eq!(minimal, "画面描述：空镜扫过桌面");
     }
 

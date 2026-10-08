@@ -318,6 +318,7 @@ async fn project_content_storyboard_and_video_export_form_a_complete_pipeline() 
                 video_desc: Some("镜头缓慢推进".into()),
                 shot_size: None,
                 camera_move: None,
+                time_of_day: None,
                 scene_key: None,
                 scene_state_id: None,
                 scene_state_key: None,

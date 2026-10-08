@@ -522,9 +522,16 @@ async fn video_expectations_from_context(pool: &sqlx::PgPool, video_id: i64) -> 
         .iter()
         .map(|shot| {
             let description = shot["description"].as_str().unwrap_or_default();
-            match shot["shotSize"].as_str().filter(|value| !value.is_empty()) {
-                Some(size) => format!("{description}（{size}）"),
-                None => description.to_string(),
+            let size = shot["shotSize"].as_str().filter(|value| !value.is_empty());
+            match shot["timeOfDay"].as_str().filter(|value| !value.is_empty()) {
+                Some(time) => match size {
+                    Some(size) => format!("{description}（{size}·{time}）"),
+                    None => format!("{description}（{time}）"),
+                },
+                None => match size {
+                    Some(size) => format!("{description}（{size}）"),
+                    None => description.to_string(),
+                },
             }
         })
         .collect::<Vec<_>>()
