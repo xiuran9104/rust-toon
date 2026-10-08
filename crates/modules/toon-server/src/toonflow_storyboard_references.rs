@@ -77,6 +77,95 @@ struct ManagedReference {
     label: String,
 }
 
+/// 对齐方案 P1 同造型跨场复用：场次键归一化匹配。“sc1”“场1”“第1场”
+/// 视为同一场次；造型的 scenes 为空表示适用于整个剧本，视为匹配。
+fn scene_matches(scene_key: &str, appearance_scenes: &[String]) -> bool {
+    fn normalize(value: &str) -> String {
+        let digits: String = value.chars().filter(char::is_ascii_digit).collect();
+        if digits.is_empty() {
+            value.trim().to_lowercase()
+        } else {
+            digits
+        }
+    }
+    if appearance_scenes.is_empty() {
+        return true;
+    }
+    let normalized_key = normalize(scene_key);
+    appearance_scenes
+        .iter()
+        .any(|scene| normalize(scene) == normalized_key)
+}
+
+/// 分镜显式绑定的人物基础资产，若该场次存在已完成的造型衍生图，则把
+/// 参考图替换为造型图——同一服装跨场复用同一张图、不重复生成，也避免
+/// 底模基础图直接出镜。返回替换记录供生成上下文留痕。
+async fn apply_costume_overrides(
+    pool: &sqlx::PgPool,
+    project_id: i64,
+    script_id: i64,
+    scene_key: &str,
+    explicit: &mut [StoryboardAssetReference],
+) -> Vec<Value> {
+    let role_asset_ids: Vec<i64> = explicit
+        .iter()
+        .filter(|reference| matches!(reference.prompt_asset.kind.as_str(), "role" | "character"))
+        .map(|reference| reference.asset_id)
+        .collect();
+    if role_asset_ids.is_empty() {
+        return Vec::new();
+    }
+    let rows: Vec<(i64, i64, String, Value)> = sqlx::query_as(
+        r#"SELECT d.parent_asset_id,d.id,i.file_path,ca.scenes
+           FROM toonflow.assets d
+           JOIN toonflow.character_appearances ca ON ca.id=d.appearance_id
+           JOIN toonflow.images i ON i.id=d.image_id
+           WHERE d.project_id=$1 AND ca.script_id=$2
+             AND d.parent_asset_id=ANY($3)
+             AND i.state='已完成' AND coalesce(i.file_path,'')<>''
+           ORDER BY d.id"#,
+    )
+    .bind(project_id)
+    .bind(script_id)
+    .bind(&role_asset_ids)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let mut overrides = Vec::new();
+    for reference in explicit.iter_mut() {
+        if !matches!(reference.prompt_asset.kind.as_str(), "role" | "character") {
+            continue;
+        }
+        let scenes_of = |value: &Value| {
+            value
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        let candidate = rows.iter().find(|(parent, _, _, scenes)| {
+            *parent == reference.asset_id && scene_matches(scene_key, &scenes_of(scenes))
+        });
+        if let Some((_, derive_id, file_path, _)) = candidate {
+            if *file_path != reference.file_path {
+                overrides.push(json!({
+                    "assetId": reference.asset_id,
+                    "deriveId": derive_id,
+                    "fromImagePath": reference.file_path,
+                    "toImagePath": file_path,
+                }));
+                reference.file_path = file_path.clone();
+            }
+        }
+    }
+    overrides
+}
+
 /// Builds one deterministic request plan. Image-edit source frames remain first; persisted
 /// storyboard references keep their original relative order after them. Missing scene anchors are
 /// appended and described by a server-owned instruction with the resulting marker numbers.
@@ -99,6 +188,13 @@ pub(crate) async fn build_storyboard_reference_plan(
     .map_err(|_| AppError::internal("failed to load storyboard scene binding"))?
     .ok_or_else(|| AppError::not_found("storyboard not found"))?;
 
+    let scene_key = storyboard
+        .scene_key
+        .clone()
+        .ok_or_else(|| AppError::bad_request("分镜缺少 sceneKey，请先设置所属场次"))?;
+    let mut explicit = explicit;
+    let costume_overrides =
+        apply_costume_overrides(pool, project_id, script_id, &scene_key, &mut explicit).await;
     let (mut paths, mut marker_by_image) = initialize_reference_paths(&explicit, leading_paths);
     let scene_key = storyboard
         .scene_key
@@ -265,6 +361,7 @@ pub(crate) async fn build_storyboard_reference_plan(
             "stateKey": binding.state_key,
             "stateRevision": binding.state_revision,
             "managedReferences": reference_manifest,
+            "costumeOverrides": costume_overrides,
             "referenceCount": reference_count,
         }),
     })
@@ -446,9 +543,20 @@ mod tests {
     }
 
     #[test]
+    fn scene_matching_normalizes_sc_prefixes_and_treats_empty_as_universal() {
+        assert!(scene_matches("sc1", &["场1".into()]));
+        assert!(scene_matches("场2", &["sc2".into()]));
+        assert!(scene_matches("第3场", &["场3".into(), "场7".into()]));
+        assert!(!scene_matches("sc4", &["场1".into()]));
+        // 造型 scenes 为空表示适用整个剧本。
+        assert!(scene_matches("sc9", &[]));
+    }
+
+    #[test]
     fn image_edit_source_stays_before_persisted_storyboard_references() {
         let explicit = vec![
             StoryboardAssetReference {
+                asset_id: 1,
                 image_id: 11,
                 file_path: "role.png".into(),
                 prompt_asset: crate::toonflow_asset_context::StoryboardPromptAsset {
@@ -457,6 +565,7 @@ mod tests {
                 },
             },
             StoryboardAssetReference {
+                asset_id: 2,
                 image_id: 12,
                 file_path: "prop.png".into(),
                 prompt_asset: crate::toonflow_asset_context::StoryboardPromptAsset {

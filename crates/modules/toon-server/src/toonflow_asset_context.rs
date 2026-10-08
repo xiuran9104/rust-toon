@@ -13,6 +13,7 @@ pub(crate) struct StoryboardPromptAsset {
 
 #[derive(Clone, Debug)]
 pub(crate) struct StoryboardAssetReference {
+    pub(crate) asset_id: i64,
     pub(crate) image_id: i64,
     pub(crate) file_path: String,
     pub(crate) prompt_asset: StoryboardPromptAsset,
@@ -29,6 +30,7 @@ pub(crate) struct TrackAssetReference {
 
 #[derive(Clone, Debug, FromRow)]
 struct StoryboardAssetReferenceRow {
+    asset_id: i64,
     asset_name: String,
     asset_type: String,
     asset_project_id: i64,
@@ -317,7 +319,7 @@ pub async fn load_storyboard_asset_references(
     storyboard_id: i64,
 ) -> Result<Vec<StoryboardAssetReference>, AppError> {
     let rows = sqlx::query_as::<_, StoryboardAssetReferenceRow>(
-        r#"SELECT a.name AS asset_name,a.type AS asset_type,a.project_id AS asset_project_id,
+        r#"SELECT a.id AS asset_id,a.name AS asset_name,a.type AS asset_type,a.project_id AS asset_project_id,
                   i.id AS image_id,i.file_path,i.state AS image_state
            FROM toonflow.assets_storyboards ast
            JOIN toonflow.storyboards s ON s.id=ast.storyboard_id
@@ -355,6 +357,7 @@ pub async fn load_storyboard_asset_references(
     Ok(rows
         .into_iter()
         .map(|row| StoryboardAssetReference {
+            asset_id: row.asset_id,
             image_id: row.image_id.expect("validated storyboard image id"),
             file_path: row.file_path.expect("validated storyboard image path"),
             prompt_asset: StoryboardPromptAsset {
