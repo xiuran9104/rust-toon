@@ -1221,6 +1221,7 @@ pub struct StoryboardRow {
     pub shot_size: Option<String>,
     pub camera_move: Option<String>,
     pub time_of_day: Option<String>,
+    pub carried_objects: Value,
     pub scene_key: Option<String>,
     pub scene_state_id: Option<i64>,
     pub generated_scene_state_id: Option<i64>,
@@ -1255,7 +1256,7 @@ pub async fn get_storyboards(
     let rows = sqlx::query_as::<_, StoryboardRow>(
         r#"SELECT storyboard.id,storyboard.script_id,storyboard.prompt,storyboard.file_path,
                   storyboard.duration,storyboard.state,storyboard.track_id,storyboard.reason,
-                  storyboard.track,storyboard.video_desc,storyboard.shot_size,storyboard.camera_move,storyboard.time_of_day,storyboard.scene_key,
+                  storyboard.track,storyboard.video_desc,storyboard.shot_size,storyboard.camera_move,storyboard.time_of_day,storyboard.carried_objects,storyboard.scene_key,
                   storyboard.scene_state_id,storyboard.generated_scene_state_id,
                   storyboard.scene_generation_context,master.id AS scene_master_id,
                   master.name AS scene_master_name,
@@ -1305,6 +1306,7 @@ pub async fn get_storyboards(
             "shotSize": row.shot_size,
             "cameraMove": row.camera_move,
             "timeOfDay": row.time_of_day,
+            "carriedObjects": row.carried_objects,
             "sceneKey": row.scene_key,
             "sceneMasterId": row.scene_master_id,
             "sceneMasterName": row.scene_master_name,
@@ -1349,6 +1351,7 @@ pub struct SaveStoryboardRequest {
     pub shot_size: Option<String>,
     pub camera_move: Option<String>,
     pub time_of_day: Option<String>,
+    pub carried_objects: Option<Value>,
     pub scene_key: Option<String>,
     pub scene_state_id: Option<i64>,
     pub scene_state_key: Option<String>,
@@ -1408,6 +1411,38 @@ pub(crate) fn validate_shot_framing(
     Ok(())
 }
 
+
+/// 随身物件的帮助：None（编辑路径未传）视作不改？此处统一为空数组写入，
+/// 创建语义为“未声明”；编辑时前端会回填现有值。
+pub(crate) fn carried_objects_json(value: &Option<Value>) -> Value {
+    value.clone().unwrap_or_else(|| json!([]))
+}
+
+/// 对齐方案 P2 穿越物件连续性：随身物件数组校验（每项非空 name ≤24 字，最多 8 件）。
+pub(crate) fn validate_carried_objects(value: &Option<Value>) -> Result<(), AppError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let items = value
+        .as_array()
+        .ok_or_else(|| AppError::bad_request("随身物件必须是数组"))?;
+    if items.len() > 8 {
+        return Err(AppError::bad_request("随身物件最多 8 件"));
+    }
+    for item in items {
+        let name = item
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| AppError::bad_request("随身物件每一项都必须有非空 name"))?;
+        if name.chars().count() > 24 {
+            return Err(AppError::bad_request(format!("随身物件“{name}”名称过长")));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_time_of_day(value: &Option<String>) -> Result<(), AppError> {
     if let Some(time) = value.as_deref().filter(|value| !value.is_empty()) {
         if !TIMES_OF_DAY.contains(&time) {
@@ -1427,6 +1462,7 @@ pub async fn add_storyboard(
     require(&user, "toon:scene:create")?;
     validate_shot_framing(&request.shot_size, &request.camera_move)?;
     validate_time_of_day(&request.time_of_day)?;
+    validate_carried_objects(&request.carried_objects)?;
     let script_id = request
         .script_id
         .ok_or_else(|| AppError::bad_request("scriptId is required"))?;
@@ -1508,8 +1544,8 @@ async fn insert_storyboard(
     sqlx::query(
         r#"INSERT INTO toonflow.storyboards
            (id, script_id, prompt, file_path, duration, state, track_id, track, video_desc,
-            shot_size,camera_move,time_of_day,scene_key,scene_state_id,should_generate_image,project_id,index,create_time)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)"#,
+            shot_size,camera_move,time_of_day,carried_objects,scene_key,scene_state_id,should_generate_image,project_id,index,create_time)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)"#,
     )
     .bind(id)
     .bind(script_id)
@@ -1523,6 +1559,7 @@ async fn insert_storyboard(
     .bind(&request.shot_size)
     .bind(&request.camera_move)
     .bind(&request.time_of_day)
+    .bind(carried_objects_json(&request.carried_objects))
     .bind(scene_key)
     .bind(scene_state_id)
     .bind(request.should_generate_image)
@@ -1696,6 +1733,7 @@ pub struct EditStoryboardInfoRequest {
     pub shot_size: Option<String>,
     pub camera_move: Option<String>,
     pub time_of_day: Option<String>,
+    pub carried_objects: Option<Value>,
     pub scene_key: Option<String>,
     pub scene_state_id: Option<i64>,
     pub scene_state_key: Option<String>,
@@ -1725,6 +1763,7 @@ pub async fn edit_storyboard_info(
     require(&user, "toon:scene:update")?;
     validate_shot_framing(&request.shot_size, &request.camera_move)?;
     validate_time_of_day(&request.time_of_day)?;
+    validate_carried_objects(&request.carried_objects)?;
     let mut tx = state
         .pool
         .begin()
@@ -1832,12 +1871,13 @@ pub async fn edit_storyboard_info(
     } else {
         current_scene_state_id
     };
-    let result = sqlx::query("UPDATE toonflow.storyboards SET prompt=$2,video_desc=$3,duration=$4,track=$5,track_id=$6,should_generate_image=$7,scene_key=CASE WHEN $8 THEN $9 ELSE scene_key END,scene_state_id=$10,shot_size=$11,camera_move=$12,time_of_day=$13,state='未生成',reason='分镜描述或参考资产已更新，请重新生成图片',generated_scene_state_id=NULL,scene_generation_context='{}'::jsonb WHERE id=$1")
+    let result = sqlx::query("UPDATE toonflow.storyboards SET prompt=$2,video_desc=$3,duration=$4,track=$5,track_id=$6,should_generate_image=$7,scene_key=CASE WHEN $8 THEN $9 ELSE scene_key END,scene_state_id=$10,shot_size=$11,camera_move=$12,time_of_day=$13,carried_objects=$14,state='未生成',reason='分镜描述或参考资产已更新，请重新生成图片',generated_scene_state_id=NULL,scene_generation_context='{}'::jsonb WHERE id=$1")
         .bind(request.id).bind(request.prompt).bind(request.video_desc)
         .bind(request.duration.map(|value| value.to_string())).bind(track).bind(track_id)
         .bind(request.should_generate_image.unwrap_or(current_should_generate))
         .bind(scene_key_was_provided).bind(scene_key).bind(scene_state_id)
-        .bind(request.shot_size).bind(request.camera_move).bind(request.time_of_day).execute(&mut *tx).await
+        .bind(request.shot_size).bind(request.camera_move).bind(request.time_of_day)
+        .bind(carried_objects_json(&request.carried_objects)).execute(&mut *tx).await
         .map_err(|_| AppError::internal("failed to update storyboard"))?;
     if let Some(asset_ids) = request.associate_assets_ids {
         sqlx::query("DELETE FROM toonflow.assets_storyboards WHERE storyboard_id=$1")

@@ -432,6 +432,44 @@ pub(crate) async fn prepare_storyboard_generation(
     Ok((response, jobs))
 }
 
+/// 对齐方案 P2 穿越物件连续性：合并多条分镜声明的随身物件。同名物件
+/// 以最后一次声明为准（年代/描述可更新），顺序保持首次出现次序。
+pub(crate) fn merge_carried_objects(declared_per_board: &[Value]) -> Vec<Value> {
+    let mut merged: Vec<Value> = Vec::new();
+    for board_objects in declared_per_board {
+        let Some(items) = board_objects.as_array() else {
+            continue;
+        };
+        for item in items {
+            let Some(name) = item.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            match merged
+                .iter()
+                .position(|existing| existing.get("name").and_then(Value::as_str) == Some(name))
+            {
+                Some(position) => merged[position] = item.clone(),
+                None => merged.push(item.clone()),
+            }
+        }
+    }
+    merged
+}
+
+fn carried_objects_summary(objects: &[Value]) -> String {
+    objects
+        .iter()
+        .filter_map(|item| {
+            let name = item.get("name").and_then(Value::as_str)?;
+            match item.get("era").and_then(Value::as_str).filter(|era| !era.is_empty()) {
+                Some(era) => Some(format!("{name}（{era}）")),
+                None => Some(name.to_string()),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("、")
+}
+
 async fn generate_storyboard_job(
     pool: sqlx::PgPool,
     project_id: i64,
@@ -513,7 +551,7 @@ async fn generate_storyboard_job(
             return false;
         }
     };
-    let generation_prompt = reference_plan.apply_to_prompt(
+    let mut generation_prompt = reference_plan.apply_to_prompt(
         crate::toonflow_asset_prompt::storyboard_generation_prompt(&job.prompt),
     );
     // P1 视觉质检：与资产图片同构的闭环（初始 + 最多 2 次定向重试，
@@ -521,6 +559,7 @@ async fn generate_storyboard_job(
     let framing: Option<(String, String, String, String)> = sqlx::query_as(
         "SELECT coalesce(video_desc,''),coalesce(shot_size,''),coalesce(camera_move,''),coalesce(time_of_day,'') FROM toonflow.storyboards WHERE id=$1",
     )
+    // （随身物件另行查询）
     .bind(job.id)
     .fetch_optional(&pool)
     .await
@@ -529,7 +568,7 @@ async fn generate_storyboard_job(
     let (framing_desc, shot_size, camera_move, time_of_day) = framing
         .unwrap_or_else(|| (String::new(), String::new(), String::new(), String::new()));
     // 对齐方案 P1 场景日夜状态：昼夜影响光线与氛围，注入生成提示词。
-    let generation_prompt = if !time_of_day.trim().is_empty() {
+    let mut generation_prompt = if !time_of_day.trim().is_empty() {
         format!("{generation_prompt}\n时间氛围：{time_of_day}。光线、色温与阴影必须与该时间一致，不得出现矛盾光源。")
     } else {
         generation_prompt
@@ -539,6 +578,36 @@ async fn generate_storyboard_job(
     } else {
         framing_desc
     };
+    // 穿越物件连续性：本镜声明 + 同轨道更早分镜的声明合并继承。
+    let track_carried: Vec<Value> = sqlx::query_scalar(
+        r#"SELECT s2.carried_objects FROM toonflow.storyboards s2
+           JOIN toonflow.storyboards cur ON cur.id=$4
+           WHERE s2.project_id=$1 AND s2.script_id=$2
+             AND s2.track_id IS NOT NULL AND s2.track_id=cur.track_id AND s2.id<>$4
+             AND s2.carried_objects<>'[]'::jsonb
+           ORDER BY s2.index NULLS LAST,s2.id"#,
+    )
+    .bind(project_id)
+    .bind(script_id)
+    .bind(job.id)
+    .bind(job.id)
+    .fetch_all(&pool)
+    .await
+    .unwrap_or_default();
+    let own_carried = sqlx::query_scalar::<_, Value>(
+        "SELECT carried_objects FROM toonflow.storyboards WHERE id=$1",
+    )
+    .bind(job.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap_or_else(|_| json!([]));
+    let merged_carried = merge_carried_objects(&track_carried);
+    let carried_summary = carried_objects_summary(&merged_carried);
+    if !carried_summary.is_empty() {
+        generation_prompt = format!(
+            "{generation_prompt}\n随身物件（连续性要求，必须出现在画面中且年代特征正确）：{carried_summary}。不得凭空消失、不得更换年代样式。"
+        );
+    }
     let asset_summary = prompt_assets
         .iter()
         .map(|asset| (asset.name.as_str(), asset.kind.as_str()))
@@ -548,6 +617,7 @@ async fn generate_storyboard_job(
         &shot_size,
         &camera_move,
         &time_of_day,
+        &carried_summary,
         &asset_summary,
     );
     let mut qc_attempts: Vec<Value> = Vec::new();
@@ -1058,7 +1128,7 @@ pub async fn download_storyboards(
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_image_references;
+    use super::{carried_objects_summary, merge_carried_objects, normalize_image_references};
 
     #[tokio::test]
     async fn keeps_provider_usable_reference_urls() {
@@ -1081,4 +1151,31 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("不支持的参考图地址"));
     }
+
+    #[test]
+    fn merges_by_name_with_latest_declaration_winning() {
+        use serde_json::json;
+        let merged = merge_carried_objects(&[
+            json!([{"name":"手机","era":"现代"}]),
+            json!([{"name":"背包"}]),
+            json!([{"name":"手机","era":"现代","description":"碎屏贴膜"}]),
+        ]);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0]["name"], json!("手机"));
+        assert_eq!(merged[0]["description"], json!("碎屏贴膜"));
+        assert_eq!(merged[1]["name"], json!("背包"));
+        let summary = carried_objects_summary(&merged);
+        assert!(summary.contains("手机"));
+        assert!(summary.contains("背包"));
+    }
+
+    #[test]
+    fn tolerates_empty_and_malformed_carried_declarations() {
+        use serde_json::json;
+        assert!(merge_carried_objects(&[]).is_empty());
+        assert!(merge_carried_objects(&[json!([])]).is_empty());
+        assert!(merge_carried_objects(&[json!(null), json!([{"era":"现代"}])]).is_empty());
+        assert_eq!(carried_objects_summary(&[]), "");
+    }
+
 }

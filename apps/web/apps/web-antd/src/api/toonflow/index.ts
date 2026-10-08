@@ -113,6 +113,7 @@ export namespace ToonflowApi {
     shotSize?: string;
     cameraMove?: string;
     timeOfDay?: string;
+    carriedObjects?: Array<{ description?: string; era?: string; name: string }>;
     shouldGenerateImage: number | boolean;
     associateAssetsIds: number[];
     describe?: string;
