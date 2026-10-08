@@ -1,19 +1,17 @@
 //! s3ctl：仓库自带的极简 S3 兼容存储客户端，供备份与 e2e 脚本使用，
-//! 取代对任何外部 S3 CLI（mc/aws）的依赖。只实现脚本实际用到的操作：
-//! stat/make bucket、put/get/delete、list、双向 mirror。凭据走 S3_*
-//! 环境变量或命令行参数，与部署配置同名。
+//! 取代对任何外部 S3 CLI（mc/aws）的依赖。传输与签名由 `rust-s3` crate
+//! 提供（MIT，非 MinIO）；本文件只保留命令行包装。命令面：stat/make
+//! bucket、put/get/delete、list、双向 mirror。凭据走 S3_* 环境变量或
+//! 命令行参数，与部署配置同名。
 //!
-//! 升级路径（2026-10-07 决策）：保持自带实现；当出现以下任一需求时再切换到
-//! `object_store` crate（Apache Arrow 项目，基金会治理、生产级下游背书）：
-//! 1) 单对象可能超过 5GB 需要分片上传；2) 恢复流程并发化需要条件写入；
-//! 3) 备份目标需要多云后端；4) 希望网关与工具统一到同一个 S3 客户端库。
-//! 届时命令面保持不变，仅替换内部实现并复跑既有 e2e。
+//! 升级路径（2026-10-07 决策）：内部已采用 rust-s3；当出现单对象 >5GB
+//! 分片、并发恢复的条件写入、多云后端，或希望网关与工具统一到同一
+//! 客户端库时，切换到 `object_store`（Apache Arrow）。命令面保持不变。
 
-use hmac::{Hmac, Mac};
-use sha2::{Digest, Sha256};
+use s3::creds::Credentials;
+use s3::region::Region;
+use s3::Bucket;
 use std::path::{Path, PathBuf};
-
-type HmacSha256 = Hmac<Sha256>;
 
 struct Config {
     endpoint: String,
@@ -54,197 +52,45 @@ impl Config {
     }
 }
 
-fn hmac(key: &[u8], data: &str) -> Result<Vec<u8>, String> {
-    let mut mac = HmacSha256::new_from_slice(key).map_err(|error| error.to_string())?;
-    mac.update(data.as_bytes());
-    Ok(mac.finalize().into_bytes().to_vec())
-}
-
-fn hex_hash(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
-}
-
-fn uri_encode(value: &str, encode_slash: bool) -> String {
-    let mut encoded = String::new();
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                encoded.push(byte as char)
-            }
-            b'/' if !encode_slash => encoded.push('/'),
-            _ => encoded.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    encoded
-}
-
-/// AWS Signature V4 over the exact request we are about to send. The signing
-/// scheme mirrors `infra-server::object_storage` so both sides stay identical.
-async fn signed_request(
-    config: &Config,
-    method: &reqwest::Method,
-    key: Option<&str>,
-    query: &[(String, String)],
-    body: Vec<u8>,
-) -> Result<reqwest::Response, String> {
-    let path = match key {
-        Some(key) => format!("/{}/{}", config.bucket, uri_encode(key, false)),
-        None => format!("/{}", config.bucket),
-    };
-    let sorted_query = {
-        let mut pairs = query.to_vec();
-        pairs.sort();
-        pairs
-            .iter()
-            .map(|(name, value)| format!("{}={}", uri_encode(name, true), uri_encode(value, true)))
-            .collect::<Vec<_>>()
-            .join("&")
-    };
-    let url = reqwest::Url::parse(&format!(
-        "{}{}{}",
-        config.endpoint,
-        path,
-        if sorted_query.is_empty() {
-            String::new()
-        } else {
-            format!("?{sorted_query}")
-        }
-    ))
-    .map_err(|error| error.to_string())?;
-    let host = match url.port() {
-        Some(port) => format!("{}:{port}", url.host_str().unwrap_or_default()),
-        None => url.host_str().unwrap_or_default().to_owned(),
-    };
-    let now = chrono_like_now();
-    let payload_hash = hex_hash(&body);
-    let headers = format!(
-        "host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{now}\n"
-    );
-    let signed = "host;x-amz-content-sha256;x-amz-date";
-    let canonical = format!(
-        "{}\n{path}\n{sorted_query}\n{headers}\n{signed}\n{payload_hash}",
-        method.as_str(),
-    );
-    let (date, _) = now.split_once('T').ok_or("invalid signing date")?;
-    let scope = format!("{date}/{}/s3/aws4_request", config.region);
-    let to_sign = format!(
-        "AWS4-HMAC-SHA256\n{now}\n{scope}\n{}",
-        hex_hash(canonical.as_bytes())
-    );
-    let k_date = hmac(format!("AWS4{}", config.secret_key).as_bytes(), date)?;
-    let k_region = hmac(&k_date, &config.region)?;
-    let k_service = hmac(&k_region, "s3")?;
-    let signing = hmac(&k_service, "aws4_request")?;
-    let signature = hex::encode(hmac(&signing, &to_sign)?);
-    let authorization = format!(
-        "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed}, Signature={signature}",
-        config.access_key
-    );
-    let client = reqwest::Client::new();
-    let request = client
-        .request(method.clone(), url)
-        .header("host", &host)
-        .header("x-amz-content-sha256", &payload_hash)
-        .header("x-amz-date", &now)
-        .header("authorization", authorization)
-        .body(body)
-        .build()
-        .map_err(|error| error.to_string())?;
-    client
-        .execute(request)
-        .await
-        .map_err(|error| format!("request failed: {error}"))
-}
-
-/// UTC timestamp in SigV4 format without pulling chrono into this tool.
-fn chrono_like_now() -> String {
-    let seconds = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0) as i64;
-    let days_since_epoch = seconds.div_euclid(86_400);
-    let (year, month, day) = civil_from_days(days_since_epoch);
-    let time_of_day = seconds.rem_euclid(86_400);
-    format!(
-        "{year:04}{month:02}{day:02}T{:02}{:02}{:02}Z",
-        time_of_day / 3_600,
-        (time_of_day % 3_600) / 60,
-        time_of_day % 60
+fn bucket_handle(config: &Config) -> Result<Box<Bucket>, String> {
+    let credentials = Credentials::new(
+        Some(&config.access_key),
+        Some(&config.secret_key),
+        None,
+        None,
+        None,
     )
+    .map_err(|error| format!("invalid credentials: {error}"))?;
+    let region = Region::Custom {
+        region: config.region.clone(),
+        endpoint: config.endpoint.clone(),
+    };
+    let bucket = Bucket::new(&config.bucket, region, credentials)
+        .map_err(|error| format!("invalid bucket config: {error}"))?;
+    // RustFS 和网关侧一致使用 path-style 寻址。
+    Ok(bucket.with_path_style())
 }
 
-/// Howard Hinnant's days-to-civil algorithm.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
-}
-
-fn extract_tag(xml: &str, tag: &str) -> Option<String> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = xml.find(&open)? + open.len();
-    let end = xml[start..].find(&close)? + start;
-    Some(xml[start..end].to_string())
-}
-
-fn extract_keys(xml: &str) -> Vec<String> {
-    let mut keys = Vec::new();
-    let mut rest = xml;
-    while let Some(start) = rest.find("<Key>") {
-        let after = &rest[start + 5..];
-        let Some(end) = after.find("</Key>") else {
-            break;
-        };
-        keys.push(after[..end].to_string());
-        rest = &after[end + 6..];
-    }
-    keys
-}
-
-/// Lists every key under an optional prefix, following continuation tokens.
-async fn list_all_keys(config: &Config, prefix: &str) -> Result<Vec<String>, String> {
+/// 列出前缀下全部对象键，自动跟随 continuation token。
+async fn list_all_keys(bucket: &Bucket, prefix: &str) -> Result<Vec<String>, String> {
     let mut keys = Vec::new();
     let mut token: Option<String> = None;
     loop {
-        let mut query = vec![("list-type".into(), "2".into())];
-        if !prefix.is_empty() {
-            query.push(("prefix".into(), prefix.into()));
-        }
-        if let Some(token) = token.as_deref() {
-            query.push(("continuation-token".into(), token.into()));
-        }
-        let response = signed_request(
-            config,
-            &reqwest::Method::GET,
-            None,
-            &query,
-            Vec::new(),
-        )
-        .await?;
-        if !response.status().is_success() {
-            return Err(format!("list failed: HTTP {}", response.status()));
-        }
-        let body = response
-            .text()
+        let (page, status) = bucket
+            .list_page(
+                prefix.to_string(),
+                None,
+                token,
+                None,
+                None,
+            )
             .await
-            .map_err(|error| error.to_string())?;
-        keys.extend(extract_keys(&body));
-        let truncated = extract_tag(&body, "IsTruncated")
-            .map(|value| value.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        token = if truncated {
-            Some(extract_tag(&body, "NextContinuationToken").ok_or("truncated list without token")?)
-        } else {
-            None
-        };
+            .map_err(|error| format!("list failed: {error}"))?;
+        if !(200..300).contains(&status) {
+            return Err(format!("list failed: HTTP {status}"));
+        }
+        keys.extend(page.contents.into_iter().map(|object| object.key));
+        token = page.next_continuation_token;
         if token.is_none() {
             return Ok(keys);
         }
@@ -274,8 +120,8 @@ fn collect_files(root: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-async fn mirror_to(config: &Config, target_dir: &Path) -> Result<(), String> {
-    for key in list_all_keys(config, "").await? {
+async fn mirror_to(bucket: &Bucket, target_dir: &Path) -> Result<(), String> {
+    for key in list_all_keys(bucket, "").await? {
         if key.is_empty() {
             continue;
         }
@@ -283,22 +129,21 @@ async fn mirror_to(config: &Config, target_dir: &Path) -> Result<(), String> {
         if let Some(parent) = destination.parent() {
             std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
-        let response = signed_request(config, &reqwest::Method::GET, Some(&key), &[], Vec::new())
-            .await?;
-        if !response.status().is_success() {
-            return Err(format!("download {key} failed: HTTP {}", response.status()));
-        }
-        let bytes = response
-            .bytes()
+        let response = bucket
+            .get_object(&key)
             .await
+            .map_err(|error| format!("download {key} failed: {error}"))?;
+        if !(200..300).contains(&response.status_code()) {
+            return Err(format!("download {key} failed: HTTP {}", response.status_code()));
+        }
+        std::fs::write(&destination, response.bytes())
             .map_err(|error| error.to_string())?;
-        std::fs::write(&destination, &bytes).map_err(|error| error.to_string())?;
     }
     Ok(())
 }
 
 async fn mirror_from(
-    config: &Config,
+    bucket: &Bucket,
     source_dir: &Path,
     remove_missing: bool,
 ) -> Result<(), String> {
@@ -317,21 +162,24 @@ async fn mirror_from(
         let bytes = tokio::fs::read(&path)
             .await
             .map_err(|error| format!("read {}: {error}", path.display()))?;
-        let response =
-            signed_request(config, &reqwest::Method::PUT, Some(&key), &[], bytes).await?;
-        if !response.status().is_success() {
-            return Err(format!("upload {key} failed: HTTP {}", response.status()));
+        let response = bucket
+            .put_object(&key, &bytes)
+            .await
+            .map_err(|error| format!("upload {key} failed: {error}"))?;
+        if !(200..300).contains(&response.status_code()) {
+            return Err(format!("upload {key} failed: HTTP {}", response.status_code()));
         }
         desired_keys.push(key);
     }
     if remove_missing {
-        for key in list_all_keys(config, "").await? {
+        for key in list_all_keys(bucket, "").await? {
             if !desired_keys.contains(&key) {
-                let response =
-                    signed_request(config, &reqwest::Method::DELETE, Some(&key), &[], Vec::new())
-                        .await?;
-                if !response.status().is_success() {
-                    return Err(format!("remove {key} failed: HTTP {}", response.status()));
+                let response = bucket
+                    .delete_object(&key)
+                    .await
+                    .map_err(|error| format!("remove {key} failed: {error}"))?;
+                if !(200..300).contains(&response.status_code()) {
+                    return Err(format!("remove {key} failed: HTTP {}", response.status_code()));
                 }
             }
         }
@@ -398,19 +246,28 @@ fn main() {
 }
 
 async fn run(config: &Config, command: &str, args: Vec<String>) -> Result<(), String> {
+    let bucket = bucket_handle(config)?;
     match command {
         "stat-bucket" => {
-            let response = signed_request(config, &reqwest::Method::HEAD, None, &[], Vec::new())
-                .await?;
-            match response.status().as_u16() {
-                200 | 301 | 302 | 403 => Ok(()),
-                status => Err(format!("bucket check failed: HTTP {status}")),
+            let exists = bucket
+                .exists()
+                .await
+                .map_err(|error| format!("bucket check failed: {error}"))?;
+            if exists {
+                Ok(())
+            } else {
+                Err("bucket does not exist".into())
             }
         }
         "make-bucket" => {
-            let response = signed_request(config, &reqwest::Method::PUT, None, &[], Vec::new())
-                .await?;
-            match response.status().as_u16() {
+            // rust-s3 0.38 的 Bucket::create 内部不使用 path-style（自定义
+            // endpoint 会拼出 bucket.127.0.0.1 非法主机），这里直接对空键
+            // 发 PUT——即 path-style 的 PUT /{bucket}/ 建桶请求。
+            let response = bucket
+                .put_object("", &[])
+                .await
+                .map_err(|error| format!("bucket create failed: {error}"))?;
+            match response.status_code() {
                 200 | 201 | 204 | 409 => Ok(()),
                 status => Err(format!("bucket create failed: HTTP {status}")),
             }
@@ -418,52 +275,51 @@ async fn run(config: &Config, command: &str, args: Vec<String>) -> Result<(), St
         "put" => {
             let key = args.first().ok_or("put requires a key")?;
             let body = read_stdin()?;
-            let response =
-                signed_request(config, &reqwest::Method::PUT, Some(key), &[], body).await?;
-            match response.status().as_u16() {
-                200 | 201 | 204 => Ok(()),
-                status => Err(format!("put {key} failed: HTTP {status}")),
+            let response = bucket
+                .put_object(key, &body)
+                .await
+                .map_err(|error| format!("put {key} failed: {error}"))?;
+            if !(200..300).contains(&response.status_code()) {
+                return Err(format!("put {key} failed: HTTP {}", response.status_code()));
             }
+            Ok(())
         }
         "get" => {
             let key = args.first().ok_or("get requires a key")?;
-            let response =
-                signed_request(config, &reqwest::Method::GET, Some(key), &[], Vec::new()).await?;
-            match response.status().as_u16() {
-                200 | 204 => {
-                    use std::io::Write;
-                    let bytes = response
-                        .bytes()
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    std::io::stdout()
-                        .write_all(&bytes)
-                        .map_err(|error| error.to_string())?;
-                    Ok(())
-                }
-                status => Err(format!("get {key} failed: HTTP {status}")),
+            let response = bucket
+                .get_object(key)
+                .await
+                .map_err(|error| format!("get {key} failed: {error}"))?;
+            if !(200..300).contains(&response.status_code()) {
+                return Err(format!("get {key} failed: HTTP {}", response.status_code()));
             }
+            use std::io::Write;
+            std::io::stdout()
+                .write_all(&response.bytes())
+                .map_err(|error| error.to_string())?;
+            Ok(())
         }
         "delete" => {
             let key = args.first().ok_or("delete requires a key")?;
-            let response =
-                signed_request(config, &reqwest::Method::DELETE, Some(key), &[], Vec::new())
-                    .await?;
-            match response.status().as_u16() {
-                200 | 202 | 204 => Ok(()),
-                status => Err(format!("delete {key} failed: HTTP {status}")),
+            let response = bucket
+                .delete_object(key)
+                .await
+                .map_err(|error| format!("delete {key} failed: {error}"))?;
+            if !(200..300).contains(&response.status_code()) {
+                return Err(format!("delete {key} failed: HTTP {}", response.status_code()));
             }
+            Ok(())
         }
         "list" => {
             let prefix = args.first().cloned().unwrap_or_default();
-            for key in list_all_keys(config, &prefix).await? {
+            for key in list_all_keys(&bucket, &prefix).await? {
                 println!("{key}");
             }
             Ok(())
         }
         "mirror-to" => {
             let dir = args.first().map(PathBuf::from).ok_or("mirror-to requires a directory")?;
-            mirror_to(config, &dir).await
+            mirror_to(&bucket, &dir).await
         }
         "mirror-from" => {
             let mut rest = args;
@@ -473,7 +329,7 @@ async fn run(config: &Config, command: &str, args: Vec<String>) -> Result<(), St
                 .ok_or("mirror-from requires a directory")?;
             rest.remove(0);
             let remove_missing = rest.iter().any(|flag| flag == "--remove-missing");
-            mirror_from(config, &dir, remove_missing).await
+            mirror_from(&bucket, &dir, remove_missing).await
         }
         _ => usage(),
     }

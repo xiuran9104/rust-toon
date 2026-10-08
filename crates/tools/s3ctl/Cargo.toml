@@ -12,9 +12,5 @@ name = "s3ctl"
 path = "src/main.rs"
 
 [dependencies]
-hex.workspace = true
-hmac.workspace = true
-reqwest.workspace = true
-serde_json.workspace = true
-sha2.workspace = true
+rust-s3 = { version = "0.38.0", default-features = false, features = ["tokio-rustls-tls"] }
 tokio = { workspace = true, features = ["rt", "macros", "io-util", "fs"] }
