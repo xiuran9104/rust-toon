@@ -32,7 +32,7 @@ async fn applies_all_migrations_to_empty_postgres() {
         .fetch_one(&pool)
         .await
         .expect("read migration history");
-    assert_eq!(applied, 26);
+    assert_eq!(applied, 27);
 
     sqlx::raw_sql(include_str!(
         "../../../../sql/postgresql/0022_video_export_timeline.sql"

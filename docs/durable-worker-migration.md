@@ -1,6 +1,6 @@
 # Durable Worker 迁移方案
 
-> 状态：第一阶段已落地（2026-10-07，迁移 0026）；第二、三阶段待排期。
+> 状态：第一、二阶段已落地（2026-10-07，迁移 0026/0027）；第三阶段待排期。
 > 目标：消除 Gateway 单副本限制（AGENTS.md 中记录的架构约束），使
 > Agent/Workflow 运行时可以水平扩展并在进程崩溃后恢复。
 
@@ -19,7 +19,14 @@ Gateway 进程内仍持有两类运行时状态：
 （NATS JetStream 租约作业，toon-worker 已消费 `toon.video_quality` 等）、
 断点续跑恢复指令（对齐方案 P1，2026-10-07）。
 
-## 第二阶段：Agent 运行注册表持久化
+## 第二阶段：Agent 运行注册表持久化（已落地，迁移 0027）
+
+- `agent_runs` 新增 `lease_until`/`heartbeat_at`/`cancel_requested`；
+  `run_with_tools` 每轮续租 90 秒并感知跨副本取消（置位即返回“用户已中止”）。
+- `stop` 先落取消标志（任一副本的运行循环下一轮感知），再走同进程
+  abort 即时路径。
+- `recover_stale` 改为租约式：仅租约过期且不在本进程活跃集的运行判
+  interrupted；其他副本仍在心跳的运行不受影响。重试走既有断点续跑。
 
 - `agent_runs` 增加租约列（`lease_owner`、`lease_until`、`heartbeat_at`），
   运行中的 Agent 定期心跳续租；租约过期的运行由任一网关实例标记

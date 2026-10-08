@@ -1040,6 +1040,24 @@ async fn run_with_tools(
     }
     let mut prompt = request.content.clone();
     for attempt in 0..4 {
+        // durable 第二阶段：每轮续租 90 秒并感知跨副本取消；任一副本
+        // stop 都会置 cancel_requested，租约过期由 recover_stale 判中断。
+        let canceled: Option<bool> = sqlx::query_scalar(
+            "UPDATE toonflow.agent_runs
+             SET lease_until=now()+interval '90 seconds',heartbeat_at=$2
+             WHERE id=$1 AND state='running'
+             RETURNING cancel_requested",
+        )
+        .bind(run_id)
+        .bind(now_ms())
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        match canceled {
+            Some(true) => return Err("用户已中止".into()),
+            None => return Err("运行已结束".into()),
+            Some(false) => {}
+        }
         if attempt > 0 {
             record_run_event(
                 &state.pool,
@@ -1436,6 +1454,12 @@ pub async fn stop(
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
     require(&user, "toon:project:update")?;
     authorize_run(&state, &user, request.id).await?;
+    // durable 第二阶段：先落取消标志，跨副本运行中的循环会在下一轮感知；
+    // 同进程句柄保留为即时中止的快速路径。
+    let _ = sqlx::query("UPDATE toonflow.agent_runs SET cancel_requested=true WHERE id=$1 AND state='running'")
+        .bind(request.id)
+        .execute(&state.pool)
+        .await;
     if let Some(handle) = ACTIVE_RUNS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1470,7 +1494,9 @@ async fn recover_stale(state: &ToonState) {
         .keys()
         .copied()
         .collect::<Vec<_>>();
-    let _=sqlx::query("UPDATE toonflow.agent_runs SET state='interrupted',error_reason='服务重启导致任务中断',finish_time=$1 WHERE state='running' AND NOT(id=ANY($2))").bind(now_ms()).bind(active).execute(&state.pool).await;
+    // durable 第二阶段：只有租约已过期且不在本进程活跃集的运行才判中断；
+    // 其他副本仍在心跳的运行不受影响。
+    let _=sqlx::query("UPDATE toonflow.agent_runs SET state='interrupted',error_reason='服务重启导致任务中断',finish_time=$1 WHERE state='running' AND NOT(id=ANY($2)) AND (lease_until IS NULL OR lease_until<now())").bind(now_ms()).bind(active).execute(&state.pool).await;
 }
 
 /// 对齐方案 P1 断点续跑：从数据库产物推断已完成阶段。全部为零时返回
