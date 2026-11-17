@@ -16,7 +16,7 @@ use crate::{
     toonflow_episode_renders::{ensure_project_access, ensure_script_in_project},
     toonflow_materials::save_asset_cover_data_url,
     toonflow_pagination::{PageData, default_limit, default_page},
-    toonflow_project_helpers::{default_should_generate, ensure_project, next_id, now_ms},
+    toonflow_project_helpers::{default_should_generate, ensure_project, now_ms},
     toonflow_scene_transitions::{
         apply_track_transition_defaults, normalize_persisted_scene_key,
         persist_work_data_with_transition_sync,
@@ -145,22 +145,23 @@ pub async fn add_novel(
         .begin()
         .await
         .map_err(|_| AppError::internal("failed to add novel chapters"))?;
-    for (idx, item) in request.data.into_iter().enumerate() {
+    for item in request.data {
         chapter_index += 1;
-        let id = next_id(idx as i64);
-        sqlx::query(
+        // The identifier is allocated by PostgreSQL: a client-side timestamp plus
+        // a batch-local offset collided between the 20-chapter batches of a file
+        // import and surfaced as a duplicate `novels_pkey` violation.
+        let id: i64 = sqlx::query_scalar(
             r#"INSERT INTO toonflow.novels
-               (id, chapter_index, reel, chapter, chapter_data, project_id, event_state, create_time)
-               VALUES ($1,$2,$3,$4,$5,$6,0,$7)"#,
+               (chapter_index, reel, chapter, chapter_data, project_id, event_state, create_time)
+               VALUES ($1,$2,$3,$4,$5,0,$6) RETURNING id"#,
         )
-        .bind(id)
         .bind(if item.index > 0 { item.index } else { chapter_index })
         .bind(item.reel)
         .bind(item.chapter)
         .bind(item.chapter_data)
         .bind(request.project_id)
         .bind(now_ms())
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|_| AppError::internal("failed to add novel chapter"))?;
         ids.push(id);
@@ -437,21 +438,24 @@ pub async fn add_script(
     let project_id = request
         .project_id
         .ok_or_else(|| AppError::bad_request("projectId is required"))?;
-    let id = request.id.unwrap_or_else(|| next_id(0));
     let mut tx = state
         .pool
         .begin()
         .await
         .map_err(|_| AppError::internal("failed to create script"))?;
-    sqlx::query(
-        "INSERT INTO toonflow.scripts (id, name, content, project_id, create_time) VALUES ($1,$2,$3,$4,$5)",
+    // Callers may pin an identifier when they replay a script, otherwise
+    // PostgreSQL allocates it from `toonflow.scripts_id_seq`.
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO toonflow.scripts (id, name, content, project_id, create_time)
+         VALUES (coalesce($1::bigint, nextval('toonflow.scripts_id_seq')),$2,$3,$4,$5)
+         RETURNING id",
     )
-    .bind(id)
+    .bind(request.id)
     .bind(request.name)
     .bind(request.content)
     .bind(project_id)
     .bind(now_ms())
-    .execute(&mut *tx)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|_| AppError::internal("failed to create script"))?;
     sync_script_assets(&mut tx, id, request.assets.as_deref().unwrap_or(&[])).await?;
@@ -719,17 +723,16 @@ pub async fn batch_add_scripts(
         .begin()
         .await
         .map_err(|_| AppError::internal("failed to create scripts"))?;
-    for (idx, item) in request.data.into_iter().enumerate() {
-        let id = next_id(idx as i64);
-        sqlx::query(
-            "INSERT INTO toonflow.scripts (id, name, content, project_id, create_time) VALUES ($1,$2,$3,$4,$5)",
+    for item in request.data {
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO toonflow.scripts (id, name, content, project_id, create_time)
+             VALUES (nextval('toonflow.scripts_id_seq'),$1,$2,$3,$4) RETURNING id",
         )
-        .bind(id)
         .bind(item.script_name)
         .bind(item.script_data)
         .bind(request.project_id)
         .bind(now_ms())
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|_| AppError::internal("failed to create scripts"))?;
         ids.push(id);
@@ -913,7 +916,6 @@ pub async fn save_asset(
     Json(request): Json<SaveAssetRequest>,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
     require(&user, "toon:project:update")?;
-    let id = request.id.unwrap_or_else(|| next_id(0));
     if let Some(image_id) = request.image_id {
         let valid: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM toonflow.images i JOIN toonflow.assets a ON a.id=i.assets_id WHERE i.id=$1 AND a.project_id=$2)",
@@ -933,7 +935,6 @@ pub async fn save_asset(
         }
         _ => None,
     };
-    let uploaded_image_id = uploaded_cover.as_ref().map(|_| next_id(1));
     let mut tx = state
         .pool
         .begin()
@@ -943,7 +944,7 @@ pub async fn save_asset(
         sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM toonflow.assets WHERE id=$1 AND project_id=$2 AND prompt IS DISTINCT FROM $3)",
         )
-        .bind(id)
+        .bind(request.id)
         .bind(request.project_id)
         .bind(request.prompt.as_deref().unwrap_or_default())
         .fetch_one(&mut *tx)
@@ -952,10 +953,12 @@ pub async fn save_asset(
     } else {
         false
     };
-    sqlx::query(
+    // New assets get their identifier from PostgreSQL; an existing asset keeps
+    // the identifier the caller pinned so the upsert stays idempotent.
+    let id: i64 = sqlx::query_scalar(
         r#"INSERT INTO toonflow.assets
            (id, project_id, name, prompt, remark, type, description, script_id, parent_asset_id, image_id)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+           VALUES (coalesce($1::bigint, nextval('toonflow.assets_id_seq')),$2,$3,$4,$5,$6,$7,$8,$9,$10)
            ON CONFLICT (id) DO UPDATE SET
              name=excluded.name,
              prompt=coalesce(excluded.prompt, toonflow.assets.prompt),
@@ -967,9 +970,10 @@ pub async fn save_asset(
              image_id=CASE
                WHEN toonflow.assets.prompt IS DISTINCT FROM excluded.prompt THEN excluded.image_id
                ELSE coalesce(excluded.image_id, toonflow.assets.image_id)
-             END"#,
+             END
+           RETURNING id"#,
     )
-    .bind(id)
+    .bind(request.id)
     .bind(request.project_id)
     .bind(request.name)
     .bind(request.prompt.unwrap_or_default())
@@ -979,7 +983,7 @@ pub async fn save_asset(
     .bind(request.script_id)
     .bind(request.parent_asset_id)
     .bind(request.image_id)
-    .execute(&mut *tx)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|_| AppError::internal("failed to save asset"))?;
     if prompt_changed {
@@ -1001,14 +1005,16 @@ pub async fn save_asset(
     .execute(&mut *tx)
     .await
     .map_err(|_| AppError::internal("failed to link saved asset"))?;
-    if let (Some(image_id), Some(file_path)) = (uploaded_image_id, uploaded_cover) {
-        sqlx::query("INSERT INTO toonflow.images(id,file_path,type,assets_id,state) VALUES($1,$2,'asset',$3,'已完成')")
-            .bind(image_id)
-            .bind(file_path)
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|_| AppError::internal("failed to save asset cover"))?;
+    if let Some(file_path) = uploaded_cover {
+        let image_id: i64 = sqlx::query_scalar(
+            "INSERT INTO toonflow.images(file_path,type,assets_id,state)
+             VALUES($1,'asset',$2,'已完成') RETURNING id",
+        )
+        .bind(file_path)
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| AppError::internal("failed to save asset cover"))?;
         sqlx::query("UPDATE toonflow.assets SET image_id=$2 WHERE id=$1")
             .bind(id)
             .bind(image_id)
@@ -1484,27 +1490,25 @@ pub async fn add_storyboard(
         )
         .await?;
     }
-    let id = request.id.unwrap_or_else(|| next_id(0));
-    let track_id = next_id(1);
     let mut tx = state
         .pool
         .begin()
         .await
         .map_err(|_| AppError::internal("failed to create storyboard"))?;
-    sqlx::query(
-        "INSERT INTO toonflow.video_tracks(id,script_id,project_id,duration,sort_order)
-         VALUES($1,$2,$3,$4,coalesce((SELECT max(sort_order)+1 FROM toonflow.video_tracks WHERE project_id=$3 AND script_id=$2),0))",
+    let track_id: i64 = sqlx::query_scalar(
+        "INSERT INTO toonflow.video_tracks(script_id,project_id,duration,sort_order)
+         VALUES($1,$2,$3,coalesce((SELECT max(sort_order)+1 FROM toonflow.video_tracks WHERE project_id=$2 AND script_id=$1),0))
+         RETURNING id",
     )
-    .bind(track_id)
     .bind(script_id)
     .bind(project_id)
     .bind(request.duration.map(|duration| duration as i32))
-    .execute(&mut *tx)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|_| AppError::internal("failed to create storyboard track"))?;
-    insert_storyboard(
+    let id = insert_storyboard(
         &mut tx,
-        id,
+        request.id,
         Some(track_id),
         &request,
         0,
@@ -1521,13 +1525,13 @@ pub async fn add_storyboard(
 
 async fn insert_storyboard(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    id: i64,
+    id: Option<i64>,
     track_id: Option<i64>,
     request: &SaveStoryboardRequest,
     index: i32,
     script_id: i64,
     project_id: i64,
-) -> Result<(), AppError> {
+) -> Result<i64, AppError> {
     let scene_key = normalize_persisted_scene_key(request.scene_key.as_deref())?;
     let scene_state_id = crate::toonflow_scene_consistency::resolve_storyboard_scene_state(
         &mut **tx,
@@ -1541,11 +1545,12 @@ async fn insert_storyboard(
         &request.associate_assets_ids,
     )
     .await?;
-    sqlx::query(
+    let id: i64 = sqlx::query_scalar(
         r#"INSERT INTO toonflow.storyboards
            (id, script_id, prompt, file_path, duration, state, track_id, track, video_desc,
             shot_size,camera_move,time_of_day,carried_objects,scene_key,scene_state_id,should_generate_image,project_id,index,create_time)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)"#,
+           VALUES (coalesce($1::bigint, nextval('toonflow.storyboards_id_seq')),$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+           RETURNING id"#,
     )
     .bind(id)
     .bind(script_id)
@@ -1566,11 +1571,11 @@ async fn insert_storyboard(
     .bind(project_id)
     .bind(index)
     .bind(now_ms())
-    .execute(&mut **tx)
+    .fetch_one(&mut **tx)
     .await
     .map_err(|_| AppError::internal("failed to create storyboard"))?;
     sync_storyboard_assets(tx, id, &request.associate_assets_ids).await?;
-    Ok(())
+    Ok(id)
 }
 
 async fn sync_storyboard_assets(
@@ -1644,15 +1649,14 @@ pub async fn batch_add_storyboards(
         .map_err(|_| AppError::internal("failed to create storyboards"))?;
     let mut storyboard_groups = std::collections::BTreeMap::<String, Vec<i64>>::new();
     for (idx, item) in request.data.iter().enumerate() {
-        let id = item.id.unwrap_or_else(|| next_id(idx as i64));
         let track = item
             .track
             .clone()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "main".to_string());
-        insert_storyboard(
+        let id = insert_storyboard(
             &mut tx,
-            id,
+            item.id,
             None,
             item,
             idx as i32,
@@ -1662,7 +1666,7 @@ pub async fn batch_add_storyboards(
         .await?;
         storyboard_groups.entry(track).or_default().push(id);
     }
-    for (group_index, (track, storyboard_ids)) in storyboard_groups.iter().enumerate() {
+    for (track, storyboard_ids) in storyboard_groups.iter() {
         let existing_track_id: Option<i64> = sqlx::query_scalar(
             "SELECT track_id FROM toonflow.storyboards WHERE project_id=$1 AND script_id=$2 AND track=$3 AND track_id IS NOT NULL LIMIT 1",
         )
@@ -1672,7 +1676,6 @@ pub async fn batch_add_storyboards(
         .fetch_optional(&mut *tx)
         .await
         .map_err(|_| AppError::internal("failed to find storyboard track"))?;
-        let track_id = existing_track_id.unwrap_or_else(|| next_id(10_000 + group_index as i64));
         let duration: i32 = sqlx::query_scalar(
             "SELECT coalesce(sum(CASE WHEN duration ~ '^[0-9]+$' THEN duration::integer ELSE 0 END),0)::integer FROM toonflow.storyboards WHERE project_id=$1 AND script_id=$2 AND track=$3",
         )
@@ -1682,26 +1685,30 @@ pub async fn batch_add_storyboards(
         .fetch_one(&mut *tx)
         .await
         .map_err(|_| AppError::internal("failed to total storyboard track duration"))?;
-        if existing_track_id.is_some() {
-            sqlx::query("UPDATE toonflow.video_tracks SET duration=$2 WHERE id=$1")
-                .bind(track_id)
+        let track_id = match existing_track_id {
+            Some(track_id) => {
+                sqlx::query("UPDATE toonflow.video_tracks SET duration=$2 WHERE id=$1")
+                    .bind(track_id)
+                    .bind(duration)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|_| AppError::internal("failed to update storyboard track"))?;
+                track_id
+            }
+            None => {
+                sqlx::query_scalar(
+                    "INSERT INTO toonflow.video_tracks(project_id,script_id,state,duration,sort_order)
+                     VALUES($1,$2,'未生成',$3,coalesce((SELECT max(sort_order)+1 FROM toonflow.video_tracks WHERE project_id=$1 AND script_id=$2),0))
+                     RETURNING id",
+                )
+                .bind(request.project_id)
+                .bind(request.script_id)
                 .bind(duration)
-                .execute(&mut *tx)
+                .fetch_one(&mut *tx)
                 .await
-                .map_err(|_| AppError::internal("failed to update storyboard track"))?;
-        } else {
-            sqlx::query(
-                "INSERT INTO toonflow.video_tracks(id,project_id,script_id,state,duration,sort_order)
-                 VALUES($1,$2,$3,'未生成',$4,coalesce((SELECT max(sort_order)+1 FROM toonflow.video_tracks WHERE project_id=$2 AND script_id=$3),0))",
-            )
-            .bind(track_id)
-            .bind(request.project_id)
-            .bind(request.script_id)
-            .bind(duration)
-            .execute(&mut *tx)
-            .await
-            .map_err(|_| AppError::internal("failed to create storyboard track"))?;
-        }
+                .map_err(|_| AppError::internal("failed to create storyboard track"))?
+            }
+        };
         sqlx::query("UPDATE toonflow.storyboards SET track_id=$2 WHERE id=ANY($1)")
             .bind(storyboard_ids)
             .bind(track_id)
@@ -1839,11 +1846,9 @@ pub async fn edit_storyboard_info(
             old_track_id.unwrap()
         }
         None => {
-            let id = next_id(2);
-            sqlx::query("INSERT INTO toonflow.video_tracks(id,project_id,script_id,state,duration,sort_order) VALUES($1,$2,$3,'未生成',0,coalesce((SELECT max(sort_order)+1 FROM toonflow.video_tracks WHERE project_id=$2 AND script_id=$3),0))")
-                .bind(id).bind(project_id).bind(script_id).execute(&mut *tx).await
-                .map_err(|_| AppError::internal("failed to create storyboard track"))?;
-            id
+            sqlx::query_scalar("INSERT INTO toonflow.video_tracks(project_id,script_id,state,duration,sort_order) VALUES($1,$2,'未生成',0,coalesce((SELECT max(sort_order)+1 FROM toonflow.video_tracks WHERE project_id=$1 AND script_id=$2),0)) RETURNING id")
+                .bind(project_id).bind(script_id).fetch_one(&mut *tx).await
+                .map_err(|_| AppError::internal("failed to create storyboard track"))?
         }
     };
     let scene_key_was_provided = request.scene_key.is_some();

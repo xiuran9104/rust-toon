@@ -67,14 +67,12 @@ pub async fn update_asset_url(
     if !exists {
         return Err(AppError::not_found("资源未找到"));
     }
-    let image_id = chrono::Utc::now().timestamp_micros();
-    sqlx::query(
-        "INSERT INTO toonflow.images(id,file_path,state,assets_id) VALUES($1,$2,'已完成',$3)",
+    let image_id: i64 = sqlx::query_scalar(
+        "INSERT INTO toonflow.images(file_path,state,assets_id) VALUES($1,'已完成',$2) RETURNING id",
     )
-    .bind(image_id)
     .bind(request.url)
     .bind(request.id)
-    .execute(&mut *tx)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|_| AppError::internal("failed to save asset image"))?;
     sqlx::query("UPDATE toonflow.assets SET flow_id=$2,image_id=$3 WHERE id=$1")
@@ -185,16 +183,14 @@ pub async fn save_flow(
     Json(req): Json<SaveFlow>,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
     require(&user, "toon:project:update")?;
-    let id = chrono::Utc::now().timestamp_millis();
     let mut tx = state
         .pool
         .begin()
         .await
         .map_err(|_| AppError::internal("failed to begin image flow transaction"))?;
-    sqlx::query("INSERT INTO toonflow.image_flows(id,flow_data)VALUES($1,$2)")
-        .bind(id)
+    let id: i64 = sqlx::query_scalar("INSERT INTO toonflow.image_flows(flow_data)VALUES($1) RETURNING id")
         .bind(json!({"edges":req.edges,"nodes":req.nodes}))
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|_| AppError::internal("failed to save image flow"))?;
     if let Some(asset_id) = req.asset_id {
@@ -335,11 +331,11 @@ pub async fn generate_flow_image(
         "references": req.references,
         "targetType": req.target_type,
     });
-    let _ = sqlx::query("INSERT INTO toonflow.tasks(id,project_id,task_class,related_objects,model,description,state,start_time,input,progress_current,progress_total) VALUES($1,$2,'工作流图片生成',$3,$4,'工作流图片生成','success',$1,$5,1,1)")
-        .bind(now)
+    let _ = sqlx::query("INSERT INTO toonflow.tasks(project_id,task_class,related_objects,model,description,state,start_time,input,progress_current,progress_total) VALUES($1,'工作流图片生成',$2,$3,'工作流图片生成','success',$4,$5,1,1)")
         .bind(req.project_id)
         .bind(json!({"prompt":req.prompt,"url":&url}).to_string())
         .bind(req.model)
+        .bind(now)
         .bind(task_input)
         .execute(&state.pool)
         .await;

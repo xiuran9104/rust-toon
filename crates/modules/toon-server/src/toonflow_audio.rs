@@ -16,10 +16,6 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-fn next_id(offset: i64) -> i64 {
-    now_ms() * 1000 + offset
-}
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectRequest {
@@ -133,15 +129,12 @@ async fn insert_audio_child(
     parent_id: i64,
     project_id: i64,
     item: &AudioItemRequest,
-    offset: i64,
 ) -> Result<i64, AppError> {
-    let asset_id = next_id(offset);
-    let image_id = next_id(offset + 500);
-    sqlx::query("INSERT INTO toonflow.assets(id,name,prompt,type,description,parent_asset_id,project_id,start_time) VALUES($1,$2,$3,'audio',$4,$5,$6,$7)")
-        .bind(asset_id).bind(&item.name).bind(&item.prompt).bind(&item.describe).bind(parent_id).bind(project_id).bind(now_ms())
-        .execute(&mut **tx).await.map_err(|_|AppError::internal("failed to add audio asset"))?;
-    sqlx::query("INSERT INTO toonflow.images(id,file_path,type,assets_id,state) VALUES($1,$2,'audio',$3,'已完成')")
-        .bind(image_id).bind(&item.src).bind(asset_id).execute(&mut **tx).await
+    let asset_id: i64 = sqlx::query_scalar("INSERT INTO toonflow.assets(name,prompt,type,description,parent_asset_id,project_id,start_time) VALUES($1,$2,'audio',$3,$4,$5,$6) RETURNING id")
+        .bind(&item.name).bind(&item.prompt).bind(&item.describe).bind(parent_id).bind(project_id).bind(now_ms())
+        .fetch_one(&mut **tx).await.map_err(|_|AppError::internal("failed to add audio asset"))?;
+    let image_id: i64 = sqlx::query_scalar("INSERT INTO toonflow.images(file_path,type,assets_id,state) VALUES($1,'audio',$2,'已完成') RETURNING id")
+        .bind(&item.src).bind(asset_id).fetch_one(&mut **tx).await
         .map_err(|_|AppError::internal("failed to add audio file"))?;
     sqlx::query("UPDATE toonflow.assets SET image_id=$2 WHERE id=$1")
         .bind(asset_id)
@@ -166,17 +159,15 @@ pub async fn add_audio_assets(
         .begin()
         .await
         .map_err(|_| AppError::internal("failed to add audio assets"))?;
-    let parent_id = next_id(0);
-    sqlx::query("INSERT INTO toonflow.assets(id,name,type,description,project_id,start_time) VALUES($1,$2,'audio',$3,$4,$5)")
-        .bind(parent_id).bind(request.name).bind(request.describe).bind(request.project_id).bind(now_ms())
-        .execute(&mut *tx).await.map_err(|_|AppError::internal("failed to add audio collection"))?;
-    for (index, item) in request.assets_item.iter().enumerate() {
+    let parent_id: i64 = sqlx::query_scalar("INSERT INTO toonflow.assets(name,type,description,project_id,start_time) VALUES($1,'audio',$2,$3,$4) RETURNING id")
+        .bind(request.name).bind(request.describe).bind(request.project_id).bind(now_ms())
+        .fetch_one(&mut *tx).await.map_err(|_|AppError::internal("failed to add audio collection"))?;
+    for item in request.assets_item.iter() {
         insert_audio_child(
             &mut tx,
             parent_id,
             request.project_id,
             item,
-            index as i64 + 1,
         )
         .await?;
     }
@@ -220,7 +211,7 @@ pub async fn update_audio_assets(
         .execute(&mut *tx)
         .await
         .map_err(|_| AppError::internal("failed to remove audio items"))?;
-    for (index, item) in request.assets_item.iter().enumerate() {
+    for item in request.assets_item.iter() {
         if let Some(id) = item.id {
             let result=sqlx::query("UPDATE toonflow.assets SET name=$4,prompt=$5,description=$6 WHERE id=$1 AND parent_asset_id=$2 AND project_id=$3")
                 .bind(id).bind(request.id).bind(request.project_id).bind(&item.name).bind(&item.prompt).bind(&item.describe)
@@ -242,7 +233,6 @@ pub async fn update_audio_assets(
                 request.id,
                 request.project_id,
                 item,
-                index as i64 + 1,
             )
             .await?;
         }
@@ -427,8 +417,6 @@ pub async fn generate_dubbing(
     } else {
         generated_url
     };
-    let audio_id = next_id(1);
-    let image_id = next_id(2);
     let name: String = sqlx::query_scalar("SELECT name FROM toonflow.assets WHERE id=$1")
         .bind(request.assets_id)
         .fetch_optional(&state.pool)
@@ -440,11 +428,11 @@ pub async fn generate_dubbing(
         .begin()
         .await
         .map_err(|_| AppError::internal("failed to save dubbing"))?;
-    sqlx::query("INSERT INTO toonflow.assets(id,name,prompt,type,description,parent_asset_id,project_id) VALUES($1,$2,$3,'audio',$4,$5,$6)")
-        .bind(audio_id).bind(format!("{name}-配音")).bind(&request.text).bind(format!("voice:{}",request.voice)).bind(request.assets_id).bind(request.project_id)
-        .execute(&mut *tx).await.map_err(|_| AppError::internal("failed to save dubbing"))?;
-    sqlx::query("INSERT INTO toonflow.images(id,file_path,type,assets_id,model,state) VALUES($1,$2,'audio',$3,$4,'生成完成')")
-        .bind(image_id).bind(&url).bind(audio_id).bind(&configured).execute(&mut *tx).await.map_err(|_| AppError::internal("failed to save dubbing"))?;
+    let audio_id: i64 = sqlx::query_scalar("INSERT INTO toonflow.assets(name,prompt,type,description,parent_asset_id,project_id) VALUES($1,$2,'audio',$3,$4,$5) RETURNING id")
+        .bind(format!("{name}-配音")).bind(&request.text).bind(format!("voice:{}",request.voice)).bind(request.assets_id).bind(request.project_id)
+        .fetch_one(&mut *tx).await.map_err(|_| AppError::internal("failed to save dubbing"))?;
+    let image_id: i64 = sqlx::query_scalar("INSERT INTO toonflow.images(file_path,type,assets_id,model,state) VALUES($1,'audio',$2,$3,'生成完成') RETURNING id")
+        .bind(&url).bind(audio_id).bind(&configured).fetch_one(&mut *tx).await.map_err(|_| AppError::internal("failed to save dubbing"))?;
     sqlx::query("UPDATE toonflow.assets SET image_id=$2 WHERE id=$1")
         .bind(audio_id)
         .bind(image_id)

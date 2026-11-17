@@ -1,8 +1,5 @@
 use serde_json::Value;
 use sqlx::PgPool;
-use std::sync::atomic::{AtomicI64, Ordering};
-
-static TASK_SEQUENCE: AtomicI64 = AtomicI64::new(0);
 
 fn normalized_app_error(error: rust_toon_framework_web::AppError) -> String {
     if let Some(data) = error.data()
@@ -19,11 +16,6 @@ fn normalized_app_error(error: rust_toon_framework_web::AppError) -> String {
         "retryable": error.status().is_server_error(),
     })
     .to_string()
-}
-
-fn task_id() -> i64 {
-    chrono::Utc::now().timestamp_millis() * 1000
-        + TASK_SEQUENCE.fetch_add(1, Ordering::Relaxed) % 1000
 }
 
 fn should_record_task(task_class: &str) -> bool {
@@ -61,10 +53,9 @@ where
     if !should_record_task(task_class) {
         return future.await;
     }
-    let id = task_id();
-    sqlx::query("INSERT INTO toonflow.tasks(id,project_id,task_class,model,description,state,start_time,progress_current,progress_total) VALUES($1,$2,$3,$4,$5,'running',$6,0,$7)")
-        .bind(id).bind(project_id).bind(task_class).bind(model).bind(description).bind(chrono::Utc::now().timestamp_millis()).bind(progress_total)
-        .execute(pool).await.map_err(|error| format!("创建 AI 任务记录失败：{error}"))?;
+    let id: i64 = sqlx::query_scalar("INSERT INTO toonflow.tasks(project_id,task_class,model,description,state,start_time,progress_current,progress_total) VALUES($1,$2,$3,$4,'running',$5,0,$6) RETURNING id")
+        .bind(project_id).bind(task_class).bind(model).bind(description).bind(chrono::Utc::now().timestamp_millis()).bind(progress_total)
+        .fetch_one(pool).await.map_err(|error| format!("创建 AI 任务记录失败：{error}"))?;
     match future.await {
         Ok(value) => {
             sqlx::query("UPDATE toonflow.tasks SET state='success',progress_current=coalesce(progress_total,progress_current),reason=NULL WHERE id=$1")
@@ -97,14 +88,12 @@ async fn recorded_image_with_context<F>(
 where
     F: std::future::Future<Output = Result<String, String>>,
 {
-    let id = task_id();
-    sqlx::query("INSERT INTO toonflow.tasks(id,project_id,task_class,model,description,state,start_time,progress_current,progress_total,input) VALUES($1,$2,'image',$3,'图片生成','running',$4,0,1,$5)")
-        .bind(id)
+    let id: i64 = sqlx::query_scalar("INSERT INTO toonflow.tasks(project_id,task_class,model,description,state,start_time,progress_current,progress_total,input) VALUES($1,'image',$2,'图片生成','running',$3,0,1,$4) RETURNING id")
         .bind(project_id)
         .bind(model)
         .bind(chrono::Utc::now().timestamp_millis())
         .bind(input)
-        .execute(pool)
+        .fetch_one(pool)
         .await
         .map_err(|error| format!("创建 AI 任务记录失败：{error}"))?;
     match future.await {

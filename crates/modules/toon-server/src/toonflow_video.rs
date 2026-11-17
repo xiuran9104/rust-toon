@@ -467,8 +467,7 @@ pub async fn add_track(
 ) -> Result<Json<ApiResponse<i64>>, AppError> {
     require(&user, "toon:scene:update")?;
     ensure_project_script_access(&state.pool, &user, req.project_id, req.script_id).await?;
-    let id = chrono::Utc::now().timestamp_millis();
-    sqlx::query("INSERT INTO toonflow.video_tracks(id,project_id,script_id,duration,state,sort_order) VALUES($1,$2,$3,$4,'未生成',coalesce((SELECT max(sort_order)+1 FROM toonflow.video_tracks WHERE project_id=$2 AND script_id=$3),0))").bind(id).bind(req.project_id).bind(req.script_id).bind(req.duration).execute(&state.pool).await.map_err(|_|AppError::internal("failed to add video track"))?;
+    let id: i64 = sqlx::query_scalar("INSERT INTO toonflow.video_tracks(project_id,script_id,duration,state,sort_order) VALUES($1,$2,$3,'未生成',coalesce((SELECT max(sort_order)+1 FROM toonflow.video_tracks WHERE project_id=$1 AND script_id=$2),0)) RETURNING id").bind(req.project_id).bind(req.script_id).bind(req.duration).fetch_one(&state.pool).await.map_err(|_|AppError::internal("failed to add video track"))?;
     Ok(Json(ApiResponse::new(id)))
 }
 #[derive(Deserialize)]
@@ -1576,7 +1575,7 @@ fn workflow_video_concurrency() -> usize {
 }
 
 fn workflow_video_resolution() -> String {
-    "1080p".into()
+    "720p".into()
 }
 
 #[derive(Clone)]

@@ -336,10 +336,8 @@ pub(crate) async fn execute_recorded(
             return Err(AppError::not_found("project not found"));
         }
     }
-    let call_id = now_ms() * 1000;
-    toonflow_agent_tool_record::start(
+    let call_id = toonflow_agent_tool_record::start(
         &state.pool,
-        call_id,
         &request.agent_type,
         &request.tool_name,
         &request.arguments,
@@ -355,7 +353,6 @@ pub(crate) async fn execute_recorded(
             {
                 toonflow_agent_tool_record::remember_ui_execution(
                     &state.pool,
-                    call_id,
                     request.project_id,
                     script_id,
                     &request.tool_name,
@@ -552,7 +549,7 @@ pub(crate) async fn execute_inner(
             .fetch_all(&mut *tx)
             .await
             .map_err(|_| AppError::internal("failed to load existing scripts"))?;
-            for (index, (name, content)) in normalized.iter().enumerate() {
+            for (name, content) in normalized.iter() {
                 if let Err(reason) = validate_script_for_episode(name, content) {
                     return Err(AppError::bad_request(format!(
                         "剧本《{name}》未完整生成：{reason}。请重新调用剧本子 Agent 生成完整正文后再保存"
@@ -575,15 +572,13 @@ pub(crate) async fn execute_inner(
                         .map_err(|_| AppError::internal("failed to replace generated script"))?;
                     id
                 } else {
-                    let id = timestamp * 1000 + index as i64;
                     let id: i64 = sqlx::query_scalar(
                         "INSERT INTO toonflow.scripts(id,name,content,project_id,create_time)
-                         VALUES($1,$2,$3,$4,$5)
+                         VALUES(nextval('toonflow.scripts_id_seq'),$1,$2,$3,$4)
                          ON CONFLICT (project_id,name) DO UPDATE
                          SET content=EXCLUDED.content,extract_state=NULL,error_reason=NULL
                          RETURNING id",
                     )
-                    .bind(id)
                     .bind(name)
                     .bind(content)
                     .bind(request.project_id)
@@ -1044,12 +1039,8 @@ pub(crate) async fn execute_inner(
             .fetch_optional(&state.pool)
             .await
             .map_err(|_| AppError::internal("failed to find appearance derivative"))?;
-            let id = existing_id.unwrap_or_else(|| {
-                request
-                    .arguments
-                    .get("id")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(now_ms() * 1000)
+            let id = existing_id.or_else(|| {
+                request.arguments.get("id").and_then(Value::as_i64)
             });
             let parent_type =
                 parent_type.ok_or_else(|| AppError::not_found("parent asset not found"))?;
@@ -1058,8 +1049,8 @@ pub(crate) async fn execute_inner(
                     "只有人物资产需要创建衍生图；场景变化请在分镜阶段生成",
                 ));
             }
-            sqlx::query("INSERT INTO toonflow.assets(id,name,prompt,prompt_state,type,description,parent_asset_id,appearance_id,project_id,start_time)VALUES($1,$2,$3,'已完成',$4,$3,$5,$6,$7,$8) ON CONFLICT(id) DO UPDATE SET name=excluded.name,description=excluded.description,prompt=excluded.prompt,prompt_state='已完成',prompt_error_reason=NULL,appearance_id=excluded.appearance_id,image_id=CASE WHEN toonflow.assets.description IS DISTINCT FROM excluded.description THEN NULL ELSE toonflow.assets.image_id END")
-                .bind(id).bind(&appearance_name).bind(&costume_prompt).bind(parent_type).bind(parent).bind(appearance_id).bind(request.project_id).bind(now_ms()).execute(&state.pool).await.map_err(|_|AppError::internal("failed to save derived asset"))?;
+            let id: i64 = sqlx::query_scalar("INSERT INTO toonflow.assets(id,name,prompt,prompt_state,type,description,parent_asset_id,appearance_id,project_id,start_time)VALUES(coalesce($1::bigint, nextval('toonflow.assets_id_seq')),$2,$3,'已完成',$4,$3,$5,$6,$7,$8) ON CONFLICT(id) DO UPDATE SET name=excluded.name,description=excluded.description,prompt=excluded.prompt,prompt_state='已完成',prompt_error_reason=NULL,appearance_id=excluded.appearance_id,image_id=CASE WHEN toonflow.assets.description IS DISTINCT FROM excluded.description THEN NULL ELSE toonflow.assets.image_id END RETURNING id")
+                .bind(id).bind(&appearance_name).bind(&costume_prompt).bind(parent_type).bind(parent).bind(appearance_id).bind(request.project_id).bind(now_ms()).fetch_one(&state.pool).await.map_err(|_|AppError::internal("failed to save derived asset"))?;
             sqlx::query("INSERT INTO toonflow.script_assets(script_id,asset_id)VALUES($1,$2) ON CONFLICT DO NOTHING").bind(script_id).bind(id).execute(&state.pool).await.ok();
             Ok(json!({"id":id,"appearanceId":appearance_id,"name":appearance_name}))
         }
@@ -1773,7 +1764,6 @@ pub(crate) async fn execute_inner(
             let script_id = request
                 .script_id
                 .ok_or_else(|| AppError::bad_request("生产工具缺少 scriptId"))?;
-            let id = now_ms() * 1000;
             let duration = request
                 .arguments
                 .get("duration")
@@ -1844,7 +1834,6 @@ pub(crate) async fn execute_inner(
                 .map_err(AppError::bad_request)?;
             }
             let index:i32=sqlx::query_scalar("SELECT coalesce(max(index),-1)+1 FROM toonflow.storyboards WHERE project_id=$1 AND script_id=$2").bind(request.project_id).bind(script_id).fetch_one(&state.pool).await.unwrap_or(0);
-            let track_id = id + 1;
             let mut tx = state
                 .pool
                 .begin()
@@ -1862,15 +1851,13 @@ pub(crate) async fn execute_inner(
             {
                 existing_track_id
             } else {
-                sqlx::query("INSERT INTO toonflow.video_tracks(id,project_id,script_id,state,duration,sort_order)VALUES($1,$2,$3,'未生成',$4,coalesce((SELECT max(sort_order)+1 FROM toonflow.video_tracks WHERE project_id=$2 AND script_id=$3),0))")
-                    .bind(track_id)
+                sqlx::query_scalar("INSERT INTO toonflow.video_tracks(project_id,script_id,state,duration,sort_order)VALUES($1,$2,'未生成',$3,coalesce((SELECT max(sort_order)+1 FROM toonflow.video_tracks WHERE project_id=$1 AND script_id=$2),0)) RETURNING id")
                     .bind(request.project_id)
                     .bind(script_id)
                     .bind(duration as i32)
-                    .execute(&mut *tx)
+                    .fetch_one(&mut *tx)
                     .await
-                    .map_err(|_| AppError::internal("failed to add storyboard track"))?;
-                track_id
+                    .map_err(|_| AppError::internal("failed to add storyboard track"))?
             };
             let scene_state_id = crate::toonflow_scene_consistency::resolve_storyboard_scene_state(
                 &mut *tx,
@@ -1884,8 +1871,7 @@ pub(crate) async fn execute_inner(
                 &associated_asset_ids,
             )
             .await?;
-            sqlx::query("INSERT INTO toonflow.storyboards(id,script_id,prompt,duration,state,track_id,track,video_desc,scene_key,scene_state_id,should_generate_image,project_id,index,create_time)VALUES($1,$2,$3,$4,'未生成',$5,$6,$7,$8,$9,$10,$11,$12,$13)")
-                .bind(id)
+            let id: i64 = sqlx::query_scalar("INSERT INTO toonflow.storyboards(script_id,prompt,duration,state,track_id,track,video_desc,scene_key,scene_state_id,should_generate_image,project_id,index,create_time)VALUES($1,$2,$3,'未生成',$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id")
                 .bind(script_id)
                 .bind(prompt)
                 .bind(duration.to_string())
@@ -1898,7 +1884,7 @@ pub(crate) async fn execute_inner(
                 .bind(request.project_id)
                 .bind(index)
                 .bind(now_ms())
-                .execute(&mut *tx)
+                .fetch_one(&mut *tx)
                 .await
                 .map_err(|_| AppError::internal("failed to add storyboard"))?;
             sqlx::query("UPDATE toonflow.video_tracks SET duration=(SELECT coalesce(sum(CASE WHEN duration ~ '^[0-9]+$' THEN duration::integer ELSE 0 END),0)::integer FROM toonflow.storyboards WHERE track_id=$1) WHERE id=$1")
@@ -2014,12 +2000,10 @@ pub(crate) async fn execute_inner(
             {
                 Some(existing_track_id)
             } else {
-                let new_track_id = now_ms() * 1000 + 1;
-                sqlx::query("INSERT INTO toonflow.video_tracks(id,project_id,script_id,state,duration,sort_order) VALUES($1,$2,$3,'未生成',0,coalesce((SELECT max(sort_order)+1 FROM toonflow.video_tracks WHERE project_id=$2 AND script_id=$3),0))")
-                    .bind(new_track_id)
+                let new_track_id: i64 = sqlx::query_scalar("INSERT INTO toonflow.video_tracks(project_id,script_id,state,duration,sort_order) VALUES($1,$2,'未生成',0,coalesce((SELECT max(sort_order)+1 FROM toonflow.video_tracks WHERE project_id=$1 AND script_id=$2),0)) RETURNING id")
                     .bind(request.project_id)
                     .bind(script_id)
-                    .execute(&mut *tx)
+                    .fetch_one(&mut *tx)
                     .await
                     .map_err(|_| AppError::internal("failed to create target storyboard track"))?;
                 Some(new_track_id)

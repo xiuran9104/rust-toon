@@ -357,38 +357,27 @@ pub(crate) async fn new_image(
     item: &ImageItem,
     model: &str,
     resolution: &str,
-    offset: i64,
 ) -> Result<ScheduledImage, AppError> {
     let input_hash = generation_input_hash(pool, item, project_id, model, resolution).await?;
     if let Some(existing) = reusable_image(pool, item.id, &item.prompt, &input_hash).await? {
         return Ok(existing);
     }
-    // Image editing/upload already uses microseconds. Mixing millisecond IDs
-    // made ORDER BY id DESC permanently prefer an older edited image.
-    static SEQUENCE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-    let now = chrono::Utc::now().timestamp_micros() + offset;
-    let previous = SEQUENCE
-        .fetch_update(
-            std::sync::atomic::Ordering::SeqCst,
-            std::sync::atomic::Ordering::SeqCst,
-            |previous| Some(now.max(previous + 1)),
-        )
-        .expect("image ID update always succeeds");
-    let id = now.max(previous + 1);
     let size = crate::toonflow_image_contract::ImageCanvas::for_quality(
         resolution,
         toonflow_asset_prompt::asset_image_ratio(&item.type_, &item.prompt),
     )
     .map_err(AppError::bad_request)?
     .size();
-    let inserted = sqlx::query("INSERT INTO toonflow.images(id,type,assets_id,model,resolution,state,input_hash) VALUES($1,$2,$3,$4,$5,'生成中',$6) ON CONFLICT DO NOTHING")
-        .bind(id).bind(&item.type_).bind(item.id).bind(model).bind(size).bind(&input_hash)
-        .execute(pool).await.map_err(|_|AppError::internal("failed to create image"))?;
-    if inserted.rows_affected() == 0 {
+    // PostgreSQL allocates the image identifier so `ORDER BY id DESC` always
+    // prefers the newest image, even when several are scheduled concurrently.
+    let inserted: Option<i64> = sqlx::query_scalar("INSERT INTO toonflow.images(type,assets_id,model,resolution,state,input_hash) VALUES($1,$2,$3,$4,'生成中',$5) ON CONFLICT DO NOTHING RETURNING id")
+        .bind(&item.type_).bind(item.id).bind(model).bind(size).bind(&input_hash)
+        .fetch_optional(pool).await.map_err(|_|AppError::internal("failed to create image"))?;
+    let Some(id) = inserted else {
         return reusable_image(pool, item.id, &item.prompt, &input_hash)
             .await?
             .ok_or_else(|| AppError::internal("failed to resolve concurrent image generation"));
-    }
+    };
     Ok(ScheduledImage {
         id,
         state: "生成中".into(),
@@ -824,7 +813,7 @@ pub(crate) async fn schedule_asset_generation(
     .map_err(|_| AppError::internal("failed to load assets"))?;
     let mut queue = Vec::new();
     let mut response = Vec::new();
-    for (offset, (id, type_, name, prompt, reference_path)) in rows.into_iter().enumerate() {
+    for (id, type_, name, prompt, reference_path) in rows.into_iter() {
         let base64 = match reference_path {
             Some(path) => Some(image_data_url(&path).await.map_err(AppError::bad_request)?),
             None => None,
@@ -836,8 +825,7 @@ pub(crate) async fn schedule_asset_generation(
             prompt,
             base64,
         };
-        let scheduled =
-            new_image(pool, project_id, &item, &model, &resolution, offset as i64).await?;
+        let scheduled = new_image(pool, project_id, &item, &model, &resolution).await?;
         response.push(json!({
             "id":item.id,"imageId":scheduled.id,"state":scheduled.state,
             "filePath":scheduled.file_path,"reused":scheduled.reused
@@ -957,7 +945,6 @@ pub async fn generate_image(
         &item,
         &model,
         &req.resolution,
-        0,
     )
     .await?;
     let result = if let Some(path) = scheduled.file_path.clone() {
@@ -992,14 +979,13 @@ pub async fn batch_generate_images(
     let model = req.model.as_configured();
     let mut queue = Vec::new();
     let mut scheduled_items = Vec::new();
-    for (index, item) in req.items.into_iter().enumerate() {
+    for item in req.items.into_iter() {
         let scheduled = new_image(
             &state.pool,
             req.project_id,
             &item,
             &model,
             &req.resolution,
-            index as i64,
         )
         .await?;
         scheduled_items.push(json!({"id":item.id,"imageId":scheduled.id,"state":scheduled.state,"filePath":scheduled.file_path,"reused":scheduled.reused}));
@@ -1211,11 +1197,11 @@ mod tests {
                 .into(),
             base64: None,
         };
-        let image_id = new_image(&pool, id, &item, &id.to_string(), "2K", 0)
+        let image_id = new_image(&pool, id, &item, &id.to_string(), "2K")
             .await
             .unwrap()
             .id;
-        let duplicate = new_image(&pool, id, &item, &id.to_string(), "2K", 1)
+        let duplicate = new_image(&pool, id, &item, &id.to_string(), "2K")
             .await
             .unwrap();
         assert_eq!(duplicate.id, image_id);
@@ -1300,7 +1286,7 @@ mod tests {
         assert_eq!(planned.load(std::sync::atomic::Ordering::Relaxed), 1);
 
         // A matching pixel ratio must not allow a cropped body through either.
-        let image_id = new_image(&pool, id, &item, &id.to_string(), "2K", 0)
+        let image_id = new_image(&pool, id, &item, &id.to_string(), "2K")
             .await
             .unwrap()
             .id;

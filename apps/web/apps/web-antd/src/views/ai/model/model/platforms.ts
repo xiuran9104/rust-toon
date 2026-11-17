@@ -88,6 +88,21 @@ export function getPlatformTypeOptions(platform?: string) {
   return AI_MODEL_TYPE_OPTIONS.filter(({ value }) => supported.has(value));
 }
 
+/**
+ * 选择平台后是否用平台默认地址覆盖当前地址。
+ *
+ * 仅当当前地址为空、或仍是上一个平台的默认地址时才覆盖：用户手动填写的
+ * 本地地址（例如指向自建 OpenAI 兼容服务）必须在切换平台后保留下来，
+ * 否则会静默变成平台默认地址而指向另一台并不存在的服务。
+ */
+export function shouldApplyPlatformDefaultUrl(
+  currentUrl: string,
+  previousDefaultUrl: string,
+): boolean {
+  const trimmed = currentUrl.trim();
+  return !trimmed || trimmed === previousDefaultUrl.trim();
+}
+
 export function getModelPresetOptions(platform?: string, type?: string) {
   if (!type) return [];
   const defaults =

@@ -145,10 +145,11 @@ impl AiPlatform {
             Self::Grok => &[Chat, Image, Video, Speech, Transcription],
             Self::ZhiPu => &[Chat, Image, Video, Speech, Transcription, Embedding],
             Self::StepFun => &[Chat, Image, Speech, Transcription],
-            Self::Ollama => &[Chat, Embedding],
             Self::StableDiffusion | Self::Midjourney => &[Image],
             Self::Suno => &[Music],
-            Self::OpenAICompatible => &[
+            // Ollama 本地模型通过 OpenAI 兼容协议接入，本地部署可以代理任意类型的
+            // 模型，因此与 OpenAI 兼容平台保持一致的类型集合。
+            Self::Ollama | Self::OpenAICompatible => &[
                 Chat,
                 Image,
                 Video,
@@ -345,5 +346,22 @@ mod tests {
             AiPlatform::DeepSeek.default_url(),
             "https://api.deepseek.com"
         );
+    }
+
+    #[test]
+    fn local_model_platforms_expose_the_full_openai_compatible_type_set() {
+        for model_type in [
+            AiModelType::Chat,
+            AiModelType::Image,
+            AiModelType::Video,
+            AiModelType::Speech,
+            AiModelType::Transcription,
+            AiModelType::Music,
+            AiModelType::Embedding,
+            AiModelType::Rerank,
+        ] {
+            assert!(AiPlatform::Ollama.supports(model_type));
+            assert!(AiPlatform::OpenAICompatible.supports(model_type));
+        }
     }
 }

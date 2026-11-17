@@ -216,7 +216,7 @@ function selectNode(event: { node: Node }) {
       ? {
           audio: Boolean(node.config?.audio),
           concurrentCount: Number(node.config?.concurrentCount ?? 2),
-          resolution: String(node.config?.resolution ?? '1080p'),
+          resolution: String(node.config?.resolution ?? '720p'),
         }
       : {}),
   };

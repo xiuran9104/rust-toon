@@ -51,7 +51,7 @@ pub async fn general_statistics(
     require(&user, "toon:project:read")?;
     let counts: (i64, i64, i64, i64) = sqlx::query_as(
         r#"SELECT
-        (SELECT count(*) FROM toonflow.assets WHERE project_id=$1 AND type='角色'),
+        (SELECT count(*) FROM toonflow.assets WHERE project_id=$1 AND type='role'),
         (SELECT count(*) FROM toonflow.scripts WHERE project_id=$1),
         (SELECT count(*) FROM toonflow.videos WHERE project_id=$1),
         (SELECT count(*) FROM toonflow.storyboards WHERE project_id=$1)"#,

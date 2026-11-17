@@ -120,7 +120,7 @@ pub async fn set_plan(
         .unwrap_or_default();
     let id:i64=sqlx::query_scalar("INSERT INTO toonflow.agent_work_data(project_id,episodes_id,key,data,create_time,update_time)VALUES($1,NULL,$2,$3,$4,$4) ON CONFLICT(project_id,key) WHERE episodes_id IS NULL DO UPDATE SET data=excluded.data,update_time=excluded.update_time RETURNING id").bind(request.project_id).bind(&request.agent_type).bind(json!({"storySkeleton":skeleton,"adaptationStrategy":strategy})).bind(now_ms()).fetch_one(&state.pool).await.map_err(|_|AppError::internal("failed to save plan data"))?;
     if let Some(items) = request.data.get("script").and_then(Value::as_array) {
-        for (index, item) in items.iter().enumerate() {
+        for item in items.iter() {
             let name = item
                 .get("name")
                 .and_then(Value::as_str)
@@ -129,12 +129,14 @@ pub async fn set_plan(
                 .get("content")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let script_id = item
-                .get("id")
-                .and_then(Value::as_i64)
-                .unwrap_or_else(|| now_ms() * 1000 + index as i64);
-            if let Some(existing_project_id) =
-                sqlx::query_scalar::<_, i64>("SELECT project_id FROM toonflow.scripts WHERE id=$1")
+            // A script identifier carried by the plan is honoured so the plan
+            // can update its own scripts; otherwise PostgreSQL allocates one.
+            let script_id = item.get("id").and_then(Value::as_i64);
+            if let Some(script_id) = script_id
+                && let Some(existing_project_id) =
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT project_id FROM toonflow.scripts WHERE id=$1",
+                    )
                     .bind(script_id)
                     .fetch_optional(&state.pool)
                     .await
@@ -143,7 +145,7 @@ pub async fn set_plan(
             {
                 return Err(AppError::bad_request("script 不属于当前项目"));
             }
-            sqlx::query("INSERT INTO toonflow.scripts(id,name,content,project_id,create_time)VALUES($1,$2,$3,$4,$5) ON CONFLICT(id) DO UPDATE SET name=excluded.name,content=excluded.content WHERE toonflow.scripts.project_id=excluded.project_id")
+            sqlx::query("INSERT INTO toonflow.scripts(id,name,content,project_id,create_time)VALUES(coalesce($1::bigint, nextval('toonflow.scripts_id_seq')),$2,$3,$4,$5) ON CONFLICT(id) DO UPDATE SET name=excluded.name,content=excluded.content WHERE toonflow.scripts.project_id=excluded.project_id")
                 .bind(script_id).bind(name).bind(content).bind(request.project_id).bind(now_ms()).execute(&state.pool).await.map_err(|_|AppError::internal("failed to save agent script"))?;
         }
     }

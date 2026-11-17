@@ -3,7 +3,7 @@ use crate::{
     shared::{affected, current_user_id, require},
     toonflow::{SaveProjectRequest, ToonflowProject},
     toonflow_episode_renders::ensure_project_access,
-    toonflow_project_helpers::{next_id, now_ms, validate_models, video_mode, video_ratio},
+    toonflow_project_helpers::{now_ms, validate_models, video_mode, video_ratio},
     toonflow_storage::enqueue_cleanup_paths,
 };
 use axum::{Json, extract::State};
@@ -50,11 +50,12 @@ pub async fn create_project(
         request.video_model,
     )
     .await?;
-    let id = request.id.unwrap_or_else(|| next_id(0));
     let time = now_ms();
-    sqlx::query("INSERT INTO toonflow.projects (id, project_type, chat_model, image_model, image_quality, video_model, name, intro, type, art_style, director_manual, mode, video_ratio, user_id, create_time, update_time) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$15)")
-        .bind(id).bind(request.project_type).bind(request.chat_model).bind(request.image_model).bind(request.image_quality).bind(request.video_model).bind(request.name.trim()).bind(request.intro).bind(request.r#type).bind(request.art_style).bind(request.director_manual).bind(video_mode(&request.mode)).bind(video_ratio(&request.video_ratio)).bind(current_user_id(&user)?).bind(time)
-        .execute(&state.pool).await.map_err(|_| AppError::internal("failed to create toonflow project"))?;
+    // New projects get their identifier from PostgreSQL; a pinned identifier is
+    // only honoured when the caller replays an existing project.
+    let id: i64 = sqlx::query_scalar("INSERT INTO toonflow.projects (id, project_type, chat_model, image_model, image_quality, video_model, name, intro, type, art_style, director_manual, mode, video_ratio, user_id, create_time, update_time) VALUES (coalesce($1::bigint, nextval('toonflow.projects_id_seq')),$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$15) RETURNING id")
+        .bind(request.id).bind(request.project_type).bind(request.chat_model).bind(request.image_model).bind(request.image_quality).bind(request.video_model).bind(request.name.trim()).bind(request.intro).bind(request.r#type).bind(request.art_style).bind(request.director_manual).bind(video_mode(&request.mode)).bind(video_ratio(&request.video_ratio)).bind(current_user_id(&user)?).bind(time)
+        .fetch_one(&state.pool).await.map_err(|_| AppError::internal("failed to create toonflow project"))?;
     Ok(Json(ApiResponse::with_message(
         json!({"id": id}),
         "新增项目成功",

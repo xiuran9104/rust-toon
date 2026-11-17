@@ -308,12 +308,53 @@ async fn update(
     let id = request
         .id
         .ok_or_else(|| AppError::bad_request("id is required"))?;
+    ensure_model_type_change_allowed(&state, id, &request.type_).await?;
     let api_key = resolve_api_key(&state, &request, Some(id)).await?;
     let result=sqlx::query("UPDATE ai.model_configs SET name=$2,key=$3,platform=$4,type=$5,model=$6,api_key=$7,url=$8,status=$9,config=$10,update_time=$11 WHERE id=$1").bind(id).bind(request.name).bind(request.key).bind(request.platform).bind(request.type_).bind(request.model).bind(api_key).bind(request.url).bind(request.status).bind(request.config).bind(chrono::Utc::now().timestamp_millis()).execute(&state.pool).await.map_err(|_|AppError::internal("failed to update AI model"))?;
     if result.rows_affected() == 0 {
         return Err(AppError::not_found("AI model not found"));
     }
     Ok(Json(ApiResponse::new(true)))
+}
+
+/// 模型类型决定生成记录的归属与项目可绑定的能力，因此仅允许在没有类型敏感
+/// 引用时调整类型，避免历史数据与项目绑定被改写成不一致的类型。
+async fn ensure_model_type_change_allowed(
+    state: &AiState,
+    id: i64,
+    requested_type: &str,
+) -> Result<(), AppError> {
+    let current_type: String = sqlx::query_scalar("SELECT type FROM ai.model_configs WHERE id=$1")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|_| AppError::internal("failed to load AI model"))?
+        .ok_or_else(|| AppError::not_found("AI model not found"))?;
+    if current_type == requested_type {
+        return Ok(());
+    }
+    let references: i64 = sqlx::query_scalar(
+        "SELECT
+           (SELECT count(*) FROM ai.images WHERE model_id=$1) +
+           (SELECT count(*) FROM ai.music WHERE model_id=$1) +
+           (SELECT count(*) FROM ai.writes WHERE model_id=$1) +
+           (SELECT count(*) FROM ai.chat_conversations WHERE model_id=$1) +
+           (SELECT count(*) FROM ai.chat_messages WHERE model_id=$1) +
+           (SELECT count(*) FROM ai.chat_roles WHERE model_id=$1) +
+           (SELECT count(*) FROM ai.knowledge_bases WHERE embedding_model_id=$1) +
+           (SELECT count(*) FROM toonflow.projects
+              WHERE chat_model=$1 OR image_model=$1 OR video_model=$1)",
+    )
+    .bind(id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|_| AppError::internal("failed to inspect AI model references"))?;
+    if references > 0 {
+        return Err(AppError::bad_request(
+            "该模型已有生成记录或项目引用，不能修改模型类型",
+        ));
+    }
+    Ok(())
 }
 async fn remove(
     user: CurrentUser,
@@ -388,22 +429,43 @@ fn discovered_model_type(model: &str) -> &'static str {
         "embedding"
     } else if id.contains("rerank") {
         "rerank"
-    } else if id.contains("transcrib") || id.contains("whisper") {
+    } else if id.contains("transcrib") || id.contains("whisper") || has_model_token(&id, "asr") {
         "transcription"
-    } else if id.contains("tts") || id.contains("audio") {
+    } else if id.contains("tts") || id.contains("audio") || id.contains("speech") {
         "speech"
-    } else if id.contains("sora") || id.contains("video") || id.contains("seedance") {
+    } else if id.contains("sora")
+        || id.contains("video")
+        || id.contains("seedance")
+        || id.contains("hailuo")
+        || id.contains("cogvideo")
+        || id.contains("kling")
+        || has_model_token(&id, "veo")
+    {
         "video"
     } else if id.contains("image")
         || id.contains("seedream")
         || id.contains("dall-e")
         || id.contains("flux")
         || id.contains("cogview")
+        || id.contains("midjourney")
+        || id.contains("niji")
+        || id.contains("sd3")
     {
         "image"
+    } else if id.contains("music") || id.contains("lyria") {
+        "music"
     } else {
         "chat"
     }
+}
+
+/// Split a model identifier into lowercase alphanumeric segments so short
+/// keywords such as `asr` or `veo` only match a whole model-name segment
+/// instead of an arbitrary substring.
+fn has_model_token(model: &str, token: &str) -> bool {
+    model
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|segment| segment == token)
 }
 
 async fn discover_models(
@@ -453,13 +515,22 @@ async fn discover_models(
     let models = items
         .into_iter()
         .filter_map(|item| {
-            item.get("id")
+            let id = item
+                .get("id")
                 .or_else(|| item.get("name"))
                 .and_then(Value::as_str)
-                .map(|id| id.trim_start_matches("models/").to_string())
+                .map(|id| id.trim_start_matches("models/").to_string())?;
+            // 供应商若显式声明了模型类型（如本地 OpenAI 兼容服务的自建网关），
+            // 优先采信其声明；未声明或声明无法识别时再按模型名推断。
+            let declared = item
+                .get("type")
+                .and_then(Value::as_str)
+                .and_then(AiModelType::parse);
+            Some((id, declared))
         })
-        .filter_map(|id| {
-            let model_type = AiModelType::parse(discovered_model_type(&id))?;
+        .filter_map(|(id, declared)| {
+            let model_type =
+                declared.or_else(|| AiModelType::parse(discovered_model_type(&id)))?;
             platform
                 .supports(model_type)
                 .then(|| json!({"id":id,"type":model_type.code()}))
@@ -674,6 +745,8 @@ async fn platforms(
 
 #[cfg(test)]
 mod tests {
+    use rust_toon_ai_api::AiModelType;
+
     use super::discovered_model_type;
 
     #[test]
@@ -687,5 +760,42 @@ mod tests {
         );
         assert_eq!(discovered_model_type("doubao-seedream-4-5-251128"), "image");
         assert_eq!(discovered_model_type("qwen-max"), "chat");
+    }
+
+    #[test]
+    fn discovered_media_models_match_their_curated_catalog_type() {
+        assert_eq!(discovered_model_type("MiniMax-Hailuo-2.3"), "video");
+        assert_eq!(discovered_model_type("veo-3.1-preview"), "video");
+        assert_eq!(discovered_model_type("cogvideox-3"), "video");
+        assert_eq!(discovered_model_type("midjourney-v8.1"), "image");
+        assert_eq!(discovered_model_type("niji-7"), "image");
+        assert_eq!(discovered_model_type("sd3.5-large"), "image");
+        assert_eq!(discovered_model_type("speech-2.8-hd"), "speech");
+        assert_eq!(discovered_model_type("glm-asr-2512"), "transcription");
+        assert_eq!(discovered_model_type("music-2.6"), "music");
+        assert_eq!(discovered_model_type("lyria-3-pro-preview"), "music");
+    }
+
+    #[test]
+    fn short_classifier_keywords_only_match_whole_model_segments() {
+        // "asr" and "veo" must not classify unrelated identifiers by substring.
+        assert_eq!(discovered_model_type("qwen3-max-asr"), "transcription");
+        assert_eq!(discovered_model_type("gemini-2.0-flash-veo"), "video");
+        assert_eq!(discovered_model_type("casual-chat"), "chat");
+        assert_eq!(discovered_model_type("llava-1.6"), "chat");
+    }
+
+    #[test]
+    fn provider_declared_model_type_wins_over_name_inference() {
+        // 本地 OpenAI 兼容网关可直接声明类型，无需再按模型名猜测。
+        let declared = AiModelType::parse("image");
+        assert!(declared.is_some());
+        assert_eq!(declared, Some(AiModelType::Image));
+        // 供应商声明无法识别时仍回退到模型名推断。
+        assert_eq!(AiModelType::parse("moderation"), None);
+        assert_eq!(
+            AiModelType::parse(discovered_model_type("MiniMax-Hailuo-2.3")),
+            Some(AiModelType::Video)
+        );
     }
 }

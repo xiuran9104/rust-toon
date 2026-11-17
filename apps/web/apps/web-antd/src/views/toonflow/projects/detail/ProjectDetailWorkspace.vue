@@ -37,7 +37,12 @@ function switchProject(value: unknown) {
       </Row>
 
       <StageNav v-model="view.activeTab" :stages="view.stages" />
-      <component :is="view.activePanelComponent" :context="view.panelContext" />
+      <!-- KeepAlive keeps the Agent WebSocket sessions alive across stage
+       switches: an in-flight workflow keeps streaming and the workspace tabs
+       keep updating instead of the backend aborting the run on disconnect. -->
+      <KeepAlive>
+        <component :is="view.activePanelComponent" :context="view.panelContext" />
+      </KeepAlive>
     </div>
   </Page>
 </template>

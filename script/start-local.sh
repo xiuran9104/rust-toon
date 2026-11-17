@@ -29,6 +29,9 @@ export NACOS_SERVER_ADDR="${NACOS_SERVER_ADDR:-127.0.0.1:8848}"
 export NACOS_USERNAME="${NACOS_USERNAME:-rust_toon}"
 export NACOS_PASSWORD="${NACOS_PASSWORD:-rust_toon_nacos_password}"
 export RUST_LOG="${RUST_LOG:-info}"
+# 本地视频服务（如自建 OpenAI 兼容网关）常同步等待数分钟出片，默认 120 秒
+# 超时会打断生成，因此本地默认放宽到上限 900 秒。
+export AI_REQUEST_TIMEOUT_SECONDS="${AI_REQUEST_TIMEOUT_SECONDS:-900}"
 
 cd "$repository_root"
 gateway_ready_url="${LOCAL_GATEWAY_READY_URL:-http://127.0.0.1:${GATEWAY_PORT:-8080}/readyz}"

@@ -26,6 +26,7 @@ import {
   getPlatformProfile,
   getPlatformTypeOptions,
   modelConfigKey,
+  shouldApplyPlatformDefaultUrl,
 } from '../platforms';
 
 const emit = defineEmits(['success']);
@@ -33,6 +34,7 @@ const formData = ref<AiModelModelApi.Model>();
 const previousPlatform = ref('');
 const previousType = ref('');
 const previousPreset = ref('');
+const previousPlatformUrl = ref('');
 let discoverTimer: ReturnType<typeof setTimeout> | undefined;
 let lastDiscoveryKey = '';
 const getTitle = computed(() => {
@@ -59,9 +61,18 @@ const [Form, formApi] = useVbenForm({
     const url = String(values.url || '');
     const apiKey = String(values.apiKey || '');
     if (platform && platform !== previousPlatform.value) {
+      const platformDefaultUrl = getPlatformProfile(platform).url;
+      // 切换平台时只在地址仍是上一个平台的默认值（或为空）时套用新默认地址，
+      // 手动填写的地址（例如指向自建 OpenAI 兼容服务）必须保留。
+      if (
+        shouldApplyPlatformDefaultUrl(url, previousPlatformUrl.value) &&
+        platformDefaultUrl
+      ) {
+        await formApi.setFieldValue('url', platformDefaultUrl);
+      }
+      previousPlatformUrl.value = platformDefaultUrl;
       previousPlatform.value = platform;
       const supportedTypes = getPlatformTypeOptions(platform);
-      await formApi.setFieldValue('url', getPlatformProfile(platform).url);
       await formApi.setFieldValue('preset', undefined);
       if (!supportedTypes.some((option) => option.value === type)) {
         await formApi.setFieldValue('type', supportedTypes[0]?.value);
@@ -141,6 +152,7 @@ const [Modal, modalApi] = useVbenModal({
       previousPlatform.value = '';
       previousType.value = '';
       previousPreset.value = '';
+      previousPlatformUrl.value = '';
       lastDiscoveryKey = '';
       clearTimeout(discoverTimer);
       return;

@@ -124,10 +124,6 @@ use crate::{
     shared::{affected, require},
 };
 
-fn next_id() -> i64 {
-    chrono::Utc::now().timestamp_millis()
-}
-
 #[derive(Debug, Serialize, FromRow)]
 #[serde(rename_all = "camelCase")]
 pub struct ArtStyle {
@@ -168,8 +164,8 @@ pub async fn save_art_style(
     Json(request): Json<SaveArtStyle>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
     require(&user, "toon:project:update")?;
-    sqlx::query("INSERT INTO toonflow.art_styles (id,name,file_url,label,prompt) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (id) DO UPDATE SET name=excluded.name,file_url=excluded.file_url,label=excluded.label,prompt=excluded.prompt")
-        .bind(request.id.unwrap_or_else(next_id)).bind(request.name).bind(request.file_url).bind(request.label).bind(request.prompt)
+    sqlx::query("INSERT INTO toonflow.art_styles (id,name,file_url,label,prompt) VALUES (coalesce($1::bigint, nextval('toonflow.art_styles_id_seq')),$2,$3,$4,$5) ON CONFLICT (id) DO UPDATE SET name=excluded.name,file_url=excluded.file_url,label=excluded.label,prompt=excluded.prompt")
+        .bind(request.id).bind(request.name).bind(request.file_url).bind(request.label).bind(request.prompt)
         .execute(&state.pool).await.map_err(|_| AppError::internal("failed to save art style"))?;
     Ok(Json(ApiResponse::new(())))
 }

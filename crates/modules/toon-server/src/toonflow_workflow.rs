@@ -1261,7 +1261,7 @@ async fn orchestrated_node_input(
             json!({
                 "trackIds":track_ids,
                 "concurrentCount":settings.get("concurrentCount").and_then(Value::as_u64).unwrap_or(2),
-                "resolution":settings.get("resolution").and_then(Value::as_str).unwrap_or("1080p"),
+                "resolution":settings.get("resolution").and_then(Value::as_str).unwrap_or("720p"),
                 "audio":settings.get("audio").and_then(Value::as_bool).unwrap_or(false),
             })
         }

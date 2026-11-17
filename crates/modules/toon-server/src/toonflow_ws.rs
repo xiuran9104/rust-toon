@@ -730,9 +730,13 @@ async fn handle_socket(
         }
     }
 
-    // Cleanup
-    let _ = abort_tx.send(true);
-    if let Some(task) = active_task { task.abort(); }
+    // Cleanup: detach the in-flight run instead of aborting it. Leaving the
+    // page (route-level unmount) or a refresh closes this socket, but the
+    // run keeps executing server-side and its memories, tool records and
+    // workspace writes still persist for the next visit; emitter sends fail
+    // silently once the socket is gone. Explicit stops go through the
+    // `stop` message or the reset flows, which stop before disconnecting.
+    drop(active_task);
     forward_handle.abort();
     heartbeat_handle.abort();
 }

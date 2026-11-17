@@ -44,7 +44,6 @@ export function useFormSchema(): VbenFormSchema[] {
       componentProps: (values) => {
         return {
           placeholder: '请选择模型类型',
-          disabled: !!values.id,
           options: getPlatformTypeOptions(values.platform),
           allowClear: true,
         };

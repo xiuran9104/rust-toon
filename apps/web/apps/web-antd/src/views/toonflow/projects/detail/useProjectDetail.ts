@@ -57,6 +57,7 @@ import {
   getNovelPage,
   getProject,
   getProjectStatistics,
+  getScriptAgentPlan,
   getScripts,
   getStoryboards,
   getVideoWorkbench,
@@ -214,8 +215,6 @@ export function useProjectDetail(fixedProjectId?: number) {
   const agentType = ref<'productionAgent' | 'scriptAgent'>(
     activeTab.value === 'production' ? 'productionAgent' : 'scriptAgent',
   );
-  const scriptPlan = reactive({ storySkeleton: '', adaptationStrategy: '' });
-
   // Agent workspace tabs - populated in real-time from sub-agent outputs
   const workspaceTabs = reactive<
     { content: string; key: string; label: string }[]
@@ -359,6 +358,47 @@ export function useProjectDetail(fixedProjectId?: number) {
       const currentStage = pipelineStages.find((s) => s.status === 'completed');
       if (currentStage) currentStage.status = 'review';
     }
+  }
+
+  // The sub-agent pipeline persists every accepted stage to
+  // agent_work_data server-side, but the tabs above only fill from live
+  // tool-result events. Re-entry, a refresh, or a missed frame would leave
+  // them empty forever, so refill empty tabs from the persisted workspace.
+  let scriptWorkspaceRestore: Promise<void> | undefined;
+  function restoreScriptWorkspace(): Promise<void> {
+    if (!detailActive || scriptWorkspaceRestore) return scriptWorkspaceRestore ?? Promise.resolve();
+    scriptWorkspaceRestore = (async () => {
+      try {
+        const plan = await getScriptAgentPlan(projectId.value);
+        if (!detailActive) return;
+        const data = plan?.data;
+        if (!data) return;
+        const restoredStages: string[] = [];
+        if (!workspaceTabs[0]!.content && data.storySkeleton) {
+          workspaceTabs[0]!.content = data.storySkeleton;
+          restoredStages.push('skeleton');
+        }
+        if (!workspaceTabs[1]!.content && data.adaptationStrategy) {
+          workspaceTabs[1]!.content = data.adaptationStrategy;
+          restoredStages.push('adaptation');
+        }
+        if (!workspaceTabs[2]!.content && data.script?.length) {
+          workspaceTabs[2]!.content = data.script
+            .map((script) => `### ${script.name}\n\n${script.content}`)
+            .join('\n\n---\n\n');
+          restoredStages.push('script');
+        }
+        for (const key of restoredStages) {
+          const stage = pipelineStages.find((item) => item.key === key);
+          if (stage && stage.status === 'pending') stage.status = 'completed';
+        }
+      } catch {
+        // Best-effort restore; live tool-result events keep filling the tabs.
+      } finally {
+        scriptWorkspaceRestore = undefined;
+      }
+    })();
+    return scriptWorkspaceRestore;
   }
 
   // Agent chat messages (WebSocket-driven)
@@ -726,6 +766,7 @@ export function useProjectDetail(fixedProjectId?: number) {
       ]);
       await loadFlow();
       if (!detailActive) return;
+      void restoreScriptWorkspace();
       locationReady = true;
       persistLocation();
       loadError.value = '';
@@ -1032,7 +1073,7 @@ export function useProjectDetail(fixedProjectId?: number) {
         model: first.model || project.value.videoModel,
         mode,
         continuityMode: first.continuityMode || 'auto',
-        resolution: first.resolution || '1080p',
+        resolution: first.resolution || '720p',
         audio: first.audio !== false,
       });
       message.success(`已提交 ${tracks.length} 个视频生成任务`);
@@ -1070,6 +1111,14 @@ export function useProjectDetail(fixedProjectId?: number) {
   }
 
   async function resetAgentWorkspace() {
+    // Stop the in-flight run explicitly: session teardown no longer aborts
+    // runs on disconnect, and clearing first would let a finishing run
+    // resurrect stale memory and workspace data. Give the server a moment to
+    // process the stop frame before the socket closes.
+    agentChatRef.value?.stop();
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    agentChatRef.value?.disconnect();
+    setTimeout(() => agentChatRef.value?.connect(), 200);
     // Clear chat messages
     if (agentType.value === 'productionAgent') {
       productionChatMessages.value = [];
@@ -1083,16 +1132,25 @@ export function useProjectDetail(fixedProjectId?: number) {
     pipelineStages.forEach(
       (s) => (s.status = s.key === 'init' ? 'completed' : 'pending'),
     );
-    // Clear server-side memory
+    // Clear server-side memory and the persisted script workspace (the
+    // confirm dialog promises both); episode scripts themselves stay in the
+    // script library.
+    const agentIsolationKey = `${agentType.value}:${projectId.value}:${agentType.value === 'productionAgent' ? (selectedScriptId.value ?? 'none') : 'project'}`;
     try {
-      const agentIsolationKey = `${agentType.value}:${projectId.value}:${agentType.value === 'productionAgent' ? (selectedScriptId.value ?? 'none') : 'project'}`;
       await clearAgentMemory(agentType.value, agentIsolationKey);
     } catch {
       /* ignore */
     }
-    // Reconnect WebSocket
-    agentChatRef.value?.disconnect();
-    setTimeout(() => agentChatRef.value?.connect(), 200);
+    if (agentType.value === 'scriptAgent') {
+      try {
+        await saveScriptAgentPlan(projectId.value, {
+          storySkeleton: '',
+          adaptationStrategy: '',
+        });
+      } catch {
+        /* ignore */
+      }
+    }
     message.success('已重新开始');
   }
 
@@ -1102,6 +1160,9 @@ export function useProjectDetail(fixedProjectId?: number) {
       return;
     }
     const isolationKey = `productionAgent:${projectId.value}:${selectedScriptId.value}`;
+    // Stop before clearing: teardown no longer aborts runs on disconnect.
+    productionAgentChatRef.value?.stop();
+    await new Promise((resolve) => setTimeout(resolve, 150));
     await clearAgentMemory('productionAgent', isolationKey);
     productionChatMessages.value = [];
     productionAgentChatRef.value?.disconnect();
@@ -1166,8 +1227,12 @@ export function useProjectDetail(fixedProjectId?: number) {
   }
 
   async function saveAgentWorkspace() {
+    // Persist the live tab contents: scriptPlan used to be an always-empty
+    // reactive here, so saving silently wiped the generated skeleton and
+    // strategy in the server-side workspace.
     await saveScriptAgentPlan(projectId.value, {
-      ...scriptPlan,
+      storySkeleton: workspaceTabs[0]!.content,
+      adaptationStrategy: workspaceTabs[1]!.content,
       script: scripts.value.map(({ id, name, content }) => ({
         id,
         name,
@@ -2366,7 +2431,7 @@ export function useProjectDetail(fixedProjectId?: number) {
         mode,
         continuityMode:
           options.continuityMode || track.continuityMode || 'auto',
-        resolution: options.resolution || '1080p',
+        resolution: options.resolution || '720p',
         duration: track.duration || storyboard?.duration || 4,
         audio: options.audio !== false,
         uploadData: videoUploadData(track, mode),
@@ -2407,7 +2472,7 @@ export function useProjectDetail(fixedProjectId?: number) {
       id: video.id,
       model: project.value.videoModel,
       mode,
-      resolution: '1080p',
+      resolution: '720p',
       audio: true,
       uploadData: videoUploadData(track, mode),
     });
@@ -2465,6 +2530,7 @@ export function useProjectDetail(fixedProjectId?: number) {
     scriptChatMessages,
     onAgentToolResult,
     resetAgentWorkspace,
+    restoreScriptWorkspace,
     openScriptGeneration,
     clearScriptAgentMemory,
     saveAgentWorkspace,
@@ -2620,7 +2686,10 @@ export function useProjectDetail(fixedProjectId?: number) {
 
   watch(activeTab, (tab) => {
     persistLocation();
-    if (tab === 'script-agent') agentType.value = 'scriptAgent';
+    if (tab === 'script-agent') {
+      agentType.value = 'scriptAgent';
+      void restoreScriptWorkspace();
+    }
     if (tab === 'production') agentType.value = 'productionAgent';
     if (tab !== 'production') {
       productionAgentCollapsed.value = true;
@@ -2655,6 +2724,13 @@ export function useProjectDetail(fixedProjectId?: number) {
     selectedScriptId.value = savedLocation.scriptId;
     loadedFlowProjectId.value = undefined;
     loadedFlowScriptId.value = undefined;
+    // Workspace tabs hold the previous project's pipeline output; clear them
+    // so restoreScriptWorkspace refills from the new project's workspace.
+    workspaceTabs.forEach((tab) => (tab.content = ''));
+    workspaceActiveTab.value = 'storySkeleton';
+    pipelineStages.forEach(
+      (stage) => (stage.status = stage.key === 'init' ? 'completed' : 'pending'),
+    );
     void loadAll();
   });
 

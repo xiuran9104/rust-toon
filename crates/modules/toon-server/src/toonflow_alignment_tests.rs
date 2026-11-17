@@ -209,11 +209,11 @@ async fn alignment_stage_skills_and_image_prompt_reach_model_boundary() {
     };
     sqlx::query("INSERT INTO toonflow.assets(id,project_id,name,type,description,prompt,parent_asset_id) VALUES($1,$2,'现代日常造型','role',$3,$3,$2)")
         .bind(derived_id).bind(id).bind(&derived.prompt).execute(&pool).await.unwrap();
-    let first = toonflow_asset_ai::new_image(&pool, id, &derived, &(id + 1).to_string(), "2K", 0)
+    let first = toonflow_asset_ai::new_image(&pool, id, &derived, &(id + 1).to_string(), "2K")
         .await
         .unwrap();
     let duplicate =
-        toonflow_asset_ai::new_image(&pool, id, &derived, &(id + 1).to_string(), "2K", 1)
+        toonflow_asset_ai::new_image(&pool, id, &derived, &(id + 1).to_string(), "2K")
             .await
             .unwrap();
     assert_eq!(duplicate.id, first.id);

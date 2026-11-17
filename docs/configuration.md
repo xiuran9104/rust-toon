@@ -150,7 +150,7 @@ Gateway 与 Toon Worker 默认在各自监听端口暴露 `GET /metrics`，使�
 | `SECRET_ENCRYPTION_KEY` | 无默认值，至少 32 字节 | 邮件、短信、OAuth 与数据源等敏感字段的独立 AES-256-GCM 密钥（新写入为 `enc:v2:`；旧 `enc:v1:` 数据保持兼容） | `framework/security/src/secret.rs` |
 | `TEST_DATABASE_URL` | 无 | 仅测试使用：迁移测试与分镜数据库集成测试 | `toon-server/src/lib.rs` 测试、`script/test-database-migrations.sh` |
 | `TEST_POSTGRES_PORT` | `55432` | 迁移测试脚本起临时 PostgreSQL 容器所用端口 | `script/test-database-migrations.sh` |
-| `AI_REQUEST_TIMEOUT_SECONDS` | `120` | AI Provider 单次 HTTP 请求总超时，实际限制在 5～900 秒；连接超时固定为 15 秒 | `ai-server/src/provider.rs` |
+| `AI_REQUEST_TIMEOUT_SECONDS` | `120`（`script/start-local.sh` 本地默认 `900`） | AI Provider 单次 HTTP 请求总超时，实际限制在 5～900 秒；连接超时固定为 15 秒。本地自建同步视频服务出片常需数分钟，本地脚本默认放宽到上限 | `ai-server/src/provider.rs`、`script/start-local.sh` |
 | `AI_REQUEST_RETRIES` | `2` | AI Provider 失败重试次数，实际最多 5 次；连接失败、超时、408/409/425/429 和 5xx 会指数退避重试，支持上游 `Retry-After` | `ai-server/src/provider.rs` |
 | `AI_VIDEO_POLL_INTERVAL_SECONDS` | `5` | 异步视频任务轮询间隔 | `toon-server/src/ai_client.rs` |
 | `AI_VIDEO_POLL_TIMEOUT_SECONDS` | `600` | 异步视频任务最长等待时间 | `toon-server/src/ai_client.rs` |

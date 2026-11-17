@@ -101,6 +101,7 @@ gateway 全局挂 `authenticate_from_database`（`system-server/src/database_aut
 
 - 迁移目录 `sql/postgresql/` 在编译期由 `sqlx::migrate!("../../../sql/postgresql")` 嵌入 `framework-database`（`database/src/postgres.rs`）。`0001_initial.sql` 是完整基线，后续变更以只增不改的编号迁移追加，新数据库由 Gateway 自动执行完整迁移链；当前迁移清单以目录内容和迁移测试为准，不在架构文档中重复维护版本上限。
 - `migrate()` 启动时自动执行；执行前有保护：若数据库里已有业务表但没有 `_sqlx_migrations` 历史表，则拒绝运行，避免覆盖未知数据库。
+- Toonflow 内容类主键（`novels`/`scripts`/`projects`/`storyboards`/`video_tracks`/`assets`/`images`/`events`/`agent_*`/`image_flows`/`character_appearances`/`art_styles`）一律由 PostgreSQL 序列分配（`<表名>_id_seq`，列 DEFAULT 为 `nextval`）。Rust 侧不再用 `now_ms() + offset` 这类进程内墙上时钟生成 ID：偏移量只在单个请求内唯一，跨请求会重叠，曾导致小说文件按 20 章分批导入时触发 `novels_pkey` 唯一约束冲突。新增此类表必须同步建序列，并让写入走 `INSERT ... RETURNING id` 或 `coalesce($1::bigint, nextval(...))`。
 - `sql/bootstrap/current.sql` 仅是参考快照，应用从不加载。
 - 迁移变更流程（新增编号迁移、保持幂等、跑 `script/test-database-migrations.sh`、更新 `crates/framework/database/tests/migrations.rs` 断言）见根 `AGENTS.md` 与 [deployment.md](deployment.md)。
 
@@ -118,8 +119,9 @@ gateway 全局挂 `authenticate_from_database`（`system-server/src/database_aut
 
 AI 能力域：
 
-- **模型配置**存于 `ai.model_configs` 表（platform / type / model / api_key / url / config），CRUD 路由 `/ai/model/*`。模型类型：chat、image、speech、video、embedding、rerank、transcription、music。
+- **模型配置**存于 `ai.model_configs` 表（platform / type / model / api_key / url / config），CRUD 路由 `/ai/model/*`。模型类型：chat、image、speech、video、embedding、rerank、transcription、music。平台可用的类型集合由 `ai.model_platforms.supported_types` 声明，前端 `/ai/model/platforms` 按该声明下发类型下拉；网关侧 `AiPlatform::supported_types`（`crates/modules/ai-api`）做同样的服务端校验，两处必须一致。Ollama 本地模型与 OpenAI 兼容平台一致支持全部八种类型（本地部署通常以 OpenAI 兼容协议代理多类型模型）。模型类型在已有生成记录或项目引用时不可修改。
 - **Provider 体系**：`AiModelFactory`（`factory.rs`）按平台分发到 `provider/` 下的实现——OpenAI 兼容协议 Provider（覆盖 OpenAI、通义、星火、DeepSeek、火山引擎、混元、硅基流动、MiniMax、Moonshot、百川、阶跃、文心、智谱、Grok、Ollama、OpenAICompatible），以及 Anthropic、Gemini、AzureOpenAI、火山引擎媒体生成等专用 Provider；未实现的平台显式报错。`AiPlatform` 枚举见 `crates/modules/ai-api`。
+- **模型同步**：`/ai/model/discover` 拉取供应商模型列表后按模型名归类类型（embedding、rerank、transcription、speech、video、image、music、chat），短关键字（`asr`、`veo`）只按完整分段匹配，避免误判；归类结果与 `ai.model_catalog` 中同平台的预设合并后下发。
 - **子模块**：`chat`（对话/会话）、`chat_role`、`media`（图片/音乐生成，含 10 秒间隔的音乐任务轮询后台任务）、`midjourney`（含后台同步任务）、`knowledge`（知识库）、`tools`、`write`、`vector`。
 
 ### 5.4 media（`crates/modules/media-server`）

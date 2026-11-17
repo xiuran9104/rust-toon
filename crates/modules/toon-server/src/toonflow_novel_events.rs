@@ -66,7 +66,6 @@ async fn process_chapter(pool: &PgPool, project_id: i64, id: i64, task_model: &s
     let Some((title, content)) = chapter else {
         return;
     };
-    let task_id = chrono::Utc::now().timestamp_millis() * 1_000_000 + id % 1_000_000;
     let task_input = json!({"projectId":project_id,"novelId":id,"chapter":title});
     // 手动提取可能重复提交，用章节级 advisory lock + running 检查
     // 保证同一章节不会并发创建两个任务。
@@ -93,20 +92,21 @@ async fn process_chapter(pool: &PgPool, project_id: i64, id: i64, task_model: &s
     if already_running.is_some() {
         return;
     }
-    if sqlx::query("INSERT INTO toonflow.tasks(id,project_id,task_class,related_objects,model,description,state,start_time,input,progress_current,progress_total) VALUES($1,$2,'novelEvent',$3,$4,$5,'running',$6,$7,0,1) ON CONFLICT(id) DO NOTHING")
-        .bind(task_id)
+    // PostgreSQL allocates the task identifier so repeated submissions for the
+    // same chapter can never collide on `tasks_pkey`.
+    let task_id: i64 = match sqlx::query_scalar("INSERT INTO toonflow.tasks(project_id,task_class,related_objects,model,description,state,start_time,input,progress_current,progress_total) VALUES($1,'novelEvent',$2,$3,$4,'running',$5,$6,0,1) RETURNING id")
         .bind(project_id)
         .bind(id.to_string())
         .bind(task_model)
         .bind(format!("提取事件：{title}"))
         .bind(chrono::Utc::now().timestamp_millis())
         .bind(task_input)
-        .execute(&mut *task_tx)
+        .fetch_one(&mut *task_tx)
         .await
-        .is_err()
     {
-        return;
-    }
+        Ok(task_id) => task_id,
+        Err(_) => return,
+    };
     if task_tx.commit().await.is_err() {
         return;
     }
@@ -183,35 +183,37 @@ async fn save_events(pool: &PgPool, novel_id: i64, raw: &str) -> Result<(), Stri
         return Err(format!("每章应概括一条核心事件，模型返回了 {} 条，请重新提取", events.len()));
     }
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
-    // Delete old events for this novel (IDs are novel_id * 1000 + 0..999)
-    let id_start = novel_id * 1000;
-    let id_end = novel_id * 1000 + 999;
+    // Delete the events this novel owns before writing its replacement. The
+    // event identifiers come from a sequence, so they are resolved through the
+    // chapter links instead of a derived identifier range.
+    sqlx::query(
+        "DELETE FROM toonflow.events e USING toonflow.event_chapters c
+         WHERE c.event_id = e.id AND c.novel_id = $1",
+    )
+    .bind(novel_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
     sqlx::query("DELETE FROM toonflow.event_chapters WHERE novel_id=$1")
         .bind(novel_id)
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
-    sqlx::query("DELETE FROM toonflow.events WHERE id BETWEEN $1 AND $2")
-        .bind(id_start)
-        .bind(id_end)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
-    for (index, event) in events.iter().enumerate() {
+    for event in events.iter() {
         let name = event
             .get("name")
             .and_then(Value::as_str)
             .unwrap_or("未命名事件");
         let detail = event.get("detail").and_then(Value::as_str).unwrap_or("");
-        let event_id = novel_id * 1000 + index as i64;
-        sqlx::query("INSERT INTO toonflow.events(id,name,detail,create_time) VALUES($1,$2,$3,$4)")
-            .bind(event_id)
-            .bind(name)
-            .bind(detail)
-            .bind(chrono::Utc::now().timestamp_millis())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?;
+        let event_id: i64 = sqlx::query_scalar(
+            "INSERT INTO toonflow.events(name,detail,create_time) VALUES($1,$2,$3) RETURNING id",
+        )
+        .bind(name)
+        .bind(detail)
+        .bind(chrono::Utc::now().timestamp_millis())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
         sqlx::query("INSERT INTO toonflow.event_chapters(event_id,novel_id) VALUES($1,$2)")
             .bind(event_id)
             .bind(novel_id)

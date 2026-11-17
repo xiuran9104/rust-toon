@@ -1,4 +1,4 @@
-use crate::{ToonState, shared::require};
+use crate::{ToonState, shared::require, toonflow_project_helpers::now_ms};
 use axum::{Json, extract::State};
 use base64::Engine;
 use rust_toon_framework_common::ApiResponse;
@@ -81,33 +81,31 @@ pub async fn upload_clip(
     if !project_exists {
         return Err(AppError::not_found("project not found"));
     }
-    let id = chrono::Utc::now().timestamp_millis();
-    let image_id = id + 1;
     let url = save_data_url(&request.base64_data, request.project_id, "materials", false).await?;
     let mut tx = state
         .pool
         .begin()
         .await
         .map_err(|_| AppError::internal("failed to begin material transaction"))?;
-    sqlx::query(
-        "INSERT INTO toonflow.assets(id,name,type,project_id,start_time) VALUES($1,$2,$3,$4,$5)",
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO toonflow.assets(name,type,project_id,start_time) VALUES($1,$2,$3,$4) RETURNING id",
     )
-    .bind(id)
     .bind(&request.name)
     .bind(&request.type_)
     .bind(request.project_id)
-    .bind(id)
-    .execute(&mut *tx)
+    .bind(now_ms())
+    .fetch_one(&mut *tx)
     .await
     .map_err(|_| AppError::internal("failed to create material"))?;
-    sqlx::query("INSERT INTO toonflow.images(id,file_path,type,assets_id,state) VALUES($1,$2,$3,$4,'已完成')")
-        .bind(image_id)
-        .bind(&url)
-        .bind(&request.type_)
-        .bind(id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|_| AppError::internal("failed to create material file"))?;
+    let image_id: i64 = sqlx::query_scalar(
+        "INSERT INTO toonflow.images(file_path,type,assets_id,state) VALUES($1,$2,$3,'已完成') RETURNING id",
+    )
+    .bind(&url)
+    .bind(&request.type_)
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|_| AppError::internal("failed to create material file"))?;
     sqlx::query("UPDATE toonflow.assets SET image_id=$2 WHERE id=$1")
         .bind(id)
         .bind(image_id)

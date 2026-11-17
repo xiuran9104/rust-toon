@@ -42,9 +42,6 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
         .as_millis() as i64
 }
-fn next_id(offset: i64) -> i64 {
-    now_ms() * 1000 + offset
-}
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -414,8 +411,7 @@ pub(crate) async fn add_memory(
     role: &str,
     content: &str,
 ) -> Result<i64, AppError> {
-    let id = next_id(if role == "user" { 1 } else { 2 });
-    sqlx::query("INSERT INTO toonflow.agent_memories(id,agent_type,isolation_key,role,content,create_time) VALUES($1,$2,$3,$4,$5,$6)").bind(id).bind(agent).bind(isolation).bind(role).bind(content).bind(now_ms()).execute(&state.pool).await.map_err(|_|AppError::internal("failed to save agent memory"))?;
+    let id: i64 = sqlx::query_scalar("INSERT INTO toonflow.agent_memories(agent_type,isolation_key,role,content,create_time) VALUES($1,$2,$3,$4,$5) RETURNING id").bind(agent).bind(isolation).bind(role).bind(content).bind(now_ms()).fetch_one(&state.pool).await.map_err(|_|AppError::internal("failed to save agent memory"))?;
     toonflow_agent_runtime::store_memory_embedding(&state.pool, id, content).await;
     let agent_key = if agent == "scriptAgent" {
         "scriptAgent:decisionAgent"
@@ -456,11 +452,10 @@ async fn summarize_if_needed(
         return;
     };
     let ids = rows.iter().map(|(id, _, _)| *id).collect::<Vec<_>>();
-    let summary_id = next_id(3);
     let Ok(mut tx) = state.pool.begin().await else {
         return;
     };
-    if sqlx::query("INSERT INTO toonflow.agent_memories(id,agent_type,isolation_key,role,content,memory_type,related_message_ids,create_time) VALUES($1,$2,$3,'system',$4,'summary',$5,$6)").bind(summary_id).bind(agent_type).bind(isolation_key).bind(&summary).bind(json!(ids)).bind(now_ms()).execute(&mut *tx).await.is_err(){return}
+    let Ok(summary_id) = sqlx::query_scalar("INSERT INTO toonflow.agent_memories(agent_type,isolation_key,role,content,memory_type,related_message_ids,create_time) VALUES($1,$2,'system',$3,'summary',$4,$5) RETURNING id").bind(agent_type).bind(isolation_key).bind(&summary).bind(json!(ids)).bind(now_ms()).fetch_one(&mut *tx).await else {return};
     let _ = sqlx::query("UPDATE toonflow.agent_memories SET summarized=true WHERE id=ANY($1)")
         .bind(&ids)
         .execute(&mut *tx)
@@ -1136,8 +1131,7 @@ async fn create_run(state: &ToonState, request: &ChatRequest) -> Result<i64, App
     if request.isolation_key.trim().is_empty() || request.content.trim().is_empty() {
         return Err(AppError::bad_request("isolationKey 和 content 不能为空"));
     }
-    let run_id = next_id(0);
-    sqlx::query("INSERT INTO toonflow.agent_runs(id,agent_type,isolation_key,project_id,script_id,input,state,think,think_level,start_time) VALUES($1,$2,$3,$4,$5,$6,'running',$7,$8,$9)").bind(run_id).bind(&request.agent_type).bind(&request.isolation_key).bind(request.project_id).bind(request.script_id).bind(&request.content).bind(request.think).bind(request.think_level.clamp(0,3)).bind(now_ms()).execute(&state.pool).await.map_err(|_|AppError::internal("failed to start agent run"))?;
+    let run_id: i64 = sqlx::query_scalar("INSERT INTO toonflow.agent_runs(agent_type,isolation_key,project_id,script_id,input,state,think,think_level,start_time) VALUES($1,$2,$3,$4,$5,'running',$6,$7,$8) RETURNING id").bind(&request.agent_type).bind(&request.isolation_key).bind(request.project_id).bind(request.script_id).bind(&request.content).bind(request.think).bind(request.think_level.clamp(0,3)).bind(now_ms()).fetch_one(&state.pool).await.map_err(|_|AppError::internal("failed to start agent run"))?;
     Ok(run_id)
 }
 

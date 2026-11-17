@@ -333,10 +333,9 @@ async fn extract_group(
         let asset_id = if let Some(id) = existing_id {
             id
         } else {
-            let id = chrono::Utc::now().timestamp_micros();
-            sqlx::query("INSERT INTO toonflow.assets(id,name,type,description,project_id,start_time) VALUES($1,$2,$3,$4,$5,$6)")
-                .bind(id).bind(&asset_name).bind(&asset_type).bind(asset.desc.trim()).bind(project_id).bind(chrono::Utc::now().timestamp_millis())
-                .execute(&mut *tx).await.map_err(|error|error.to_string())?;
+            let id: i64 = sqlx::query_scalar("INSERT INTO toonflow.assets(name,type,description,project_id,start_time) VALUES($1,$2,$3,$4,$5) RETURNING id")
+                .bind(&asset_name).bind(&asset_type).bind(asset.desc.trim()).bind(project_id).bind(chrono::Utc::now().timestamp_millis())
+                .fetch_one(&mut *tx).await.map_err(|error|error.to_string())?;
             id
         };
         sqlx::query("INSERT INTO toonflow.project_assets(project_id,asset_id,linked_at) VALUES($1,$2,$3) ON CONFLICT DO NOTHING")
@@ -380,7 +379,7 @@ async fn extract_group(
         }
     }
     let mut retained_appearance_ids = Vec::new();
-    for (offset, appearance) in result.appearances.into_iter().enumerate() {
+    for appearance in result.appearances.into_iter() {
         if !script_ids.contains(&appearance.script_id)
             || appearance.role_name.trim().is_empty()
             || appearance.name.trim().is_empty()
@@ -405,9 +404,7 @@ async fn extract_group(
         let Some(role_asset_id) = role_asset_id else {
             continue;
         };
-        let id = chrono::Utc::now().timestamp_micros() + offset as i64;
-        let retained_id: i64 = sqlx::query_scalar("INSERT INTO toonflow.character_appearances(id,project_id,script_id,role_asset_id,name,age_stage,scenes,costume_prompt,description,create_time,update_time) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10) ON CONFLICT(script_id,role_asset_id,age_stage,name) DO UPDATE SET scenes=excluded.scenes,costume_prompt=excluded.costume_prompt,description=excluded.description,update_time=excluded.update_time RETURNING id")
-            .bind(id)
+        let retained_id: i64 = sqlx::query_scalar("INSERT INTO toonflow.character_appearances(project_id,script_id,role_asset_id,name,age_stage,scenes,costume_prompt,description,create_time,update_time) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$9) ON CONFLICT(script_id,role_asset_id,age_stage,name) DO UPDATE SET scenes=excluded.scenes,costume_prompt=excluded.costume_prompt,description=excluded.description,update_time=excluded.update_time RETURNING id")
             .bind(project_id)
             .bind(appearance.script_id)
             .bind(role_asset_id)
@@ -450,7 +447,6 @@ pub async fn extract_assets(
         .await
         .map_err(AppError::bad_request)?
         .to_string();
-    let task_id = chrono::Utc::now().timestamp_micros();
     let mut tx = state
         .pool
         .begin()
@@ -463,8 +459,8 @@ pub async fn extract_assets(
     }
     let related_objects = json!({"scriptIds":request.script_ids}).to_string();
     let task_input = json!({"projectId":request.project_id,"scriptIds":request.script_ids,"groupSize":request.group_size.unwrap_or(5).clamp(1,20)});
-    sqlx::query("INSERT INTO toonflow.tasks(id,project_id,task_class,related_objects,model,description,state,start_time,input,progress_current,progress_total) SELECT $1,$2,'scriptAssetExtraction',$3,$4,'剧本资产提取','running',$5,$6,0,$7 FROM toonflow.projects WHERE id=$2")
-        .bind(task_id).bind(request.project_id).bind(related_objects).bind(task_model).bind(chrono::Utc::now().timestamp_millis()).bind(task_input).bind(request.script_ids.len() as i32).execute(&mut *tx).await.map_err(|_|AppError::internal("failed to create asset extraction task"))?;
+    let task_id: i64 = sqlx::query_scalar("INSERT INTO toonflow.tasks(project_id,task_class,related_objects,model,description,state,start_time,input,progress_current,progress_total) SELECT $1,'scriptAssetExtraction',$2,$3,'剧本资产提取','running',$4,$5,0,$6 FROM toonflow.projects WHERE id=$1 RETURNING id")
+        .bind(request.project_id).bind(related_objects).bind(task_model).bind(chrono::Utc::now().timestamp_millis()).bind(task_input).bind(request.script_ids.len() as i32).fetch_one(&mut *tx).await.map_err(|_|AppError::internal("failed to create asset extraction task"))?;
     tx.commit()
         .await
         .map_err(|_| AppError::internal("failed to queue asset extraction"))?;

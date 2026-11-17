@@ -359,7 +359,7 @@ function generation(track: any) {
   track.generation.duration = Number(track.duration || storyboard?.duration || track.generation.duration || 4);
   track.generation.mode ??= defaultVideoGenerationMode(storyboards.length, props.videoMode);
   track.generation.model ??= props.videoModel;
-  track.generation.resolution ??= '1080p';
+  track.generation.resolution ??= '720p';
   return track.generation;
 }
 
@@ -979,7 +979,7 @@ onActivated(() => {
           <aside class="editor-properties">
             <header><div class="editor-panel-title"><b>视频属性</b><small>当前片段设置</small></div></header>
             <label><span>画面比例</span><b>{{ videoRatio || '16:9' }}</b></label>
-            <label><span>分辨率</span><b>1080p</b></label>
+            <label><span>分辨率</span><b>720p</b></label>
             <label><span>当前场次</span><b>{{ activeEditorClip?.sceneName || '—' }}</b></label>
             <label><span>当前片段</span><b>{{ activeEditorClip?.duration || 0 }}s</b></label>
             <label><span>成片时长</span><b>{{ totalDuration }}s</b></label>

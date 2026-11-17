@@ -2,10 +2,6 @@ pub(crate) fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-pub(crate) fn next_id(offset: i64) -> i64 {
-    now_ms() + offset
-}
-
 pub(crate) fn video_ratio(value: &str) -> &str {
     if value.trim().is_empty() {
         "16:9"

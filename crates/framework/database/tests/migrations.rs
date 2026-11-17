@@ -32,7 +32,7 @@ async fn applies_all_migrations_to_empty_postgres() {
         .fetch_one(&pool)
         .await
         .expect("read migration history");
-    assert_eq!(applied, 27);
+    assert_eq!(applied, 29);
 
     sqlx::raw_sql(include_str!(
         "../../../../sql/postgresql/0022_video_export_timeline.sql"
@@ -218,6 +218,41 @@ async fn applies_all_migrations_to_empty_postgres() {
     .await
     .expect("inspect retired DouBao platform identifier");
     assert_eq!(legacy_platform_rows, 0);
+
+    sqlx::raw_sql(include_str!(
+        "../../../../sql/postgresql/0028_ollama_supported_model_types.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("Ollama supported model types migration is idempotent");
+
+    let ollama_types: Vec<String> = sqlx::query_scalar(
+        "SELECT supported_types FROM ai.model_platforms WHERE platform='Ollama'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect Ollama supported model types");
+    assert_eq!(
+        ollama_types,
+        vec![
+            "chat",
+            "image",
+            "video",
+            "speech",
+            "transcription",
+            "music",
+            "embedding",
+            "rerank"
+        ]
+    );
+
+    let compatible_types: Vec<String> = sqlx::query_scalar(
+        "SELECT supported_types FROM ai.model_platforms WHERE platform='OpenAICompatible'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect OpenAI compatible supported model types");
+    assert_eq!(ollama_types, compatible_types);
 
     sqlx::raw_sql(include_str!(
         "../../../../sql/postgresql/0016_align_event_extraction_prompt.sql"
@@ -1645,6 +1680,84 @@ async fn applies_all_migrations_to_empty_postgres() {
             .is_some_and(|value| value.contains("video_id_seq")),
         "toonflow video ids must come from the database sequence"
     );
+
+    sqlx::raw_sql(include_str!(
+        "../../../../sql/postgresql/0029_toonflow_content_id_sequences.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("toonflow content id sequence migration is idempotent");
+
+    for table in [
+        "agent_memories",
+        "agent_runs",
+        "agent_tool_calls",
+        "art_styles",
+        "assets",
+        "character_appearances",
+        "events",
+        "image_flows",
+        "images",
+        "novels",
+        "projects",
+        "scripts",
+        "storyboards",
+        "video_tracks",
+    ] {
+        let default: Option<String> = sqlx::query_scalar(
+            "SELECT column_default
+             FROM information_schema.columns
+             WHERE table_schema='toonflow' AND table_name=$1 AND column_name='id'",
+        )
+        .bind(table)
+        .fetch_one(&pool)
+        .await
+        .expect("inspect toonflow content id default");
+        assert!(
+            default
+                .as_deref()
+                .is_some_and(|value| value.contains(&format!("{table}_id_seq"))),
+            "toonflow {table} ids must come from the database sequence"
+        );
+    }
+
+    // Two batches minted in the same millisecond must not collide any more.
+    let probe_project: i64 = sqlx::query_scalar(
+        "INSERT INTO toonflow.projects(name,create_time,update_time)
+         VALUES('toonflow id sequence probe',0,0) RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("create novel probe project");
+    let first_batch: Vec<i64> = sqlx::query_scalar(
+        "INSERT INTO toonflow.novels(chapter_index,reel,chapter,chapter_data,project_id,create_time)
+         SELECT 1,'',format('sequence probe %s',g),'probe',$1,0
+         FROM generate_series(1,20) g RETURNING id",
+    )
+    .bind(probe_project)
+    .fetch_all(&pool)
+    .await
+    .expect("insert first novel probe batch");
+    let second_batch: Vec<i64> = sqlx::query_scalar(
+        "INSERT INTO toonflow.novels(chapter_index,reel,chapter,chapter_data,project_id,create_time)
+         SELECT 1,'',format('sequence probe %s',g),'probe',$1,0
+         FROM generate_series(1,20) g RETURNING id",
+    )
+    .bind(probe_project)
+    .fetch_all(&pool)
+    .await
+    .expect("insert second novel probe batch");
+    assert_eq!(first_batch.len(), 20);
+    assert_eq!(second_batch.len(), 20);
+    assert!(
+        first_batch.iter().all(|id| !second_batch.contains(id)),
+        "toonflow novel ids must not overlap between batches"
+    );
+    sqlx::query("DELETE FROM toonflow.projects WHERE id=$1")
+        .bind(probe_project)
+        .execute(&pool)
+        .await
+        .expect("remove novel probe project");
 
     let continuity_fk: Option<(String, String)> = sqlx::query_as(
         "SELECT pg_get_constraintdef(oid),confdeltype::text
