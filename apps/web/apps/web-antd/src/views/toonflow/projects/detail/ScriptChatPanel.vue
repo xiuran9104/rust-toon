@@ -9,5 +9,14 @@ const props = defineProps<{ context: any }>();
 // Refill the workspace tabs from the persisted script workspace on every
 // mount, independent of the loadAll timing.
 onMounted(() => void props.context.restoreScriptWorkspace?.());
+// A durable run that finished while this panel was disconnected (or being
+// reattached after reconnect) may have written new skeleton/strategy/scripts;
+// clear the possibly-stale tabs and restore from the persisted workspace.
+function onRunSettled() {
+  props.context.workspaceTabs?.forEach((tab: { content: string }) => {
+    tab.content = '';
+  });
+  void props.context.restoreScriptWorkspace?.();
+}
 </script>
-<template><section class="detail-panel detail-panel--chat"><Row :gutter="16"><Col :span="8"><AgentChat :ref="context.setAgentChatRef" agent-type="scriptAgent" :project-id="context.projectId" :messages="context.scriptChatMessages" @clear-memory="context.clearScriptAgentMemory" @tool-result="context.onAgentToolResult" /></Col><Col :span="16"><Card class="workspace-card" size="small" title="剧本创作工作区"><template #extra><Space><Popconfirm title="确认清除剧本 Agent 的对话和工作区？" @confirm="context.resetAgentWorkspace"><Button>重新开始</Button></Popconfirm><Button @click="context.openScriptGeneration">开始创作</Button><Button type="primary" @click="context.saveAgentWorkspace">保存工作区</Button></Space></template><Tabs v-model:active-key="context.workspaceActiveTab" size="small"><Tabs.TabPane v-for="tab in context.workspaceTabs" :key="tab.key" :tab="tab.label"><div v-if="!tab.content" class="workspace-placeholder">剧本 Agent 将在此展示{{ tab.label }}...</div><div v-else class="workspace-output" v-html="context.renderMarkdown(tab.content)"></div></Tabs.TabPane></Tabs></Card></Col></Row></section></template>
+<template><section class="detail-panel detail-panel--chat"><Row :gutter="16"><Col :span="8"><AgentChat :ref="context.setAgentChatRef" agent-type="scriptAgent" :project-id="context.projectId" :messages="context.scriptChatMessages" @clear-memory="context.clearScriptAgentMemory" @run-settled="onRunSettled" @tool-result="context.onAgentToolResult" /></Col><Col :span="16"><Card class="workspace-card" size="small" title="剧本创作工作区"><template #extra><Space><Popconfirm title="确认清除剧本 Agent 的对话和工作区？" @confirm="context.resetAgentWorkspace"><Button>重新开始</Button></Popconfirm><Button @click="context.openScriptGeneration">开始创作</Button><Button type="primary" @click="context.saveAgentWorkspace">保存工作区</Button></Space></template><Tabs v-model:active-key="context.workspaceActiveTab" size="small"><Tabs.TabPane v-for="tab in context.workspaceTabs" :key="tab.key" :tab="tab.label"><div v-if="!tab.content" class="workspace-placeholder">剧本 Agent 将在此展示{{ tab.label }}...</div><div v-else class="workspace-output" v-html="context.renderMarkdown(tab.content)"></div></Tabs.TabPane></Tabs></Card></Col></Row></section></template>

@@ -22,6 +22,113 @@ use tracing::{info, warn};
 static ACTIVE_RUNS: LazyLock<Mutex<HashMap<i64, tokio::task::AbortHandle>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// durable 第三阶段：WebSocket 发起的运行也注册进进程活跃集。
+/// 这样 HTTP stop 能跨会话 abort 它，周期 recover_stale 也不会把
+/// 本进程仍在执行（但单轮超过租约窗口）的运行误判为中断。
+pub(crate) fn register_active_run(run_id: i64, handle: tokio::task::AbortHandle) {
+    ACTIVE_RUNS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(run_id, handle);
+}
+
+pub(crate) fn unregister_active_run(run_id: i64) {
+    ACTIVE_RUNS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&run_id);
+}
+
+/// 把按 token 到达的流式 delta 合并为约一个时间窗口一行的写入量。
+/// durable 路径与 WS 路径共用：`push` 在窗口到期时返回应落库的块，
+/// 流结束后用 `take_tail` 取走未跨窗口的尾部。Clone 共享同一缓冲，
+/// 流式回调与流结束后的调用方各持一份即可。
+#[derive(Clone)]
+pub(crate) struct DeltaBatcher {
+    state: std::sync::Arc<Mutex<DeltaBatchState>>,
+    interval: std::time::Duration,
+}
+
+struct DeltaBatchState {
+    buffer: String,
+    last_flush: std::time::Instant,
+}
+
+impl DeltaBatcher {
+    pub(crate) fn new(interval: std::time::Duration) -> Self {
+        Self {
+            state: std::sync::Arc::new(Mutex::new(DeltaBatchState {
+                buffer: String::new(),
+                last_flush: std::time::Instant::now(),
+            })),
+            interval,
+        }
+    }
+
+    /// 追加 delta；窗口到期时返回合并后的待写入块（调用方立刻持久化）。
+    pub(crate) fn push(&self, delta: &str) -> Option<String> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.buffer.push_str(delta);
+        if state.last_flush.elapsed() < self.interval {
+            return None;
+        }
+        state.last_flush = std::time::Instant::now();
+        Some(std::mem::take(&mut state.buffer))
+    }
+
+    /// 取走尾部残余；为空返回 None。回放不能被截断，流结束必须调用。
+    pub(crate) fn take_tail(&self) -> Option<String> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (!state.buffer.is_empty()).then(|| std::mem::take(&mut state.buffer))
+    }
+}
+
+/// 守卫式取消：仅当运行仍处于 running 时置为 canceled。返回是否生效。
+pub(crate) async fn mark_run_canceled(
+    pool: &sqlx::PgPool,
+    run_id: i64,
+    reason: &str,
+) -> Result<bool, sqlx::Error> {
+    let result =
+        sqlx::query("UPDATE toonflow.agent_runs SET state='canceled',error_reason=$2,finish_time=$3 WHERE id=$1 AND state='running'")
+            .bind(run_id)
+            .bind(reason)
+            .bind(now_ms())
+            .execute(pool)
+            .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// 查询某隔离键当前是否有 running 运行；重连时用于 emit run:active。
+pub(crate) async fn latest_running_run(
+    pool: &sqlx::PgPool,
+    agent_type: &str,
+    isolation_key: &str,
+) -> Result<Option<(i64, i64)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT id,start_time FROM toonflow.agent_runs WHERE agent_type=$1 AND isolation_key=$2 AND state='running' ORDER BY start_time DESC LIMIT 1",
+    )
+    .bind(agent_type)
+    .bind(isolation_key)
+    .fetch_optional(pool)
+    .await
+}
+
+/// 运行以错误收尾时的终态：用户主动中止归为 canceled，其余为 failed。
+fn terminal_state_for_error(error: &str) -> &'static str {
+    if error.contains("用户已中止") {
+        "canceled"
+    } else {
+        "failed"
+    }
+}
+
 type ProjectContextRow = (
     String,
     String,
@@ -1064,12 +1171,9 @@ async fn run_with_tools(
         }
         // Durable deltas arrive per token; coalesce them so a long generation
         // writes one row per ~200ms instead of one row per token.
-        const DELTA_FLUSH_INTERVAL: std::time::Duration =
-            std::time::Duration::from_millis(200);
+        let batcher = DeltaBatcher::new(std::time::Duration::from_millis(200));
+        let callback_batcher = batcher.clone();
         let event_pool = state.pool.clone();
-        let delta_buffer = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        let delta_buffer_tail = delta_buffer.clone();
-        let mut last_flush = std::time::Instant::now();
         let output = ai_client::project_text_stream(
             &state.pool,
             agent_key,
@@ -1077,26 +1181,12 @@ async fn run_with_tools(
             &complete_system,
             &prompt,
             move |delta: String| {
-                let chunk = {
-                    let mut buffer = delta_buffer
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    buffer.push_str(&delta);
-                    let flush_due = last_flush.elapsed() >= DELTA_FLUSH_INTERVAL;
-                    if flush_due {
-                        last_flush = std::time::Instant::now();
-                    }
-                    if flush_due {
-                        std::mem::take(&mut *buffer)
-                    } else {
-                        String::new()
-                    }
-                };
+                let chunk = callback_batcher.push(&delta);
                 let pool = event_pool.clone();
                 async move {
-                    if chunk.is_empty() {
+                    let Some(chunk) = chunk else {
                         return Ok(());
-                    }
+                    };
                     sqlx::query("INSERT INTO toonflow.agent_run_events(run_id,event_type,data,create_time)VALUES($1,'delta',$2,$3)").bind(run_id).bind(json!({"text":chunk})).bind(now_ms()).execute(&pool).await.map_err(|error|error.to_string())?;
                     Ok(())
                 }
@@ -1105,13 +1195,7 @@ async fn run_with_tools(
         .await?;
         // The stream tail never crossed the flush window; persist it too so
         // replay never truncates the final text.
-        let tail = {
-            let mut buffer = delta_buffer_tail
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            std::mem::take(&mut *buffer)
-        };
-        if !tail.is_empty() {
+        if let Some(tail) = batcher.take_tail() {
             sqlx::query("INSERT INTO toonflow.agent_run_events(run_id,event_type,data,create_time)VALUES($1,'delta',$2,$3)").bind(run_id).bind(json!({"text":tail})).bind(now_ms()).execute(&state.pool).await.map_err(|error|error.to_string())?;
         }
         let calls = parse_tool_calls(&output);
@@ -1168,7 +1252,10 @@ async fn run_with_tools(
     Err("Agent 工具调用超过最大轮数".to_string())
 }
 
-async fn create_run(state: &ToonState, request: &ChatRequest) -> Result<i64, AppError> {
+pub(crate) async fn create_run(
+    state: &ToonState,
+    request: &ChatRequest,
+) -> Result<i64, AppError> {
     validate_agent(&request.agent_type)?;
     if request.isolation_key.trim().is_empty() || request.content.trim().is_empty() {
         return Err(AppError::bad_request("isolationKey 和 content 不能为空"));
@@ -1250,6 +1337,9 @@ async fn perform_run(
 
 /// Run the agent with a WebSocket emitter for real-time streaming.
 /// Uses the proven run_with_tools() logic and visualizes the output.
+/// durable 第三阶段：WS 运行与 HTTP 运行同级持久化——事件写
+/// agent_run_events，每轮续租并感知 cancel_requested，结束时回写
+/// agent_runs 终态与 output；断连后任务照常跑完并落库。
 pub(crate) async fn run_with_emitter(
     state: &ToonState,
     request: &ChatRequest,
@@ -1258,6 +1348,79 @@ pub(crate) async fn run_with_emitter(
     msg_id: &str,
     text_cid: &str,
     mut abort_rx: watch::Receiver<bool>,
+    run_id: i64,
+) -> Result<String, String> {
+    record_run_event(
+        &state.pool,
+        run_id,
+        "started",
+        json!({"message": "Agent 已启动，正在读取项目上下文"}),
+    )
+    .await;
+    let result = run_with_emitter_inner(
+        state,
+        request,
+        agent_key,
+        emitter,
+        msg_id,
+        text_cid,
+        &mut abort_rx,
+        run_id,
+    )
+    .await;
+    match &result {
+        Ok(output) => {
+            // 记账失败不影响已流式送达的成功结果。
+            if let Err(error) = sqlx::query("UPDATE toonflow.agent_runs SET output=$2,state='success',finish_time=$3 WHERE id=$1 AND state='running'")
+                .bind(run_id)
+                .bind(output)
+                .bind(now_ms())
+                .execute(&state.pool)
+                .await
+            {
+                warn!(%error, run_id, "failed to finalize agent run state");
+            }
+            record_run_event(
+                &state.pool,
+                run_id,
+                "completed",
+                json!({"message": "Agent 已完成"}),
+            )
+            .await;
+        }
+        Err(error) => {
+            let final_state = terminal_state_for_error(error);
+            if let Err(update_error) = sqlx::query("UPDATE toonflow.agent_runs SET state=$2,error_reason=$3,finish_time=$4 WHERE id=$1 AND state='running'")
+                .bind(run_id)
+                .bind(final_state)
+                .bind(error)
+                .bind(now_ms())
+                .execute(&state.pool)
+                .await
+            {
+                warn!(%update_error, run_id, "failed to finalize agent run state");
+            }
+            record_run_event(
+                &state.pool,
+                run_id,
+                "failed",
+                json!({"message": "Agent 执行失败", "error": error}),
+            )
+            .await;
+        }
+    }
+    result
+}
+
+async fn run_with_emitter_inner(
+    state: &ToonState,
+    request: &ChatRequest,
+    agent_key: &str,
+    emitter: &WsEmitter,
+    msg_id: &str,
+    text_cid: &str,
+    abort_rx: &mut watch::Receiver<bool>,
+    run_id: i64,
 ) -> Result<String, String> {
     // Add user memory
     let _ = add_memory(
@@ -1311,10 +1474,33 @@ pub(crate) async fn run_with_emitter(
         if *abort_rx.borrow_and_update() {
             return Err("用户已中止".into());
         }
+        // durable 第三阶段：每轮续租并感知跨会话取消；其他会话 stop
+        // 置 cancel_requested 后，本轮结束即中止。
+        let canceled: Option<bool> = sqlx::query_scalar(
+            "UPDATE toonflow.agent_runs
+             SET lease_until=now()+interval '90 seconds',heartbeat_at=$2
+             WHERE id=$1 AND state='running'
+             RETURNING cancel_requested",
+        )
+        .bind(run_id)
+        .bind(now_ms())
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        match canceled {
+            Some(true) => return Err("用户已中止".into()),
+            None => return Err("运行已结束".into()),
+            Some(false) => {}
+        }
 
+        // WS 增量照常推送；同时按窗口合并落库一份，供重连后的
+        // 事件查看与审计回放。
+        let batcher = DeltaBatcher::new(std::time::Duration::from_millis(200));
+        let callback_batcher = batcher.clone();
         let stream_emitter = emitter.clone();
         let stream_message = msg_id.to_string();
         let stream_content = text_cid.to_string();
+        let event_pool = state.pool.clone();
         let raw = ai_client::project_text_tools_stream(
             &state.pool,
             agent_key,
@@ -1325,15 +1511,35 @@ pub(crate) async fn run_with_emitter(
                 let emitter = stream_emitter.clone();
                 let message = stream_message.clone();
                 let content = stream_content.clone();
+                let batcher = callback_batcher.clone();
+                let pool = event_pool.clone();
                 async move {
                     if let Some(text) = delta.get("content").and_then(Value::as_str) {
                         emitter.text_delta(&message, &content, text);
+                        if let Some(chunk) = batcher.push(text) {
+                            sqlx::query("INSERT INTO toonflow.agent_run_events(run_id,event_type,data,create_time)VALUES($1,'delta',$2,$3)")
+                                .bind(run_id)
+                                .bind(json!({"text":chunk}))
+                                .bind(now_ms())
+                                .execute(&pool)
+                                .await
+                                .ok();
+                        }
                     }
                     Ok(())
                 }
             },
         )
         .await?;
+        if let Some(tail) = batcher.take_tail() {
+            sqlx::query("INSERT INTO toonflow.agent_run_events(run_id,event_type,data,create_time)VALUES($1,'delta',$2,$3)")
+                .bind(run_id)
+                .bind(json!({"text":tail}))
+                .bind(now_ms())
+                .execute(&state.pool)
+                .await
+                .ok();
+        }
 
         let message = raw
             .pointer("/choices/0/message")
@@ -1396,6 +1602,14 @@ pub(crate) async fn run_with_emitter(
                 return Err(err);
             }
 
+            record_run_event(
+                &state.pool,
+                run_id,
+                "tool_call",
+                json!({"tool": name, "mode": "native"}),
+            )
+            .await;
+
             let tool_request = toonflow_agent_tools::ToolRequest {
                 agent_type: request.agent_type.clone(),
                 agent_key: Some(agent_key.to_string()),
@@ -1408,9 +1622,16 @@ pub(crate) async fn run_with_emitter(
             };
 
             match toonflow_agent_tools::execute_recorded(state, &tool_request).await {
-                Ok((_, value)) => {
+                Ok((record_id, value)) => {
                     let result_str = serde_json::to_string_pretty(&value).unwrap_or_default();
                     emitter.tool_call_success(msg_id, &tc_cid, &tool_call_id, &result_str);
+                    record_run_event(
+                        &state.pool,
+                        run_id,
+                        "tool_result",
+                        json!({"callId": record_id, "tool": name, "success": true}),
+                    )
+                    .await;
                     messages.push(
                         json!({"role":"tool","tool_call_id":call_id,"content":value.to_string()}),
                     );
@@ -1418,6 +1639,13 @@ pub(crate) async fn run_with_emitter(
                 Err(error) => {
                     let err_str = format!("{error:?}");
                     emitter.tool_call_error(msg_id, &tc_cid, &tool_call_id, &err_str);
+                    record_run_event(
+                        &state.pool,
+                        run_id,
+                        "tool_result",
+                        json!({"tool": name, "success": false, "error": err_str}),
+                    )
+                    .await;
                     if stop_run_after_tool_failure(name) {
                         return Err(format!("{name} 执行失败：{err_str}"));
                     }
@@ -1550,6 +1778,19 @@ pub async fn prune_agent_run_events(
         .execute(pool)
         .await?;
     Ok(result.rows_affected())
+}
+
+/// 周期僵尸运行回收：durable 第三阶段前 recover_stale 只在 chat/start/retry
+/// 入口触发，进程崩溃遗留的 running 行要等下一次用户操作才会被标记。
+/// 每分钟回收一次（本地活跃集被排除，只处理租约过期的行），gateway 启动时挂载。
+pub fn spawn_agent_run_recovery(state: ToonState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            recover_stale(&state).await;
+        }
+    })
 }
 
 /// 事件保留策略：流式 delta 让 agent_run_events 增长很快，按天定期清理
@@ -1862,9 +2103,33 @@ pub(crate) async fn clear_memory_records(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_resume_directive, format_chapter_ranges, parse_native_tool_arguments,
-        parse_tool_calls, pipeline_rule, stop_run_after_tool_failure, tool_names,
+        DeltaBatcher, build_resume_directive, format_chapter_ranges,
+        parse_native_tool_arguments, parse_tool_calls, pipeline_rule,
+        stop_run_after_tool_failure, terminal_state_for_error, tool_names,
     };
+
+    #[test]
+    fn delta_batcher_flushes_by_window_and_returns_tail() {
+        // 零间隔窗口：每次 push 立即冲刷。
+        let mut batcher = DeltaBatcher::new(std::time::Duration::from_millis(0));
+        assert_eq!(batcher.push("a"), Some("a".to_string()));
+        assert_eq!(batcher.push("b"), Some("b".to_string()));
+        assert_eq!(batcher.take_tail(), None);
+
+        // 长窗口：合并到窗口外的尾部由 take_tail 补齐。
+        let batcher = DeltaBatcher::new(std::time::Duration::from_secs(3600));
+        let shared = batcher.clone();
+        assert_eq!(shared.push("hel"), None);
+        assert_eq!(shared.push("lo"), None);
+        assert_eq!(batcher.take_tail(), Some("hello".to_string()));
+        assert_eq!(batcher.take_tail(), None);
+    }
+
+    #[test]
+    fn terminal_state_maps_user_abort_to_canceled() {
+        assert_eq!(terminal_state_for_error("用户已中止"), "canceled");
+        assert_eq!(terminal_state_for_error("模型请求了未授权工具 x"), "failed");
+    }
 
     #[test]
     fn session_keys_bind_history_to_a_canonical_project_and_script() {
@@ -2037,6 +2302,91 @@ mod agent_event_retention_database_tests {
         .await
         .unwrap();
         assert_eq!(remaining, 1);
+
+        sqlx::query("DELETE FROM toonflow.projects WHERE id=$1")
+            .bind(project_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod agent_run_lifecycle_database_tests {
+    use std::time::Duration;
+
+    use rust_toon_framework_database::{DatabaseConfig, connect, migrate};
+
+    use super::{latest_running_run, mark_run_canceled};
+
+    #[tokio::test]
+    #[ignore = "run with script/test-database-migrations.sh"]
+    async fn latest_running_run_and_guarded_cancellation_round_trip() {
+        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is required");
+        let config = DatabaseConfig::new(url, 1, 5, Duration::from_secs(10)).unwrap();
+        let pool = connect(&config).await.unwrap();
+        migrate(&pool).await.unwrap();
+        let project_id = 9_400_000_i64;
+        let isolation = "test:run:lifecycle";
+        sqlx::query("DELETE FROM toonflow.projects WHERE id=$1")
+            .bind(project_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO toonflow.projects(id,name,create_time,update_time) VALUES($1,'agent run lifecycle test',0,0)")
+            .bind(project_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM toonflow.agent_runs WHERE isolation_key=$1")
+            .bind(isolation)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // 无运行时查询为空。
+        assert_eq!(
+            latest_running_run(&pool, "scriptAgent", isolation).await.unwrap(),
+            None
+        );
+
+        // 两条 running：返回 start_time 最新的那条。
+        for (run_id, start_time) in [(9_400_010_i64, 1_000_i64), (9_400_011, 2_000)] {
+            sqlx::query("INSERT INTO toonflow.agent_runs(id,agent_type,isolation_key,project_id,input,state,start_time) VALUES($1,'scriptAgent',$2,$3,'go','running',$4)")
+                .bind(run_id)
+                .bind(isolation)
+                .bind(project_id)
+                .bind(start_time)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            latest_running_run(&pool, "scriptAgent", isolation)
+                .await
+                .unwrap(),
+            Some((9_400_011, 2_000))
+        );
+
+        // 守卫式取消只影响 running 行，重复取消返回 false。
+        assert!(mark_run_canceled(&pool, 9_400_011, "用户已中止")
+            .await
+            .unwrap());
+        assert!(!mark_run_canceled(&pool, 9_400_011, "用户已中止")
+            .await
+            .unwrap());
+        assert_eq!(
+            latest_running_run(&pool, "scriptAgent", isolation).await.unwrap(),
+            Some((9_400_010, 1_000))
+        );
+
+        // 其他隔离键互不可见。
+        assert_eq!(
+            latest_running_run(&pool, "productionAgent", isolation)
+                .await
+                .unwrap(),
+            None
+        );
 
         sqlx::query("DELETE FROM toonflow.projects WHERE id=$1")
             .bind(project_id)

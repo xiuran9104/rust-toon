@@ -421,6 +421,9 @@ async fn handle_socket(
     let (mut abort_tx, _abort_rx) = watch::channel(false);
     let mut active_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut active_message: Option<(String, String)> = None;
+    // durable 第三阶段：本会话最近发起的运行 ID。abort 会阻止任务体收尾，
+    // 因此 Chat/Stop/UpdateContext 在中止任务时同步把运行行标记为 canceled。
+    let mut active_run_id: Option<i64> = None;
 
     // New clients restore one bounded history page in a single frame. Keep the
     // legacy event stream for older deployed frontends during rolling updates.
@@ -501,6 +504,25 @@ async fn handle_socket(
         emitter.text_delta(&greeting_id, &greeting_cid, greeting);
         emitter.text_complete(&greeting_id, &greeting_cid);
         emitter.update_message(&greeting_id, "complete", None);
+    }
+
+    // durable 第三阶段：若该隔离键仍有运行中的任务（例如用户在运行中途
+    // 刷新了页面），通知客户端重新挂载"执行中"指示并跟随到终态。
+    match toonflow_agents::latest_running_run(
+        &state.pool,
+        &agent_type,
+        &params.isolation_key,
+    )
+    .await
+    {
+        Ok(Some((run_id, start_time))) => {
+            emitter.send_json(&json!({
+                "event": "run:active",
+                "data": { "runId": run_id, "state": "running", "startTime": start_time }
+            }));
+        }
+        Ok(None) => {}
+        Err(error) => warn!(%error, "failed to check for an in-flight agent run"),
     }
 
     // Revalidate idle connections too; each command also checks current access.
@@ -606,6 +628,20 @@ async fn handle_socket(
                     );
                     emitter.text_complete(&old_message, &old_content);
                 }
+                // abort 阻止任务体收尾，这里同步把旧运行的持久化行收掉。
+                if let Some(old_run_id) = active_run_id.take() {
+                    toonflow_agents::unregister_active_run(old_run_id);
+                    match toonflow_agents::mark_run_canceled(
+                        &state.pool,
+                        old_run_id,
+                        "用户开始了新的 Agent 运行",
+                    )
+                    .await
+                    {
+                        Ok(_) => {}
+                        Err(error) => warn!(%error, run_id = old_run_id, "failed to cancel superseded agent run"),
+                    }
+                }
 
                 // Build the agent request
                 let request = toonflow_agents::ChatRequest {
@@ -625,6 +661,26 @@ async fn handle_socket(
                 let (new_abort_tx, new_abort_rx) = watch::channel(false);
                 abort_tx = new_abort_tx;
 
+                // durable 第三阶段：WS 运行入库，重连可查、任何会话可停。
+                let run_id = match toonflow_agents::create_run(&state, &request).await {
+                    Ok(id) => id,
+                    Err(error) => {
+                        emitter.text_delta(
+                            &msg_id,
+                            &text_cid,
+                            &format!("\n\n错误：{}", friendly_error(&format!("{error:?}"))),
+                        );
+                        emitter.text_complete(&msg_id, &text_cid);
+                        emitter.update_message(&msg_id, "error", Some(&format!("{error:?}")));
+                        continue;
+                    }
+                };
+                active_run_id = Some(run_id);
+                emitter.send_json(&json!({
+                    "event": "run:started",
+                    "data": { "runId": run_id, "state": "running" }
+                }));
+
                 // Spawn agent execution
                 let exec_emitter = emitter.clone();
                 let exec_state = state.clone();
@@ -633,7 +689,7 @@ async fn handle_socket(
                 let exec_text_cid = text_cid.clone();
                 let exec_abort_rx = new_abort_rx;
 
-                active_task = Some(tokio::spawn(async move {
+                let spawned = tokio::spawn(async move {
                     let result = toonflow_agents::run_with_emitter(
                         &exec_state,
                         &request,
@@ -642,6 +698,7 @@ async fn handle_socket(
                         &exec_msg_id,
                         &exec_text_cid,
                         exec_abort_rx,
+                        run_id,
                     )
                     .await;
 
@@ -661,7 +718,12 @@ async fn handle_socket(
                             exec_emitter.update_message(&exec_msg_id, "error", Some(&error));
                         }
                     }
-                }));
+                    // 任务体自然结束（含 Err 与被 Stop 协作中止）时注销；
+                    // 被 abort 的路径由 Chat/Stop/UpdateContext 分支注销。
+                    toonflow_agents::unregister_active_run(run_id);
+                });
+                toonflow_agents::register_active_run(run_id, spawned.abort_handle());
+                active_task = Some(spawned);
                 active_message = Some((msg_id, text_cid));
             }
 
@@ -673,6 +735,15 @@ async fn handle_socket(
                 if let Some((message_id, content_id)) = active_message.take() {
                     emitter.text_complete(&message_id, &content_id);
                     emitter.update_message(&message_id, "canceled", Some("用户已中止"));
+                }
+                if let Some(run_id) = active_run_id.take() {
+                    toonflow_agents::unregister_active_run(run_id);
+                    if let Err(error) =
+                        toonflow_agents::mark_run_canceled(&state.pool, run_id, "用户已中止")
+                            .await
+                    {
+                        warn!(%error, run_id, "failed to cancel agent run");
+                    }
                 }
             }
 
@@ -722,6 +793,15 @@ async fn handle_socket(
                 let _ = abort_tx.send(true);
                 if let Some(task) = active_task.take() { task.abort(); }
                 active_message = None;
+                if let Some(run_id) = active_run_id.take() {
+                    toonflow_agents::unregister_active_run(run_id);
+                    if let Err(error) =
+                        toonflow_agents::mark_run_canceled(&state.pool, run_id, "会话上下文已切换")
+                            .await
+                    {
+                        warn!(%error, run_id, "failed to cancel agent run on context switch");
+                    }
+                }
                 params.isolation_key = isolation_key;
                 params.project_id = project_id;
                 params.script_id = script_id;

@@ -23,6 +23,8 @@ import {
 
 import { buildWebSocketUrl } from '#/utils/websocket';
 
+import { getAgentRunState, stopAgent } from '#/api/toonflow';
+
 import { assetFileUrl } from '../assets/asset-types';
 import { useAgentChatRun } from './agent-chat-run';
 import {
@@ -30,6 +32,7 @@ import {
   historyContentPreview,
   mergeAgentHistory,
 } from './agent-chat-history';
+import { createRunWatcher } from './agent-run-watch';
 
 const props = defineProps<{
   agentType: 'productionAgent' | 'scriptAgent';
@@ -43,6 +46,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: 'activity', payload: { status: string; toolName: string }): void;
   (e: 'clear-memory', memoryType: 'all' | 'message' | 'summary'): void;
+  (e: 'run-settled', payload: { runId: number; state: string }): void;
   (e: 'workspace-preview', payload: { key: 'scriptPlan' | 'storyboardTable'; value: string }): void;
   (e: 'tool-result', payload: { result: any; status: string; toolName: string }): void;
 }>();
@@ -78,6 +82,37 @@ const liveMessageIds = new Set<string>();
 const workspacePreviewValues = new Map<string, string>();
 const messageById = new Map<string, AgentChatMessage>();
 const blockById = new Map<string, AgentChatContentBlock>();
+
+// durable 运行跟踪：run:started 记录本会话发起的运行；run:active 在重连时
+// 恢复“执行中”指示并轮询跟随到终态（运行已离开本 socket 的消息流）。
+const trackedRunId = ref<number>();
+function requestHistoryRefresh() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(
+    JSON.stringify({
+      type: 'history',
+      beforeId: null,
+      limit: AGENT_HISTORY_PAGE_SIZE,
+    }),
+  );
+}
+function handleReattachedTerminal(runId: number, state: string) {
+  trackedRunId.value = undefined;
+  run.reset();
+  emit('activity', {
+    status: state === 'success' ? 'complete' : state === 'canceled' ? 'canceled' : 'error',
+    toolName: '__agent__',
+  });
+  emit('run-settled', { runId, state });
+  requestHistoryRefresh();
+}
+const runWatcher = createRunWatcher({
+  fetchState: (runId) => getAgentRunState(runId),
+  onTerminal: handleReattachedTerminal,
+});
+watch(hasActiveRun, (active) => {
+  if (!active) trackedRunId.value = undefined;
+});
 const workspacePreviewPatterns = {
   scriptPlan: /<scriptPlan>([\s\S]*?)<\/scriptPlan>/,
   storyboardTable: /<storyboardTable>([\s\S]*?)<\/storyboardTable>/,
@@ -279,6 +314,16 @@ function send(content: string) {
 }
 
 function stop() {
+  // 本会话消息流走 WS stop；被跟踪的 durable 运行（含重连挂载的）同时
+  // 调 HTTP stop，服务端置 cancel_requested 并 abort 本进程任务。
+  if (trackedRunId.value) {
+    const runId = trackedRunId.value;
+    trackedRunId.value = undefined;
+    runWatcher.stop();
+    void stopAgent(runId).catch(() => {
+      // 运行可能已自然结束；守卫式停止失败无需提示。
+    });
+  }
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   ws.send(JSON.stringify({ type: 'stop' }));
   run.reset();
@@ -444,6 +489,21 @@ function handleServerMessage(frame: any) {
       historyLoading.value = false;
       break;
     }
+    case 'run:started': {
+      // 本会话发起的 durable 运行：记录 ID 供停止按钮跨会话调用。
+      if (data.runId) trackedRunId.value = data.runId;
+      break;
+    }
+    case 'run:active': {
+      // 重连时后端仍有运行中的任务：恢复“执行中”指示并轮询跟随到终态。
+      const runId = data.runId;
+      if (runId && !hasActiveRun.value) {
+        trackedRunId.value = runId;
+        run.begin();
+        runWatcher.watch(runId);
+      }
+      break;
+    }
     case 'message': {
       const msg: AgentChatMessage = {
         id: data.id,
@@ -500,6 +560,7 @@ function scrollToBottom(force = false) {
 
 onBeforeUnmount(() => {
   disposed = true;
+  runWatcher.dispose();
   window.clearTimeout(restoreTimer);
   window.clearTimeout(historyFallbackTimer);
   window.clearTimeout(workspacePreviewTimer);
