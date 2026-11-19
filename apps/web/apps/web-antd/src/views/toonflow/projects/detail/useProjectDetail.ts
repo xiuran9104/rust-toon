@@ -259,8 +259,16 @@ export function useProjectDetail(fixedProjectId?: number) {
     }
   }
 
-  function onAgentToolResult(payload: { result: any; toolName: string }) {
-    const { toolName, result } = payload;
+  function onAgentToolResult(payload: {
+    result: any;
+    status?: string;
+    toolName: string;
+  }) {
+    const { toolName, result, status } = payload;
+    // A failed tool already surfaces its error inside the chat bubble with a
+    // ✗ marker; treat it as a no-op here so the error string never lands in a
+    // workspace tab and never completes a pipeline stage.
+    if (status === 'error') return;
     if (toolName === 'save_scripts') {
       workspaceActiveTab.value = 'script';
       updatePipelineStage(toolName, 'completed');
@@ -269,6 +277,7 @@ export function useProjectDetail(fixedProjectId?: number) {
           .map((script) => `### ${script.name}\n\n${script.content}`)
           .join('\n\n---\n\n');
       });
+      void refreshStatistics();
       return;
     }
     if (
@@ -548,15 +557,25 @@ export function useProjectDetail(fixedProjectId?: number) {
     { title: '操作', key: 'action', width: 220, fixed: 'right' as const },
   ];
 
+  async function refreshStatistics() {
+    const targetProjectId = projectId.value;
+    try {
+      const statisticData = await getProjectStatistics(targetProjectId);
+      if (!detailActive || targetProjectId !== projectId.value) return;
+      Object.assign(statistics, statisticData);
+    } catch {
+      // Header statistics are best-effort; the page keeps its previous values.
+    }
+  }
+
   async function loadProject() {
     const targetProjectId = projectId.value;
-    const [projectData, statisticData] = await Promise.all([
+    const [projectData] = await Promise.all([
       getProject(targetProjectId),
-      getProjectStatistics(targetProjectId),
+      refreshStatistics(),
     ]);
     if (!detailActive || targetProjectId !== projectId.value) return;
     project.value = projectData;
-    Object.assign(statistics, statisticData);
   }
 
   let novelLoadVersion = 0;
@@ -1434,7 +1453,11 @@ export function useProjectDetail(fixedProjectId?: number) {
     if (payload.toolName === '__agent__') {
       if (payload.status === 'pending' || payload.status === 'streaming') {
         if (!productionAgentSyncTimer) {
-          productionAgentSyncTimer = setInterval(() => void loadFlow(), 1800);
+          productionAgentSyncTimer = setInterval(() => {
+            // KeepAlive keeps this timer alive across stages; only the
+            // visible production canvas consumes the refresh.
+            if (activeTab.value === 'production') void loadFlow();
+          }, 1800);
         }
         productionAgentActivity.value = 'Agent 执行中';
       } else {
@@ -1939,6 +1962,12 @@ export function useProjectDetail(fixedProjectId?: number) {
     if (storyboardPollTimer) clearTimeout(storyboardPollTimer);
     storyboardPollAttempts = 0;
     const refresh = async () => {
+      if (activeTab.value !== 'production') {
+        // Stage hidden by KeepAlive: hold the loop without burning attempts
+        // or issuing requests; the next visible tick resumes normally.
+        storyboardPollTimer = setTimeout(refresh, 2000);
+        return;
+      }
       const generatingIds = storyboards.value
         .filter((item) => item.state === '生成中')
         .map((item) => item.id);
@@ -2067,6 +2096,12 @@ export function useProjectDetail(fixedProjectId?: number) {
     if (workflowRunPollTimer) clearTimeout(workflowRunPollTimer);
     observedWorkflowRunId = workflowRunId;
     const refresh = async () => {
+      if (activeTab.value !== 'production') {
+        // Stage hidden by KeepAlive: pause status requests until the user is
+        // back on the production canvas.
+        workflowRunPollTimer = setTimeout(refresh, 1500);
+        return;
+      }
       try {
         const run = await getWorkflowRun(workflowRunId);
         applyWorkflowRunNodes(run.nodes);
@@ -2342,6 +2377,11 @@ export function useProjectDetail(fixedProjectId?: number) {
     if (!detailActive) return;
     if (videoPollTimer) clearTimeout(videoPollTimer);
     const refresh = async () => {
+      if (activeTab.value !== 'production') {
+        // Stage hidden by KeepAlive: hold video status polling until visible.
+        videoPollTimer = setTimeout(refresh, 2000);
+        return;
+      }
       const project = Number(projectId.value);
       const script = Number(selectedScriptId.value);
       if (
@@ -2690,7 +2730,11 @@ export function useProjectDetail(fixedProjectId?: number) {
       agentType.value = 'scriptAgent';
       void restoreScriptWorkspace();
     }
-    if (tab === 'production') agentType.value = 'productionAgent';
+    if (tab === 'production') {
+      agentType.value = 'productionAgent';
+      // Pollers held while other stages were visible catch up here.
+      void loadFlow();
+    }
     if (tab !== 'production') {
       productionAgentCollapsed.value = true;
       stopProductionAgentSync();

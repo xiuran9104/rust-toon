@@ -85,6 +85,7 @@ pub use toonflow_video_export::{
 pub use toonflow_video_quality::{VIDEO_QUALITY_JOB_KIND, execute_distributed_quality};
 pub use toonflow_video::resume_interrupted_video_generations;
 pub use toonflow_workflow::resume_interrupted_workflow_runs;
+pub use toonflow_agents::spawn_agent_event_retention;
 
 const STORAGE_CLEANUP_CONCURRENCY: usize = 8;
 const STORAGE_CLEANUP_REFERENCE_RECHECK_SECONDS: u64 = 30;

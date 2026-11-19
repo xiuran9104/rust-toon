@@ -154,6 +154,7 @@ Gateway 与 Toon Worker 默认在各自监听端口暴露 `GET /metrics`，使�
 | `AI_REQUEST_RETRIES` | `2` | AI Provider 失败重试次数，实际最多 5 次；连接失败、超时、408/409/425/429 和 5xx 会指数退避重试，支持上游 `Retry-After` | `ai-server/src/provider.rs` |
 | `AI_VIDEO_POLL_INTERVAL_SECONDS` | `5` | 异步视频任务轮询间隔 | `toon-server/src/ai_client.rs` |
 | `AI_VIDEO_POLL_TIMEOUT_SECONDS` | `600` | 异步视频任务最长等待时间 | `toon-server/src/ai_client.rs` |
+| `AGENT_RUN_EVENTS_RETENTION_DAYS` | `30` | Agent 运行事件（含流式 delta）保留天数；Gateway 启动时立即清理一次过期事件，之后每 6 小时清理一次。设为 `<=0` 关闭清理，运行历史无限保留 | `toon-server/src/toonflow_agents.rs`、`gateway/src/main.rs` |
 
 ### 1.11 分布式任务与 Toon Worker
 

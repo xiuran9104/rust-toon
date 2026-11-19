@@ -44,7 +44,7 @@ const emit = defineEmits<{
   (e: 'activity', payload: { status: string; toolName: string }): void;
   (e: 'clear-memory', memoryType: 'all' | 'message' | 'summary'): void;
   (e: 'workspace-preview', payload: { key: 'scriptPlan' | 'storyboardTable'; value: string }): void;
-  (e: 'tool-result', payload: { result: any; toolName: string; }): void;
+  (e: 'tool-result', payload: { result: any; status: string; toolName: string }): void;
 }>();
 
 const accessStore = useAccessStore();
@@ -428,6 +428,7 @@ function handleServerMessage(frame: any) {
           emit('activity', { status: data.status, toolName });
           emit('tool-result', {
             toolName,
+            status: data.status,
             result: data.data?.result || block.data.result || block.data,
           });
         }

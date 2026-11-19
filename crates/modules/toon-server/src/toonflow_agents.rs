@@ -17,7 +17,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::watch;
-use tracing::warn;
+use tracing::{info, warn};
 
 static ACTIVE_RUNS: LazyLock<Mutex<HashMap<i64, tokio::task::AbortHandle>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -1062,16 +1062,58 @@ async fn run_with_tools(
             )
             .await;
         }
+        // Durable deltas arrive per token; coalesce them so a long generation
+        // writes one row per ~200ms instead of one row per token.
+        const DELTA_FLUSH_INTERVAL: std::time::Duration =
+            std::time::Duration::from_millis(200);
         let event_pool = state.pool.clone();
+        let delta_buffer = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let delta_buffer_tail = delta_buffer.clone();
+        let mut last_flush = std::time::Instant::now();
         let output = ai_client::project_text_stream(
             &state.pool,
             agent_key,
             request.project_id,
             &complete_system,
             &prompt,
-            move |delta| { let pool=event_pool.clone(); async move { sqlx::query("INSERT INTO toonflow.agent_run_events(run_id,event_type,data,create_time)VALUES($1,'delta',$2,$3)").bind(run_id).bind(json!({"text":delta})).bind(now_ms()).execute(&pool).await.map_err(|error|error.to_string())?;Ok(()) } },
+            move |delta: String| {
+                let chunk = {
+                    let mut buffer = delta_buffer
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    buffer.push_str(&delta);
+                    let flush_due = last_flush.elapsed() >= DELTA_FLUSH_INTERVAL;
+                    if flush_due {
+                        last_flush = std::time::Instant::now();
+                    }
+                    if flush_due {
+                        std::mem::take(&mut *buffer)
+                    } else {
+                        String::new()
+                    }
+                };
+                let pool = event_pool.clone();
+                async move {
+                    if chunk.is_empty() {
+                        return Ok(());
+                    }
+                    sqlx::query("INSERT INTO toonflow.agent_run_events(run_id,event_type,data,create_time)VALUES($1,'delta',$2,$3)").bind(run_id).bind(json!({"text":chunk})).bind(now_ms()).execute(&pool).await.map_err(|error|error.to_string())?;
+                    Ok(())
+                }
+            },
         )
         .await?;
+        // The stream tail never crossed the flush window; persist it too so
+        // replay never truncates the final text.
+        let tail = {
+            let mut buffer = delta_buffer_tail
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *buffer)
+        };
+        if !tail.is_empty() {
+            sqlx::query("INSERT INTO toonflow.agent_run_events(run_id,event_type,data,create_time)VALUES($1,'delta',$2,$3)").bind(run_id).bind(json!({"text":tail})).bind(now_ms()).execute(&state.pool).await.map_err(|error|error.to_string())?;
+        }
         let calls = parse_tool_calls(&output);
         if calls.is_empty() {
             return Ok(output);
@@ -1491,6 +1533,42 @@ async fn recover_stale(state: &ToonState) {
     // durable 第二阶段：只有租约已过期且不在本进程活跃集的运行才判中断；
     // 其他副本仍在心跳的运行不受影响。
     let _=sqlx::query("UPDATE toonflow.agent_runs SET state='interrupted',error_reason='服务重启导致任务中断',finish_time=$1 WHERE state='running' AND NOT(id=ANY($2)) AND (lease_until IS NULL OR lease_until<now())").bind(now_ms()).bind(active).execute(&state.pool).await;
+}
+
+/// 事件保留策略：流式 delta 让 agent_run_events 增长很快，按天定期清理
+/// 过期事件，避免运行历史无限膨胀。retention_days<=0 视为关闭清理。
+/// 任务循环幂等，gateway（单副本）启动时调用一次即可。
+pub fn spawn_agent_event_retention(
+    pool: sqlx::PgPool,
+    retention_days: i64,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if retention_days <= 0 {
+            warn!("agent run events retention disabled (AGENT_RUN_EVENTS_RETENTION_DAYS<=0)");
+            return;
+        }
+        // tokio interval 首个 tick 立即触发：启动时先清理一次，之后每 6 小时。
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+        loop {
+            interval.tick().await;
+            let cutoff = now_ms() - retention_days.saturating_mul(86_400_000);
+            match sqlx::query("DELETE FROM toonflow.agent_run_events WHERE create_time < $1")
+                .bind(cutoff)
+                .execute(&pool)
+                .await
+            {
+                Ok(result) => {
+                    if result.rows_affected() > 0 {
+                        info!(
+                            deleted = result.rows_affected(),
+                            retention_days, "pruned expired agent run events"
+                        );
+                    }
+                }
+                Err(error) => warn!(%error, "failed to prune agent run events"),
+            }
+        }
+    })
 }
 
 /// 对齐方案 P1 断点续跑：从数据库产物推断已完成阶段。全部为零时返回

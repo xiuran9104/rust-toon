@@ -87,6 +87,15 @@ async fn main() -> anyhow::Result<()> {
             resumed_runs, "resumed interrupted video generations and workflow runs"
         );
     }
+    // 事件保留策略：启动即清理一次，之后每 6 小时；<=0 关闭清理。
+    let agent_event_retention_days = std::env::var("AGENT_RUN_EVENTS_RETENTION_DAYS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .unwrap_or(30);
+    rust_toon_toon_server::spawn_agent_event_retention(
+        database.clone(),
+        agent_event_retention_days,
+    );
     let media_state = rust_toon_media_server::MediaState::new(database.clone(), tokens);
     system_state.bootstrap().await?;
     let database_auth = system_state.database_auth_state();
