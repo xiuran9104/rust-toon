@@ -41,7 +41,7 @@ argon2 = "0.5"
 base64 = "0.22"
 bcrypt = "0.17"
 axum = { version = "0.8", features = ["multipart"] }
-calamine = "0.36"
+calamine = "0.38"
 chrono = { version = "0.4", features = ["serde"] }
 croner = "3.0.1"
 jsonwebtoken = "9.3"

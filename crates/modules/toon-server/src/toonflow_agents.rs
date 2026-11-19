@@ -494,7 +494,7 @@ fn thinking_instruction(enabled: bool, level: i32) -> &'static str {
 
 fn pipeline_rule(agent_type: &str) -> &'static str {
     if agent_type == "scriptAgent" {
-        "\n\n## 流水线铁律\n1. 阶段必须串行：故事骨架 → 改编策略 → 剧本编写，禁止跳过或合并\n2. 阶段1故事骨架、阶段2改编策略完成后必须分别调用 run_supervision_agent 审核，并把审核报告展示给用户\n3. 用户确认阶段1/2审核结果后才能进入下一阶段\n4. 阶段3不调用监督层：必须按集序为每一集单独调用 run_sub_agent_script，每次只生成一集；全部集数完成后统一调用 save_scripts 写入，未保存不得宣称完成\n5. 用户给出明确原著章节范围但未指定集数或单集时长时，必须先调用 get_novel_events 读取该范围，依据事件数量、密度和情节完整性，主动给出明确的推荐集数、单集时长及简短理由，再等待用户确认；禁止仅显示“待确认”或继续把同一问题原样抛给用户\n6. 项目参数未全部确认前，不得调用任何生成或保存工具"
+        "\n\n## 流水线铁律\n1. 阶段必须串行：故事骨架 → 改编策略 → 剧本编写，禁止跳过或合并\n2. 阶段1故事骨架、阶段2改编策略完成后必须分别调用 run_supervision_agent 审核，并把审核报告展示给用户\n3. 用户确认阶段1/2审核结果后才能进入下一阶段\n4. 阶段3不调用监督层：必须按集序为每一集单独调用 run_sub_agent_script，每次只生成一集；全部集数完成后统一调用 save_scripts 写入，未保存不得宣称完成。工作区 scriptEpisodes 中已有的集数视为已完成的断点存档，直接纳入 save_scripts 保存或按需微调，禁止整集重新生成\n5. 用户给出明确原著章节范围但未指定集数或单集时长时，必须先调用 get_novel_events 读取该范围，依据事件数量、密度和情节完整性，主动给出明确的推荐集数、单集时长及简短理由，再等待用户确认；禁止仅显示“待确认”或继续把同一问题原样抛给用户\n6. 项目参数未全部确认前，不得调用任何生成或保存工具"
     } else {
         "\n\n## 生产流水线铁律\n1. 默认顺序：导演规划 → 按需人物造型衍生分析 → 用户确认后生成所需衍生图片 → 分镜表与监制审核 → 分镜面板 → 按需生成分镜图。\n2. 衍生资产只表示稳定、可复用且会改变整体识别外观的状态；瞬时表情、动作和局部特写留在分镜描述中。现有同一造型必须跨场复用，禁止重复生成。\n3. 项目描述和当前剧本决定世界观与时代事实；画风和导演手册只提供审美及镜头技法。古今混合题材必须逐元素保留各自年代。\n4. 每阶段必须读取实时工作区并以实际保存结果为完成依据。已有内容在原版本上修改，禁止只用文字声称写入或生成完成。\n5. 付费图片生成只处理用户确认的资产或分镜；重试前先读取任务与媒体状态，只重试失败或缺失项。\n6. 分镜表保存后必须使用最新版本自动复审；用户修改内容后旧审核结论失效。"
     }
@@ -1535,6 +1535,23 @@ async fn recover_stale(state: &ToonState) {
     let _=sqlx::query("UPDATE toonflow.agent_runs SET state='interrupted',error_reason='服务重启导致任务中断',finish_time=$1 WHERE state='running' AND NOT(id=ANY($2)) AND (lease_until IS NULL OR lease_until<now())").bind(now_ms()).bind(active).execute(&state.pool).await;
 }
 
+/// 单次清理：删除早于保留窗口的运行事件，返回删除行数。
+/// `retention_days<=0` 视为关闭保留，直接返回 0。
+pub async fn prune_agent_run_events(
+    pool: &sqlx::PgPool,
+    retention_days: i64,
+) -> Result<u64, sqlx::Error> {
+    if retention_days <= 0 {
+        return Ok(0);
+    }
+    let cutoff = now_ms() - retention_days.saturating_mul(86_400_000);
+    let result = sqlx::query("DELETE FROM toonflow.agent_run_events WHERE create_time < $1")
+        .bind(cutoff)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
 /// 事件保留策略：流式 delta 让 agent_run_events 增长很快，按天定期清理
 /// 过期事件，避免运行历史无限膨胀。retention_days<=0 视为关闭清理。
 /// 任务循环幂等，gateway（单副本）启动时调用一次即可。
@@ -1551,18 +1568,10 @@ pub fn spawn_agent_event_retention(
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
         loop {
             interval.tick().await;
-            let cutoff = now_ms() - retention_days.saturating_mul(86_400_000);
-            match sqlx::query("DELETE FROM toonflow.agent_run_events WHERE create_time < $1")
-                .bind(cutoff)
-                .execute(&pool)
-                .await
-            {
-                Ok(result) => {
-                    if result.rows_affected() > 0 {
-                        info!(
-                            deleted = result.rows_affected(),
-                            retention_days, "pruned expired agent run events"
-                        );
+            match prune_agent_run_events(&pool, retention_days).await {
+                Ok(deleted) => {
+                    if deleted > 0 {
+                        info!(deleted, retention_days, "pruned expired agent run events");
                     }
                 }
                 Err(error) => warn!(%error, "failed to prune agent run events"),
@@ -1953,5 +1962,86 @@ mod tests {
         // 只有剧本、没有分镜：从衍生后的阶段继续。
         let early = build_resume_directive(Some("第3集"), 600, 1, 0, 0, 0).unwrap();
         assert!(early.contains("从衍生造型确认后的下一阶段继续"));
+    }
+}
+
+#[cfg(test)]
+mod agent_event_retention_database_tests {
+    use std::time::Duration;
+
+    use rust_toon_framework_database::{DatabaseConfig, connect, migrate};
+    use serde_json::json;
+
+    use super::{now_ms, prune_agent_run_events};
+
+    #[tokio::test]
+    #[ignore = "run with script/test-database-migrations.sh"]
+    async fn prunes_only_events_older_than_the_retention_window() {
+        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is required");
+        let config = DatabaseConfig::new(url, 1, 5, Duration::from_secs(10)).unwrap();
+        let pool = connect(&config).await.unwrap();
+        migrate(&pool).await.unwrap();
+        let project_id = 9_300_000_i64;
+        let run_id = 9_300_001_i64;
+        sqlx::query("DELETE FROM toonflow.projects WHERE id=$1")
+            .bind(project_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO toonflow.projects(id,name,create_time,update_time) VALUES($1,'agent event retention test',0,0)")
+            .bind(project_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO toonflow.agent_runs(id,agent_type,isolation_key,project_id,input,state,start_time) VALUES($1,'scriptAgent','test:retention',$2,'go','success',0)")
+            .bind(run_id)
+            .bind(project_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let now = now_ms();
+        let day = 86_400_000_i64;
+        // 40 天前的事件落入 30 天保留窗口之外；1 天前的必须存活。
+        for (id, create_time) in
+            [(9_300_010_i64, now - 40 * day), (9_300_011_i64, now - day)]
+        {
+            sqlx::query("INSERT INTO toonflow.agent_run_events(id,run_id,event_type,data,create_time) VALUES($1,$2,'delta',$3,$4)")
+                .bind(id)
+                .bind(run_id)
+                .bind(json!({"text":"chunk"}))
+                .bind(create_time)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let deleted = prune_agent_run_events(&pool, 30).await.unwrap();
+        assert!(deleted >= 1, "expected the stale event to be pruned");
+        let surviving: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM toonflow.agent_run_events WHERE run_id=$1 ORDER BY id",
+        )
+        .bind(run_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(surviving, vec![9_300_011]);
+
+        // 关闭保留（<=0）时不删除任何行。
+        let disabled = prune_agent_run_events(&pool, 0).await.unwrap();
+        assert_eq!(disabled, 0);
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM toonflow.agent_run_events WHERE run_id=$1",
+        )
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 1);
+
+        sqlx::query("DELETE FROM toonflow.projects WHERE id=$1")
+            .bind(project_id)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 }

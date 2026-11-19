@@ -25,6 +25,38 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 const STORYBOARD_TABLE_AGENT_TOOLS: &[&str] = &["get_flowData", "set_flowData"];
 
+/// 解析剧本子 Agent 输出中的 `<scriptItem name="...">正文</scriptItem>` 列表。
+/// 按集断点保存依赖它把每次生成的集数写入工作区缓存。
+fn parse_script_items(output: &str) -> Vec<(String, String)> {
+    const OPEN_TAG: &str = "<scriptItem";
+    const CLOSE_TAG: &str = "</scriptItem>";
+    let mut items = Vec::new();
+    let mut rest = output;
+    while let Some(open) = rest.find(OPEN_TAG) {
+        let after_open = &rest[open..];
+        let Some(header_end) = after_open.find('>') else {
+            break;
+        };
+        let name = after_open[..header_end]
+            .split("name=\"")
+            .nth(1)
+            .and_then(|tail| tail.split('"').next())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let body = &after_open[header_end + 1..];
+        let Some(close) = body.find(CLOSE_TAG) else {
+            break;
+        };
+        let content = body[..close].trim().to_string();
+        if !name.is_empty() && !content.is_empty() {
+            items.push((name, content));
+        }
+        rest = &body[close + CLOSE_TAG.len()..];
+    }
+    items
+}
+
 #[cfg(test)]
 mod memory_tool_tests {
     use super::{
@@ -44,6 +76,20 @@ mod memory_tool_tests {
     fn missing_workspace_xml_is_returned_as_an_actionable_error() {
         let error = required_tagged("没有标签", "storySkeleton").unwrap_err();
         assert!(error.to_string().contains("未输出 <storySkeleton> 标签"));
+    }
+
+    #[test]
+    fn parse_script_items_extracts_named_episodes_only() {
+        let output = "前言说明\n<scriptItem name=\"第1集\">△开场动作</scriptItem>\n中间文字\n<scriptItem name=\"第2集\">△第二集动作</scriptItem>\n<broken>未闭合</scriptItem";
+        let items = super::parse_script_items(output);
+        assert_eq!(
+            items,
+            vec![
+                ("第1集".to_string(), "△开场动作".to_string()),
+                ("第2集".to_string(), "△第二集动作".to_string()),
+            ]
+        );
+        assert!(super::parse_script_items("没有剧本标签").is_empty());
     }
 
     #[tokio::test]
@@ -593,6 +639,8 @@ pub(crate) async fn execute_inner(
             tx.commit()
                 .await
                 .map_err(|_| AppError::internal("failed to commit generated scripts"))?;
+            // 剧本已正式落库，按集缓存完成使命，一并清除避免误导续写。
+            sqlx::query("UPDATE toonflow.agent_work_data SET data=data - 'scriptEpisodes' - 'scriptEpisodesUpdatedAt', update_time=$2 WHERE project_id=$1 AND episodes_id IS NULL AND key='scriptAgent'").bind(request.project_id).bind(now_ms()).execute(&state.pool).await.ok();
             Ok(json!({"saved":saved}))
         }
         ("scriptAgent", name)
@@ -862,6 +910,30 @@ pub(crate) async fn execute_inner(
                     "policyVersion": 2
                 });
                 sqlx::query("INSERT INTO toonflow.agent_work_data(project_id,episodes_id,key,data,create_time,update_time)VALUES($1,NULL,'scriptAgent',$2,$3,$3) ON CONFLICT(project_id,key) WHERE episodes_id IS NULL DO UPDATE SET data=excluded.data,update_time=excluded.update_time").bind(request.project_id).bind(data).bind(now_ms()).execute(&state.pool).await.map_err(|_|AppError::internal("failed to save sub agent result"))?;
+            }
+            if agent_key == "scriptAgent:scriptAgent" {
+                // 按集断点保存：剧本子 Agent 每完成一集立即落入工作区缓存。
+                // 运行中断后，决策 Agent 直接复用已完成集数续写剩余部分，
+                // save_scripts 落库成功后缓存清空。
+                let episodes = parse_script_items(&output);
+                if !episodes.is_empty() {
+                    let mut data:Value=sqlx::query_scalar("SELECT data FROM toonflow.agent_work_data WHERE project_id=$1 AND episodes_id IS NULL AND key='scriptAgent'").bind(request.project_id).fetch_optional(&state.pool).await.map_err(|_|AppError::internal("failed to load script workspace"))?.unwrap_or_else(||json!({"storySkeleton":"","adaptationStrategy":""}));
+                    if let Some(store) = data.as_object_mut() {
+                        let entry = store
+                            .entry("scriptEpisodes")
+                            .or_insert_with(|| json!({}));
+                        if let Some(map) = entry.as_object_mut() {
+                            for (name, content) in episodes {
+                                map.insert(name, json!(content));
+                            }
+                        }
+                        store.insert(
+                            "scriptEpisodesUpdatedAt".to_string(),
+                            json!(now_ms()),
+                        );
+                    }
+                    sqlx::query("INSERT INTO toonflow.agent_work_data(project_id,episodes_id,key,data,create_time,update_time)VALUES($1,NULL,'scriptAgent',$2,$3,$3) ON CONFLICT(project_id,key) WHERE episodes_id IS NULL DO UPDATE SET data=excluded.data,update_time=excluded.update_time").bind(request.project_id).bind(data).bind(now_ms()).execute(&state.pool).await.map_err(|_|AppError::internal("failed to save script episode checkpoints"))?;
+                }
             }
             Ok(json!({"agent":agent_key,"content":output,
                 "evidence":{"sourceChaptersRead":evidence.chapters,"workspaceRead":evidence.workspace,"singlePassQualityPolicy":quality_stage}}))

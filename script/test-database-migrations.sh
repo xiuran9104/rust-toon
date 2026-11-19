@@ -36,6 +36,7 @@ cargo test -p rust-toon-system-server login_lockout_database_tests -- --ignored 
 cargo test -p rust-toon-toon-server gateway_repair_database_tests -- --ignored --nocapture
 cargo test -p rust-toon-toon-server task_pagination_tests -- --ignored --nocapture
 cargo test -p rust-toon-toon-server agent_memory_database_tests -- --ignored --nocapture
+cargo test -p rust-toon-toon-server agent_event_retention_database_tests -- --ignored --nocapture
 cargo test -p rust-toon-toon-server \
   toonflow_video_export::tests::source_snapshot_blocks_video_delete_until_job_enqueue_commits \
   -- --ignored --nocapture

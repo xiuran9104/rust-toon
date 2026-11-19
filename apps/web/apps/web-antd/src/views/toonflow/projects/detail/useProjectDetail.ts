@@ -93,6 +93,7 @@ import {
   extractXmlContent,
   formatEventDisplay,
   renderMarkdown,
+  scriptWorkspaceTabsFromPlan,
 } from '../production-content';
 import { requestProductionScriptSwitch } from '../production-script-switch';
 import { normalizeProductionWorkflow } from '../production-workflow';
@@ -382,20 +383,21 @@ export function useProjectDetail(fixedProjectId?: number) {
         if (!detailActive) return;
         const data = plan?.data;
         if (!data) return;
+        const tabs = scriptWorkspaceTabsFromPlan(data);
         const restoredStages: string[] = [];
-        if (!workspaceTabs[0]!.content && data.storySkeleton) {
-          workspaceTabs[0]!.content = data.storySkeleton;
+        if (!workspaceTabs[0]!.content && tabs.storySkeleton) {
+          workspaceTabs[0]!.content = tabs.storySkeleton;
           restoredStages.push('skeleton');
         }
-        if (!workspaceTabs[1]!.content && data.adaptationStrategy) {
-          workspaceTabs[1]!.content = data.adaptationStrategy;
+        if (!workspaceTabs[1]!.content && tabs.adaptationStrategy) {
+          workspaceTabs[1]!.content = tabs.adaptationStrategy;
           restoredStages.push('adaptation');
         }
-        if (!workspaceTabs[2]!.content && data.script?.length) {
-          workspaceTabs[2]!.content = data.script
-            .map((script) => `### ${script.name}\n\n${script.content}`)
-            .join('\n\n---\n\n');
-          restoredStages.push('script');
+        if (!workspaceTabs[2]!.content && tabs.script) {
+          workspaceTabs[2]!.content = tabs.script;
+          // Only saved scripts complete the stage; episode checkpoints are
+          // intermediate progress and keep the stage in progress.
+          if (data.script?.length) restoredStages.push('script');
         }
         for (const key of restoredStages) {
           const stage = pipelineStages.find((item) => item.key === key);

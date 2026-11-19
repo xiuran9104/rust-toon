@@ -149,6 +149,9 @@ AI 能力域：
 
 - HTTP 接口 `/api/agents/*`（chat / start / runState / stop / events / retry / memories / runs / clearMemory / tools/execute）与剧本计划接口 `/api/scriptAgent/*`。
 - WebSocket：`GET /api/socket/{agent}`（别名 `/socket/{agent}`，`toonflow_ws.rs`），query 参数 `token`、`isolationKey`、`projectId`、`scriptId` 鉴权与隔离；客户端消息类型 `chat` / `stop` / `updateThinkConfig` / `updateContext`，协议对齐 Toonflow-app 的 socket 协议。
+- **运行生命周期与断连语义**：WS 会话断开（切页面、刷新）不再中止运行中的任务，任务分离继续执行并把记忆、工具记录与工作区写入持久化，下次进入可恢复；显式 `stop`、发起新会话或「重新开始」仍会中止当前运行。「重新开始」先 stop 再清理，并同步清空持久化剧本工作区（故事骨架/改编策略），剧本库中的成集剧本不受影响。
+- **剧本工作区持久化**：故事骨架/改编策略在每个子 Agent 成功后写入 `agent_work_data`；剧本子 Agent 每完成一集立即写入 `scriptEpisodes` 按集断点缓存，`save_scripts` 落库成功后清空。前端三个工作区 tab 进入页面时从 `getPlanData` 恢复，未保存的断点集数以提示样式展示；失败的工具结果不会写入工作区内容，也不会推进流水线阶段。
+- **事件历史与保留**：durable 运行的流式 delta 约 200ms 合并写入一行 `agent_run_events`；Gateway 启动时及每 6 小时按 `AGENT_RUN_EVENTS_RETENTION_DAYS`（默认 30，`<=0` 关闭）清理过期事件（`spawn_agent_event_retention`）。
 - 记忆向量化：取 `ai.model_configs` 中启用的 embedding 模型，经 `AiModelFactory` 生成向量写入 `toonflow.agent_memories`；写入长期记忆前会剥离协议 XML 标签。
 
 **文件与对象存储**：
