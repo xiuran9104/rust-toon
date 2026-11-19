@@ -543,12 +543,27 @@ function handleServerMessage(frame: any) {
 
 const chatContainer = ref<HTMLElement | null>(null);
 
-function scrollToBottom(force = false) {
+// 跟随滚动的真相源是用户的滚动位置：贴近底部（≤40px）视为“跟随”，
+// 一旦向上滚离就停止自动跟随，直到用户滚回底部或点击“回到底部”。
+// 内容增长本身不触发 scroll 事件，因此流式追加不会误关跟随。
+const stickToBottom = ref(true);
+const hasUnreadBelow = ref(false);
+
+function handleChatScroll() {
   const container = chatContainer.value;
   if (!container) return;
   const distanceFromBottom =
     container.scrollHeight - container.scrollTop - container.clientHeight;
-  if (!force && distanceFromBottom > 120) return;
+  stickToBottom.value = distanceFromBottom <= 40;
+  if (stickToBottom.value) hasUnreadBelow.value = false;
+}
+
+function scrollToBottom(force = false) {
+  if (!force && !stickToBottom.value) {
+    // 用户正在上方阅读：不打扰，只提示有新内容。
+    hasUnreadBelow.value = true;
+    return;
+  }
   if (scrollFrame !== undefined) return;
   scrollFrame = window.requestAnimationFrame(() => {
     scrollFrame = undefined;
@@ -558,6 +573,12 @@ function scrollToBottom(force = false) {
   });
 }
 
+function jumpToBottom() {
+  stickToBottom.value = true;
+  hasUnreadBelow.value = false;
+  scrollToBottom(true);
+}
+
 onBeforeUnmount(() => {
   disposed = true;
   runWatcher.dispose();
@@ -565,6 +586,7 @@ onBeforeUnmount(() => {
   window.clearTimeout(historyFallbackTimer);
   window.clearTimeout(workspacePreviewTimer);
   if (scrollFrame !== undefined) window.cancelAnimationFrame(scrollFrame);
+  chatContainer.value?.removeEventListener('scroll', handleChatScroll);
   disconnect();
 });
 
@@ -638,6 +660,9 @@ function useSuggestion(item: any) {
 onMounted(() => {
   disposed = false;
   rebuildMessageIndex();
+  chatContainer.value?.addEventListener('scroll', handleChatScroll, {
+    passive: true,
+  });
   connect();
 });
 
@@ -817,6 +842,13 @@ defineExpose({ connect, disconnect, send, stop, updateThinkConfig, connected });
           <button :class="{ active: ratings[msg.id] === 'bad' }" type="button" title="需要改进" @click="ratings[msg.id] = ratings[msg.id] === 'bad' ? undefined : 'bad'">👎</button>
         </div>
       </div>
+
+      <!-- 用户滚离底部时吸附在可视区底部的回底入口 -->
+      <div v-if="!stickToBottom" class="jump-to-bottom">
+        <Button size="small" shape="round" @click="jumpToBottom">
+          {{ hasUnreadBelow ? '↓ 有新消息' : '↓ 回到底部' }}
+        </Button>
+      </div>
     </div>
 
     <!-- Input area -->
@@ -895,6 +927,14 @@ defineExpose({ connect, disconnect, send, stop, updateThinkConfig, connected });
   gap: 12px;
 }
 .history-more { display: flex; justify-content: center; }
+
+/* 吸附在滚动可视区底部中央的回底按钮：sticky 不依赖外层定位 */
+.jump-to-bottom {
+  position: sticky;
+  bottom: 8px;
+  align-self: center;
+  z-index: 5;
+}
 
 .chat-empty {
   text-align: center;
