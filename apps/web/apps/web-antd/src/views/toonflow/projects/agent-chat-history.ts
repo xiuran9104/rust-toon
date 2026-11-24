@@ -11,7 +11,8 @@ export interface AgentChatContentBlock {
 export interface AgentChatMessage {
   content: AgentChatContentBlock[];
   datetime: string;
-  ext?: { error?: string };
+  /** `replay` marks a message rebuilt from persisted run events after a reconnect. */
+  ext?: { error?: string; replay?: boolean };
   historical?: boolean;
   id: string;
   name?: string;

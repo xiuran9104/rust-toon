@@ -6,6 +6,7 @@ import {
   historyContentPreview,
   mergeAgentHistory,
 } from './agent-chat-history';
+import { createReplayMessage } from './agent-run-replay';
 
 function message(
   id: string,
@@ -51,5 +52,20 @@ describe('agent chat history', () => {
       truncated: true,
     });
     expect(historyContentPreview(text, true, 8).text).toBe(text);
+  });
+
+  it('keeps a replay message when a snapshot or an older page arrives', () => {
+    // 回放消息住在同一个消息数组里，靠的是“在途消息会被保留”这条规则。
+    const replay = createReplayMessage(7);
+    expect(
+      mergeAgentHistory([replay], [message('memory:1')], false).map(
+        (item) => item.id,
+      ),
+    ).toEqual(['memory:1', 'run:7:replay']);
+    expect(
+      mergeAgentHistory([replay], [message('memory:0')], true).map(
+        (item) => item.id,
+      ),
+    ).toEqual(['memory:0', 'run:7:replay']);
   });
 });

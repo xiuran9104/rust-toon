@@ -6,7 +6,15 @@ import type {
   AgentHistoryFrame,
 } from './agent-chat-history';
 
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import {
+  computed,
+  nextTick,
+  onBeforeUnmount,
+  onMounted,
+  reactive,
+  ref,
+  watch,
+} from 'vue';
 
 import { useAppConfig } from '@vben/hooks';
 import { useAccessStore } from '@vben/stores';
@@ -23,7 +31,7 @@ import {
 
 import { buildWebSocketUrl } from '#/utils/websocket';
 
-import { getAgentRunState, stopAgent } from '#/api/toonflow';
+import { getAgentRunEvents, getAgentRunState, stopAgent } from '#/api/toonflow';
 
 import { assetFileUrl } from '../assets/asset-types';
 import { useAgentChatRun } from './agent-chat-run';
@@ -32,6 +40,10 @@ import {
   historyContentPreview,
   mergeAgentHistory,
 } from './agent-chat-history';
+import {
+  createReplayMessage,
+  createRunReplayer,
+} from './agent-run-replay';
 import { createRunWatcher } from './agent-run-watch';
 
 const props = defineProps<{
@@ -99,6 +111,8 @@ function requestHistoryRefresh() {
 function handleReattachedTerminal(runId: number, state: string) {
   trackedRunId.value = undefined;
   run.reset();
+  // 回放只是运行期间的临时视图，结束后的权威版本是刚写入的历史。
+  discardReplayMessages();
   emit('activity', {
     status: state === 'success' ? 'complete' : state === 'canceled' ? 'canceled' : 'error',
     toolName: '__agent__',
@@ -110,6 +124,32 @@ const runWatcher = createRunWatcher({
   fetchState: (runId) => getAgentRunState(runId),
   onTerminal: handleReattachedTerminal,
 });
+// 断线期间的输出不再经过本 socket，但事件是持久化的：从事件表回放成一条
+// 消息，跟随到运行结束。
+const runReplayer = createRunReplayer({
+  fetchEvents: (runId, afterId) => getAgentRunEvents(runId, afterId),
+  onUpdate: (changed, message) => {
+    // 处于 streaming 的在途消息会被历史合并保留（见 mergeAgentHistory）。
+    if (!props.messages.some((item) => item.id === message.id)) {
+      props.messages.push(message);
+      rebuildMessageIndex();
+    }
+    // 没有新内容就不动滚动位置，否则会把正在上翻阅读误判成“有新消息”。
+    if (changed) scrollToBottom();
+  },
+});
+function discardReplayMessages() {
+  runReplayer.stop();
+  const index = props.messages.findIndex((item) => item.ext?.replay);
+  if (index < 0) return;
+  props.messages.splice(index, 1);
+  rebuildMessageIndex();
+}
+function startReplay(runId: number, startTime?: number) {
+  discardReplayMessages();
+  // 响应式对象才能让回放过程中的修改触发界面更新。
+  runReplayer.start(reactive(createReplayMessage(runId, startTime)), runId);
+}
 watch(hasActiveRun, (active) => {
   if (!active) trackedRunId.value = undefined;
 });
@@ -243,6 +283,9 @@ function connect() {
       socket.close();
       return;
     }
+    // 上一个连接的回放随旧消息列表一起作废；运行若仍在进行，
+    // 服务端会重新下发 run:active。
+    runReplayer.stop();
     replaceMessages([]);
     resetHistoryState();
     completedToolCalls.clear();
@@ -290,6 +333,7 @@ function connect() {
 }
 
 function disconnect() {
+  runReplayer.stop();
   run.reset();
   shouldReconnect = false;
   clearReconnectTimer();
@@ -316,6 +360,8 @@ function send(content: string) {
 function stop() {
   // 本会话消息流走 WS stop；被跟踪的 durable 运行（含重连挂载的）同时
   // 调 HTTP stop，服务端置 cancel_requested 并 abort 本进程任务。
+  // 回放消息只存在于重连挂载的运行上。
+  const wasReattached = props.messages.some((item) => item.ext?.replay);
   if (trackedRunId.value) {
     const runId = trackedRunId.value;
     trackedRunId.value = undefined;
@@ -324,11 +370,14 @@ function stop() {
       // 运行可能已自然结束；守卫式停止失败无需提示。
     });
   }
+  if (wasReattached) discardReplayMessages();
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   ws.send(JSON.stringify({ type: 'stop' }));
   run.reset();
   liveMessageBudget = 0;
   liveMessageIds.clear();
+  // 重连挂载的运行没有本会话气泡：断线期间已完成的子 Agent 输出只在历史里。
+  if (wasReattached) requestHistoryRefresh();
 }
 
 function updateThinkConfig(think: boolean, thinkLevel: number) {
@@ -501,6 +550,7 @@ function handleServerMessage(frame: any) {
         trackedRunId.value = runId;
         run.begin();
         runWatcher.watch(runId);
+        startReplay(runId, data.startTime);
       }
       break;
     }
@@ -582,6 +632,7 @@ function jumpToBottom() {
 onBeforeUnmount(() => {
   disposed = true;
   runWatcher.dispose();
+  runReplayer.stop();
   window.clearTimeout(restoreTimer);
   window.clearTimeout(historyFallbackTimer);
   window.clearTimeout(workspacePreviewTimer);
@@ -744,6 +795,7 @@ defineExpose({ connect, disconnect, send, stop, updateThinkConfig, connected });
             {{ msg.role.startsWith('user') ? '你' : (msg.name || 'Agent') }}
           </span>
           <span class="message-time">{{ new Date(msg.datetime).toLocaleTimeString() }}</span>
+          <span v-if="msg.ext?.replay" class="message-replay-tag">重连同步中</span>
         </div>
 
         <!-- Content blocks -->
@@ -976,6 +1028,13 @@ defineExpose({ connect, disconnect, send, stop, updateThinkConfig, connected });
 }
 .message-role { font-weight: 600; }
 .message-time { color: var(--ant-color-text-tertiary); }
+.message-replay-tag {
+  color: var(--ant-color-text-tertiary);
+  border: 1px solid var(--ant-color-border);
+  border-radius: 10px;
+  padding: 0 6px;
+  font-size: 11px;
+}
 
 .content-block { margin-top: 4px; }
 .content-images { display: grid; gap: 8px; grid-template-columns: repeat(2, minmax(0, 1fr)); }.content-images img { display: block; width: 100%; max-height: 220px; border-radius: 9px; object-fit: cover; }

@@ -276,7 +276,8 @@ export namespace ToonflowApi {
   export interface CreativeManual { id: number; kind: 'director' | 'visual'; name: string; path: string; images: string[]; data: Array<{ label: string; value: string; data: string }>; createTime: number; updateTime: number }
   export interface AgentMemory { id: number; role: string; content: string; memoryType: 'message' | 'summary'; createTime: number }
   export interface AgentRun { id: number; agentType: string; isolationKey: string; projectId: number; scriptId?: number; input: string; output?: string; state: string; errorReason?: string; startTime: number; finishTime?: number; retryOfId?: number }
-  export interface AgentRunEvent { id: number; runId: number; eventType: string; data: { text?: string }; createTime: number }
+  /** `data` depends on `eventType`: deltas carry `text`, tool events carry `tool`/`success`/`error`. */
+  export interface AgentRunEvent { data: { error?: string; message?: string; success?: boolean; text?: string; tool?: string }; eventType: string; id: number; runId: number; createTime: number }
 }
 
 export const getArtStyles = () => requestClient.get<ToonflowApi.ArtStyle[]>('/toonflow/art-styles');
