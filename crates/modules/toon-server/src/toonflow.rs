@@ -1145,10 +1145,13 @@ pub async fn get_flow_data(
     ensure_script_in_project(&state.pool, request.project_id, request.episodes_id).await?;
     // 版本号先于数据读取：两者之间若有写入，版本号偏旧，下一轮轮询会再
     // 刷新一遍，不会漏。
-    let flow_version =
-        crate::toonflow_flow_version::production_flow_version(&state.pool, request.project_id, request.episodes_id)
-            .await
-            .map_err(|_| AppError::internal("failed to compute flow version"))?;
+    let flow_version = crate::toonflow_flow_version::production_flow_version(
+        &state.pool,
+        request.project_id,
+        request.episodes_id,
+    )
+    .await
+    .map_err(|_| AppError::internal("failed to compute flow version"))?;
     let flow: Option<(Value,)> = sqlx::query_as(
         "SELECT data FROM toonflow.agent_work_data WHERE project_id=$1 AND episodes_id=$2 AND key='productionAgent'",
     )
@@ -1200,10 +1203,13 @@ pub async fn get_flow_version(
     // 必须在这里补上，否则节点从 running 转为 interrupted 时版本号不会变化，
     // 画布会一直停在"运行中"。
     crate::toonflow_workflow::recover_stale_node_runs(&state).await;
-    let flow_version =
-        crate::toonflow_flow_version::production_flow_version(&state.pool, request.project_id, request.episodes_id)
-            .await
-            .map_err(|_| AppError::internal("failed to compute flow version"))?;
+    let flow_version = crate::toonflow_flow_version::production_flow_version(
+        &state.pool,
+        request.project_id,
+        request.episodes_id,
+    )
+    .await
+    .map_err(|_| AppError::internal("failed to compute flow version"))?;
     Ok(Json(ApiResponse::new(
         json!({ "flowVersion": flow_version }),
     )))

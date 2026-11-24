@@ -705,10 +705,8 @@ async fn handle_socket(
 
                     match result {
                         Ok(_) => {
-                            exec_emitter
-                                .text_complete(&exec_target.msg_id, &exec_target.text_cid);
-                            exec_emitter
-                                .update_message(&exec_target.msg_id, "complete", None);
+                            exec_emitter.text_complete(&exec_target.msg_id, &exec_target.text_cid);
+                            exec_emitter.update_message(&exec_target.msg_id, "complete", None);
                         }
                         Err(error) => {
                             let friendly = friendly_error(&error);
@@ -717,13 +715,8 @@ async fn handle_socket(
                                 &exec_target.text_cid,
                                 &format!("\n\n错误：{friendly}"),
                             );
-                            exec_emitter
-                                .text_complete(&exec_target.msg_id, &exec_target.text_cid);
-                            exec_emitter.update_message(
-                                &exec_target.msg_id,
-                                "error",
-                                Some(&error),
-                            );
+                            exec_emitter.text_complete(&exec_target.msg_id, &exec_target.text_cid);
+                            exec_emitter.update_message(&exec_target.msg_id, "error", Some(&error));
                         }
                     }
                     // 任务体自然结束（含 Err 与被 Stop 协作中止）时注销；

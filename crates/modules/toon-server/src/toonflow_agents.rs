@@ -1364,15 +1364,8 @@ pub(crate) async fn run_with_emitter(
         json!({"message": "Agent 已启动，正在读取项目上下文"}),
     )
     .await;
-    let result = run_with_emitter_inner(
-        state,
-        request,
-        agent_key,
-        emitter,
-        target,
-        &mut abort_rx,
-    )
-    .await;
+    let result =
+        run_with_emitter_inner(state, request, agent_key, emitter, target, &mut abort_rx).await;
     match &result {
         Ok(output) => {
             // 记账失败不影响已流式送达的成功结果。

@@ -106,7 +106,11 @@ mod database_tests {
     fn storyboard_ids() -> Vec<i64> {
         [SCRIPT_ID, OTHER_SCRIPT_ID]
             .into_iter()
-            .flat_map(|script| STORYBOARD_OFFSETS.into_iter().map(move |offset| script + offset))
+            .flat_map(|script| {
+                STORYBOARD_OFFSETS
+                    .into_iter()
+                    .map(move |offset| script + offset)
+            })
             .collect()
     }
 
@@ -169,11 +173,19 @@ mod database_tests {
                 .bind(asset_id).bind(PROJECT_ID).bind(parent).execute(pool).await.unwrap();
         }
         sqlx::query("INSERT INTO toonflow.script_assets(script_id,asset_id) VALUES($1,$2)")
-            .bind(SCRIPT_ID).bind(role).execute(pool).await.unwrap();
+            .bind(SCRIPT_ID)
+            .bind(role)
+            .execute(pool)
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO toonflow.images(id,file_path,assets_id,state) VALUES($1,'/a.png',$2,'已完成')")
             .bind(SCRIPT_ID + 400).bind(role).execute(pool).await.unwrap();
         sqlx::query("UPDATE toonflow.assets SET image_id=$2 WHERE id=$1")
-            .bind(role).bind(SCRIPT_ID + 400).execute(pool).await.unwrap();
+            .bind(role)
+            .bind(SCRIPT_ID + 400)
+            .execute(pool)
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO toonflow.character_appearances(id,project_id,script_id,role_asset_id,name,scenes,costume_prompt,description,create_time,update_time,age_stage) VALUES($1,$2,$3,$4,'造型','[]','服装','说明',0,0,'')")
             .bind(SCRIPT_ID + 500).bind(PROJECT_ID).bind(SCRIPT_ID).bind(role).execute(pool).await.unwrap();
         sqlx::query("INSERT INTO toonflow.assets_storyboards(storyboard_id,asset_id,sort_order) VALUES($1,$2,0)")
@@ -231,23 +243,91 @@ mod database_tests {
         assert_ne!(current, other_before);
 
         let mutations: Vec<(&str, &str, Vec<i64>)> = vec![
-            ("agent_work_data", "UPDATE toonflow.agent_work_data SET data='{\"scriptPlan\":\"x\"}'::jsonb, update_time=1 WHERE project_id=$1 AND episodes_id=$2", vec![PROJECT_ID, SCRIPT_ID]),
-            ("scripts", "UPDATE toonflow.scripts SET content='新正文' WHERE id=$1", vec![SCRIPT_ID]),
-            ("script_assets", "INSERT INTO toonflow.script_assets(script_id,asset_id) VALUES($1,$2)", vec![SCRIPT_ID, SCRIPT_ID + 302]),
-            ("assets", "UPDATE toonflow.assets SET name='新名字' WHERE id=$1", vec![SCRIPT_ID + 300]),
-            ("images", "UPDATE toonflow.images SET state='生成失败' WHERE id=$1", vec![SCRIPT_ID + 400]),
-            ("character_appearances", "UPDATE toonflow.character_appearances SET name='新造型' WHERE id=$1", vec![SCRIPT_ID + 500]),
-            ("storyboards", "UPDATE toonflow.storyboards SET state='生成中' WHERE id=$1", vec![SCRIPT_ID + 200]),
-            ("assets_storyboards", "UPDATE toonflow.assets_storyboards SET sort_order=3 WHERE storyboard_id=$1", vec![SCRIPT_ID + 200]),
-            ("scene_masters", "UPDATE toonflow.scene_masters SET name='卧室' WHERE id=$1", vec![SCRIPT_ID + 600]),
-            ("scene_states", "UPDATE toonflow.scene_states SET name='受损' WHERE id=$1", vec![SCRIPT_ID + 601]),
-            ("asset_audio_bindings", "UPDATE toonflow.asset_audio_bindings SET create_time=7 WHERE asset_role_id=$1", vec![SCRIPT_ID + 300]),
-            ("video_tracks", "INSERT INTO toonflow.video_tracks(project_id,script_id,state,sort_order,continuity_mode,transition_type,frame_policy,transition_source,trim_start_ms,transition_duration_ms) VALUES($1,$2,'未生成',0,'auto','cut','own','manual',0,0)", vec![PROJECT_ID, SCRIPT_ID]),
-            ("videos", "INSERT INTO toonflow.videos(id,project_id,script_id,state,generation_context) VALUES($1,$2,$3,'生成中','{}')", vec![SCRIPT_ID + 800, PROJECT_ID, SCRIPT_ID]),
-            ("scene_transitions", "UPDATE toonflow.scene_transitions SET description='硬切' WHERE project_id=$1 AND script_id=$2", vec![PROJECT_ID, SCRIPT_ID]),
-            ("workflow_definitions", "UPDATE toonflow.workflow_definitions SET version=version+1, update_time=1 WHERE project_id=$1 AND script_id=$2", vec![PROJECT_ID, SCRIPT_ID]),
-            ("workflow_runs", "UPDATE toonflow.workflow_runs SET state='running' WHERE id=$1", vec![SCRIPT_ID + 700]),
-            ("workflow_node_runs", "UPDATE toonflow.workflow_node_runs SET state='running', progress_total=3 WHERE id=$1", vec![SCRIPT_ID + 701]),
+            (
+                "agent_work_data",
+                "UPDATE toonflow.agent_work_data SET data='{\"scriptPlan\":\"x\"}'::jsonb, update_time=1 WHERE project_id=$1 AND episodes_id=$2",
+                vec![PROJECT_ID, SCRIPT_ID],
+            ),
+            (
+                "scripts",
+                "UPDATE toonflow.scripts SET content='新正文' WHERE id=$1",
+                vec![SCRIPT_ID],
+            ),
+            (
+                "script_assets",
+                "INSERT INTO toonflow.script_assets(script_id,asset_id) VALUES($1,$2)",
+                vec![SCRIPT_ID, SCRIPT_ID + 302],
+            ),
+            (
+                "assets",
+                "UPDATE toonflow.assets SET name='新名字' WHERE id=$1",
+                vec![SCRIPT_ID + 300],
+            ),
+            (
+                "images",
+                "UPDATE toonflow.images SET state='生成失败' WHERE id=$1",
+                vec![SCRIPT_ID + 400],
+            ),
+            (
+                "character_appearances",
+                "UPDATE toonflow.character_appearances SET name='新造型' WHERE id=$1",
+                vec![SCRIPT_ID + 500],
+            ),
+            (
+                "storyboards",
+                "UPDATE toonflow.storyboards SET state='生成中' WHERE id=$1",
+                vec![SCRIPT_ID + 200],
+            ),
+            (
+                "assets_storyboards",
+                "UPDATE toonflow.assets_storyboards SET sort_order=3 WHERE storyboard_id=$1",
+                vec![SCRIPT_ID + 200],
+            ),
+            (
+                "scene_masters",
+                "UPDATE toonflow.scene_masters SET name='卧室' WHERE id=$1",
+                vec![SCRIPT_ID + 600],
+            ),
+            (
+                "scene_states",
+                "UPDATE toonflow.scene_states SET name='受损' WHERE id=$1",
+                vec![SCRIPT_ID + 601],
+            ),
+            (
+                "asset_audio_bindings",
+                "UPDATE toonflow.asset_audio_bindings SET create_time=7 WHERE asset_role_id=$1",
+                vec![SCRIPT_ID + 300],
+            ),
+            (
+                "video_tracks",
+                "INSERT INTO toonflow.video_tracks(project_id,script_id,state,sort_order,continuity_mode,transition_type,frame_policy,transition_source,trim_start_ms,transition_duration_ms) VALUES($1,$2,'未生成',0,'auto','cut','own','manual',0,0)",
+                vec![PROJECT_ID, SCRIPT_ID],
+            ),
+            (
+                "videos",
+                "INSERT INTO toonflow.videos(id,project_id,script_id,state,generation_context) VALUES($1,$2,$3,'生成中','{}')",
+                vec![SCRIPT_ID + 800, PROJECT_ID, SCRIPT_ID],
+            ),
+            (
+                "scene_transitions",
+                "UPDATE toonflow.scene_transitions SET description='硬切' WHERE project_id=$1 AND script_id=$2",
+                vec![PROJECT_ID, SCRIPT_ID],
+            ),
+            (
+                "workflow_definitions",
+                "UPDATE toonflow.workflow_definitions SET version=version+1, update_time=1 WHERE project_id=$1 AND script_id=$2",
+                vec![PROJECT_ID, SCRIPT_ID],
+            ),
+            (
+                "workflow_runs",
+                "UPDATE toonflow.workflow_runs SET state='running' WHERE id=$1",
+                vec![SCRIPT_ID + 700],
+            ),
+            (
+                "workflow_node_runs",
+                "UPDATE toonflow.workflow_node_runs SET state='running', progress_total=3 WHERE id=$1",
+                vec![SCRIPT_ID + 701],
+            ),
         ];
         for (table, statement, binds) in &mutations {
             run(&pool, statement, binds).await;
