@@ -52,6 +52,7 @@ import {
   generateVideoPrompt,
   getAssets,
   getFlowData,
+  getFlowVersion,
   getImageFlow,
   getLatestWorkflowNodeRun,
   getNovelPage,
@@ -188,6 +189,9 @@ export function useProjectDetail(fixedProjectId?: number) {
   );
   const loadedFlowProjectId = ref<number>();
   const loadedFlowScriptId = ref<number>();
+  // 最近一次完整加载对应的画布版本号，按 项目:剧本 记录。轮询先比对它，
+  // 版本没变就不拉全量数据。
+  const loadedFlowVersion = ref<{ key: string; version: string }>();
 
   const flowImageModalOpen = ref(false);
   const imageFlowId = ref<number>();
@@ -659,6 +663,7 @@ export function useProjectDetail(fixedProjectId?: number) {
     if (!targetScriptId) {
       loadedFlowProjectId.value = undefined;
       loadedFlowScriptId.value = undefined;
+      loadedFlowVersion.value = undefined;
       flowText.value =
         '{\n  "script": "",\n  "storyboard": [],\n  "workbench": { "videoList": [] }\n}';
       storyboards.value = [];
@@ -671,12 +676,15 @@ export function useProjectDetail(fixedProjectId?: number) {
     // These endpoints are independent, read-only snapshots of the same script.
     // Fetch them together so switching production scripts does not pay three
     // consecutive network round trips.
-    const [flow, workbench, nextStoryboards] = await Promise.all([
+    const [flowResponse, workbench, nextStoryboards] = await Promise.all([
       getFlowData(targetProjectId, targetScriptId),
       getVideoWorkbench(targetProjectId, targetScriptId),
       getStoryboards(targetProjectId, targetScriptId),
     ]);
     if (!isCurrentFlowTarget(targetProjectId, targetScriptId)) return;
+    // flowVersion 是读取时的派生值：记下来供轮询比对，但不进入可编辑的
+    // flowText，否则会被原样存回工作区。
+    const { flowVersion, ...flow } = flowResponse;
     const workflow = normalizeProductionWorkflow(flow.workflow);
     const latestRuns = await Promise.all(
       workflow.nodes.map((node) =>
@@ -694,6 +702,11 @@ export function useProjectDetail(fixedProjectId?: number) {
     storyboards.value = nextStoryboards;
     loadedFlowProjectId.value = targetProjectId;
     loadedFlowScriptId.value = targetScriptId;
+    // 旧网关不返回 flowVersion：留空，轮询退回每次都刷新。
+    loadedFlowVersion.value =
+      typeof flowVersion === 'string' && flowVersion
+        ? { key: flowKey, version: flowVersion }
+        : undefined;
     const remembered = savedLocation.nodes[String(targetScriptId)];
     productionNodeId.value = workflow.nodes.some(
       (node) => node.id === remembered,
@@ -747,6 +760,38 @@ export function useProjectDetail(fixedProjectId?: number) {
     return loadFlowInFlight;
   }
 
+  // 网关不提供版本探针时（滚动升级期间遇到旧网关），轮询退回每次都刷新。
+  let flowVersionUnsupported = false;
+
+  // 轮询入口：先取轻量版本号，画布读取的数据没变就不拉全量。
+  async function syncFlowIfChanged(): Promise<void> {
+    const targetProjectId = projectId.value;
+    const targetScriptId = selectedScriptId.value;
+    if (!targetScriptId || flowVersionUnsupported) return loadFlow();
+    let version: string | undefined;
+    try {
+      version = (await getFlowVersion(targetProjectId, targetScriptId))
+        .flowVersion;
+    } catch (error) {
+      const status = (error as { response?: { status?: number } })?.response
+        ?.status;
+      if (Number(status) === 404) {
+        flowVersionUnsupported = true;
+        return loadFlow();
+      }
+      // 瞬时失败：跳过这一轮，下一轮再试。其余刷新入口不受影响。
+      return;
+    }
+    if (!isCurrentFlowTarget(targetProjectId, targetScriptId)) return;
+    const loaded = loadedFlowVersion.value;
+    const unchanged =
+      !!version &&
+      loaded?.key === `${targetProjectId}:${targetScriptId}` &&
+      loaded.version === version;
+    if (unchanged) return;
+    await loadFlow();
+  }
+
   let productionAssetRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   let productionAssetRefreshAttempts = 0;
 
@@ -755,7 +800,7 @@ export function useProjectDetail(fixedProjectId?: number) {
     if (productionAssetRefreshTimer) clearTimeout(productionAssetRefreshTimer);
     productionAssetRefreshAttempts = 0;
     const refresh = async () => {
-      await loadFlow();
+      await syncFlowIfChanged();
       productionAssetRefreshAttempts += 1;
       if (
         detailActive &&
@@ -1457,8 +1502,9 @@ export function useProjectDetail(fixedProjectId?: number) {
         if (!productionAgentSyncTimer) {
           productionAgentSyncTimer = setInterval(() => {
             // KeepAlive keeps this timer alive across stages; only the
-            // visible production canvas consumes the refresh.
-            if (activeTab.value === 'production') void loadFlow();
+            // visible production canvas consumes the refresh, and only
+            // when the server reports that canvas data actually changed.
+            if (activeTab.value === 'production') void syncFlowIfChanged();
           }, 1800);
         }
         productionAgentActivity.value = 'Agent 执行中';

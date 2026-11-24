@@ -477,6 +477,14 @@ export function getFlowData(projectId: number, episodesId: number) {
   });
 }
 
+/** 轻量变更探针：画布读取的数据没变时返回同一个 flowVersion。 */
+export function getFlowVersion(projectId: number, episodesId: number) {
+  return requestClient.post<{ flowVersion: string }>('/toonflow/production/getFlowVersion', {
+    projectId,
+    episodesId,
+  });
+}
+
 export function saveFlowData(projectId: number, episodesId: number, data: Record<string, any>) {
   return requestClient.post('/toonflow/production/saveFlowData', {
     projectId,

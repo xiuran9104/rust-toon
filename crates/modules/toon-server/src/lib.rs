@@ -27,6 +27,7 @@ mod toonflow_face_identity;
 mod toonflow_audio;
 mod toonflow_character_identity;
 mod toonflow_episode_renders;
+mod toonflow_flow_version;
 mod toonflow_image_edit_prompt;
 mod toonflow_image_workflow;
 mod toonflow_manuals;
@@ -1660,6 +1661,10 @@ pub fn routes(state: ToonState) -> Router {
             post(toonflow::get_flow_data),
         )
         .route(
+            "/toonflow/production/getFlowVersion",
+            post(toonflow::get_flow_version),
+        )
+        .route(
             "/toonflow/production/saveFlowData",
             post(toonflow::save_flow_data),
         )
@@ -1836,6 +1841,10 @@ pub fn routes(state: ToonState) -> Router {
         .route("/api/other/getVersion", get(toonflow_resources::version))
         .route("/api/production/getFlowData", post(toonflow::get_flow_data))
         .route(
+            "/api/production/getFlowVersion",
+            post(toonflow::get_flow_version),
+        )
+        .route(
             "/api/production/saveFlowData",
             post(toonflow::save_flow_data),
         )
@@ -1968,6 +1977,10 @@ pub fn routes(state: ToonState) -> Router {
         )
         .route("/other/getVersion", get(toonflow_resources::version))
         .route("/production/getFlowData", post(toonflow::get_flow_data))
+        .route(
+            "/production/getFlowVersion",
+            post(toonflow::get_flow_version),
+        )
         .route("/agents/tools/execute", post(toonflow_agent_tools::execute))
         .route(
             "/assets/getMaterialData",

@@ -167,6 +167,38 @@ async fn project_content_storyboard_and_video_export_form_a_complete_pipeline() 
     .expect("load default production flow")
     .0
     .data;
+    // 画布版本号随全量数据返回，轻量探针给出同一个值，且受同样的权限保护。
+    let flow_version = flow_data["flowVersion"]
+        .as_str()
+        .expect("flow data carries a flow version")
+        .to_string();
+    let probed_version = toonflow::get_flow_version(
+        user(),
+        State(state.clone()),
+        Json(toonflow::FlowRequest {
+            project_id,
+            episodes_id: script_id,
+        }),
+    )
+    .await
+    .expect("probe flow version")
+    .0
+    .data;
+    assert_eq!(
+        probed_version["flowVersion"].as_str(),
+        Some(flow_version.as_str())
+    );
+    let outsider_version = toonflow::get_flow_version(
+        outsider.clone(),
+        State(state.clone()),
+        Json(toonflow::FlowRequest {
+            project_id,
+            episodes_id: script_id,
+        }),
+    )
+    .await
+    .expect_err("another user must not probe production flow data");
+    assert_eq!(outsider_version.status(), StatusCode::NOT_FOUND);
     let outsider_flow_write = toonflow::save_flow_data(
         outsider.clone(),
         State(state.clone()),
@@ -190,6 +222,37 @@ async fn project_content_storyboard_and_video_export_form_a_complete_pipeline() 
     )
     .await
     .expect("persist production workflow");
+    // flowVersion 只是读取时的派生值。这里把读到的整份数据原样存回（旧前端
+    // 的行为），它不得留在工作区里；这次写入本身要让版本号变化。
+    let stored_flow: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT data FROM toonflow.agent_work_data WHERE project_id=$1 AND episodes_id=$2 AND key='productionAgent'",
+    )
+    .bind(project_id)
+    .bind(script_id)
+    .fetch_optional(&pool)
+    .await
+    .expect("read stored production flow");
+    assert!(
+        stored_flow.is_some_and(|data| data.get("flowVersion").is_none()),
+        "flowVersion must not be persisted into the production workspace"
+    );
+    let version_after_save = toonflow::get_flow_version(
+        user(),
+        State(state.clone()),
+        Json(toonflow::FlowRequest {
+            project_id,
+            episodes_id: script_id,
+        }),
+    )
+    .await
+    .expect("probe flow version after save")
+    .0
+    .data;
+    assert_ne!(
+        version_after_save["flowVersion"].as_str(),
+        Some(flow_version.as_str()),
+        "saving the production flow must change its version"
+    );
     let workflow_run = toonflow_workflow::create_run(
         user(),
         State(state.clone()),

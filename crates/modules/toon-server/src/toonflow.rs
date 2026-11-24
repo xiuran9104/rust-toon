@@ -1143,6 +1143,12 @@ pub async fn get_flow_data(
     require(&user, "toon:scene:read")?;
     ensure_project_access(&state.pool, &user, request.project_id).await?;
     ensure_script_in_project(&state.pool, request.project_id, request.episodes_id).await?;
+    // 版本号先于数据读取：两者之间若有写入，版本号偏旧，下一轮轮询会再
+    // 刷新一遍，不会漏。
+    let flow_version =
+        crate::toonflow_flow_version::production_flow_version(&state.pool, request.project_id, request.episodes_id)
+            .await
+            .map_err(|_| AppError::internal("failed to compute flow version"))?;
     let flow: Option<(Value,)> = sqlx::query_as(
         "SELECT data FROM toonflow.agent_work_data WHERE project_id=$1 AND episodes_id=$2 AND key='productionAgent'",
     )
@@ -1161,6 +1167,7 @@ pub async fn get_flow_data(
     if let Some((mut data,)) = flow {
         data["script"] = json!(script);
         data["assets"] = assets;
+        data["flowVersion"] = json!(flow_version);
         if data.get("workflow").is_none() {
             data["workflow"] =
                 serde_json::to_value(crate::toonflow_workflow::default_production_workflow())
@@ -1175,8 +1182,31 @@ pub async fn get_flow_data(
         "storyboardTable": "",
         "storyboard": [],
         "workbench": { "videoList": [] },
-        "workflow": crate::toonflow_workflow::default_production_workflow()
+        "workflow": crate::toonflow_workflow::default_production_workflow(),
+        "flowVersion": flow_version
     }))))
+}
+
+/// 画布增量刷新的轻量探针：只返回版本号，前端据此决定是否重新拉取全量数据。
+pub async fn get_flow_version(
+    user: CurrentUser,
+    State(state): State<ToonState>,
+    Json(request): Json<FlowRequest>,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
+    require(&user, "toon:scene:read")?;
+    ensure_project_access(&state.pool, &user, request.project_id).await?;
+    ensure_script_in_project(&state.pool, request.project_id, request.episodes_id).await?;
+    // 过期节点运行的状态修复原本由 latest_node_run 顺带触发。轮询改走这里后
+    // 必须在这里补上，否则节点从 running 转为 interrupted 时版本号不会变化，
+    // 画布会一直停在"运行中"。
+    crate::toonflow_workflow::recover_stale_node_runs(&state).await;
+    let flow_version =
+        crate::toonflow_flow_version::production_flow_version(&state.pool, request.project_id, request.episodes_id)
+            .await
+            .map_err(|_| AppError::internal("failed to compute flow version"))?;
+    Ok(Json(ApiResponse::new(
+        json!({ "flowVersion": flow_version }),
+    )))
 }
 
 pub async fn save_flow_data(
@@ -1198,6 +1228,11 @@ pub async fn save_flow_data(
     )
     .await?;
     let mut data = request.data;
+    // flowVersion 只是读取时的派生值。旧前端不认识它，会把整份 JSON 原样
+    // 存回来；这里剔除，避免它进入工作区。
+    if let Some(object) = data.as_object_mut() {
+        object.remove("flowVersion");
+    }
     data["workflow"] = serde_json::to_value(workflow)
         .map_err(|_| AppError::internal("failed to serialize workflow definition"))?;
     persist_work_data_with_transition_sync(
