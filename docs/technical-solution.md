@@ -188,13 +188,12 @@ AI 能力域：
 
 ### 6.1 依赖审计
 
-Rust 侧 `cargo audit` 当前为 0 漏洞。`.cargo/audit.toml` 登记了 zip（7.4.0 / 8.6.0）与 libsqlite3-sys 的豁免，每条都写明了核实过的不可达理由和复核命令；新增读取压缩包的代码、启用 zip 的 `legacy-zip` 特性或启用 sqlx 的 sqlite 特性之前，先重新核对这些理由。sqlx 0.9 的升级（可同时解除 libsqlite3-sys 豁免）要求逐处审计并标注约 30 处动态 SQL，尚未进行。另有 chrono 被标记为停止维护（RUSTSEC-2026-0543），无修复版本。
+Rust 侧 `cargo audit` 当前为 0 漏洞。sqlx 已升级 0.9.1（特性拆分为 `runtime-tokio` + `tls-rustls-ring-webpki`，行为等价原 `runtime-tokio-rustls`）；0.9 要求动态 SQL 显式声明已审计（`AssertSqlSafe`），全仓约 30 处插值点已逐处核实——插值均来自静态规格表、内部匹配片段或编译期常量，用户输入一律走绑定参数，各站点以注释注明依据。`.cargo/audit.toml` 登记 zip（7.4.0 / 8.6.0 / 9.7.3 共存于依赖树，仅写包与读取自有文件）与 libsqlite3-sys（sqlite 特性关闭，不参与编译）的豁免及复核命令；新增读取压缩包、启用 zip `legacy-zip` 或 sqlx `sqlite` 特性前先重新核对这些理由。另有 chrono 被标记为停止维护（RUSTSEC-2026-0543），无修复版本。
 
-前端用 CI 同版本的 pnpm 执行 `pnpm audit --prod`（2026-11-24）：critical 0、high 4、moderate 3、low 1。声明范围内可修复的都已更新（`27645c7`），剩下的告警在各自声明的版本范围内都没有修复版本，逐条理由如下。上游发布修复或完成升级后，移除对应条目。
+前端用 CI 同版本的 pnpm 执行 `pnpm audit --prod`（2026-11-24）：critical 0、high 3、moderate 3、low 1。tinymce 已升级 8.10.2（media 插件 XSS 随升级修复，`license-key="gpl"` 自托管合规），声明范围内可修复的都已更新（`27645c7`），剩下的告警在各自声明的版本范围内都没有修复版本，逐条理由如下。上游发布修复或完成升级后，移除对应条目。
 
 | 包 | 严重度 | 引入路径 | 未修复原因 |
 | --- | --- | --- | --- |
-| tinymce 7.9.3 | high | `@tinymce/tinymce-vue`，富文本编辑器 | 修复只在 8.x，需要跨大版本升级。该 XSS 需要 media 插件处理恶意内容，而默认配置（`components/tinymce/tinymce.ts`）启用了 `media`。升级前可从默认 `plugins`/`toolbar` 移除 `media` 关闭这条路径，代价是失去插入音视频的功能，属于产品取舍。 |
 | wangeditor 4.7.15 | high | `@form-create/antd-designer` → `@form-create/component-wangeditor` | 上游已停止维护，无修复版本。应用源码没有使用 wangeditor 字段；只有在表单设计器里拖入该控件并加载恶意内容时才可达。 |
 | zod 3.25.76 | high | `@vben-core/form-ui` → `@vee-validate/zod` | 修复需要 zod 4，`form-ui` 的目录范围是 `^3.25.76`。问题是校验超大集合时的内存耗尽，输入来自本应用的表单。 |
 | glob 10.4.5 | high / moderate | `@form-create/antd-designer` → `js-beautify@1` → `glob` | `js-beautify@1` 精确钉住。两条告警分别是 glob CLI 的 `-c/--cmd` 命令注入和文件系统遍历的取消绕过，都是 Node 专有路径，在浏览器产物中不可达。 |
