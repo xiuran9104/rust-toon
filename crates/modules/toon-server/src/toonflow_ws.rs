@@ -685,8 +685,11 @@ async fn handle_socket(
                 let exec_emitter = emitter.clone();
                 let exec_state = state.clone();
                 let exec_agent_key = agent_key.clone();
-                let exec_msg_id = msg_id.clone();
-                let exec_text_cid = text_cid.clone();
+                let exec_target = toonflow_agents::LiveRunTarget {
+                    msg_id: msg_id.clone(),
+                    text_cid: text_cid.clone(),
+                    run_id,
+                };
                 let exec_abort_rx = new_abort_rx;
 
                 let spawned = tokio::spawn(async move {
@@ -695,27 +698,32 @@ async fn handle_socket(
                         &request,
                         &exec_agent_key,
                         &exec_emitter,
-                        &exec_msg_id,
-                        &exec_text_cid,
+                        &exec_target,
                         exec_abort_rx,
-                        run_id,
                     )
                     .await;
 
                     match result {
                         Ok(_) => {
-                            exec_emitter.text_complete(&exec_msg_id, &exec_text_cid);
-                            exec_emitter.update_message(&exec_msg_id, "complete", None);
+                            exec_emitter
+                                .text_complete(&exec_target.msg_id, &exec_target.text_cid);
+                            exec_emitter
+                                .update_message(&exec_target.msg_id, "complete", None);
                         }
                         Err(error) => {
                             let friendly = friendly_error(&error);
                             exec_emitter.text_delta(
-                                &exec_msg_id,
-                                &exec_text_cid,
+                                &exec_target.msg_id,
+                                &exec_target.text_cid,
                                 &format!("\n\n错误：{friendly}"),
                             );
-                            exec_emitter.text_complete(&exec_msg_id, &exec_text_cid);
-                            exec_emitter.update_message(&exec_msg_id, "error", Some(&error));
+                            exec_emitter
+                                .text_complete(&exec_target.msg_id, &exec_target.text_cid);
+                            exec_emitter.update_message(
+                                &exec_target.msg_id,
+                                "error",
+                                Some(&error),
+                            );
                         }
                     }
                     // 任务体自然结束（含 Err 与被 Stop 协作中止）时注销；

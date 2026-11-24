@@ -1335,6 +1335,14 @@ async fn perform_run(
     }
 }
 
+/// WS 运行的推送目标：流式输出写进哪条消息的哪个文本块，以及记到哪次运行。
+#[derive(Clone)]
+pub(crate) struct LiveRunTarget {
+    pub(crate) msg_id: String,
+    pub(crate) text_cid: String,
+    pub(crate) run_id: i64,
+}
+
 /// Run the agent with a WebSocket emitter for real-time streaming.
 /// Uses the proven run_with_tools() logic and visualizes the output.
 /// durable 第三阶段：WS 运行与 HTTP 运行同级持久化——事件写
@@ -1345,11 +1353,10 @@ pub(crate) async fn run_with_emitter(
     request: &ChatRequest,
     agent_key: &str,
     emitter: &WsEmitter,
-    msg_id: &str,
-    text_cid: &str,
+    target: &LiveRunTarget,
     mut abort_rx: watch::Receiver<bool>,
-    run_id: i64,
 ) -> Result<String, String> {
+    let run_id = target.run_id;
     record_run_event(
         &state.pool,
         run_id,
@@ -1362,10 +1369,8 @@ pub(crate) async fn run_with_emitter(
         request,
         agent_key,
         emitter,
-        msg_id,
-        text_cid,
+        target,
         &mut abort_rx,
-        run_id,
     )
     .await;
     match &result {
@@ -1417,11 +1422,12 @@ async fn run_with_emitter_inner(
     request: &ChatRequest,
     agent_key: &str,
     emitter: &WsEmitter,
-    msg_id: &str,
-    text_cid: &str,
+    target: &LiveRunTarget,
     abort_rx: &mut watch::Receiver<bool>,
-    run_id: i64,
 ) -> Result<String, String> {
+    let msg_id = target.msg_id.as_str();
+    let text_cid = target.text_cid.as_str();
+    let run_id = target.run_id;
     // Add user memory
     let _ = add_memory(
         state,
@@ -2111,7 +2117,7 @@ mod tests {
     #[test]
     fn delta_batcher_flushes_by_window_and_returns_tail() {
         // 零间隔窗口：每次 push 立即冲刷。
-        let mut batcher = DeltaBatcher::new(std::time::Duration::from_millis(0));
+        let batcher = DeltaBatcher::new(std::time::Duration::from_millis(0));
         assert_eq!(batcher.push("a"), Some("a".to_string()));
         assert_eq!(batcher.push("b"), Some("b".to_string()));
         assert_eq!(batcher.take_tail(), None);
