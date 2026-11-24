@@ -469,8 +469,8 @@ catalogs:
       specifier: ^0.1.0
       version: 0.1.0
     tinymce:
-      specifier: ^7.9.3
-      version: 7.9.3
+      specifier: ^8.10.2
+      version: 8.10.2
     tippy.js:
       specifier: ^6.3.7
       version: 6.3.7
@@ -706,7 +706,7 @@ importers:
         version: 3.4.0(vue@3.5.46(typescript@6.0.3))
       '@tinymce/tinymce-vue':
         specifier: 'catalog:'
-        version: 6.3.0(tinymce@7.9.3)(vue@3.5.46(typescript@6.0.3))
+        version: 6.3.0(tinymce@8.10.2)(vue@3.5.46(typescript@6.0.3))
       '@vben/access':
         specifier: workspace:*
         version: link:../../packages/effects/access
@@ -796,7 +796,7 @@ importers:
         version: 0.1.0
       tinymce:
         specifier: 'catalog:'
-        version: 7.9.3
+        version: 8.10.2
       tyme4ts:
         specifier: 'catalog:'
         version: 1.5.2
@@ -10561,8 +10561,8 @@ packages:
     resolution: {integrity: sha512-wXR/dYpcqKmfWpEdZjiKJOwCNFndD0DMnrW/cYjVGttEkBfVgcLFHoNrlj47mjOVic9yyNu65alsgF4NQyTa2g==}
     engines: {node: '>=12.0.0'}
 
-  tinymce@7.9.3:
-    resolution: {integrity: sha512-Mtm54U5YJ6Pyo/GaAx+JSHXTGEuxrg2AowVWCD9zy1eBolp5Ub7S1rTtsyQdxhPegfhLuR3VLiTKGw1tacv09g==}
+  tinymce@8.10.2:
+    resolution: {integrity: sha512-Na5apA/kwb5o5HrHAZWnWssvZFZRph7gyROSXyvkAwS7E/59qEUttQx2ACfHLkM5EUyzCz2ww9PMm5/VpeZgIA==}
 
   tinypool@2.2.0:
     resolution: {integrity: sha512-jBrmx4lYmaC9k/mgPbylxs7kBUxHtD8256up+HjLaDFfXScKJQyil+SWXSvhAtT7XHo+yTVlpB81PGmHP8oLSQ==}
@@ -14667,11 +14667,11 @@ snapshots:
       - '@sveltejs/kit'
       - svelte
 
-  '@tinymce/tinymce-vue@6.3.0(tinymce@7.9.3)(vue@3.5.46(typescript@6.0.3))':
+  '@tinymce/tinymce-vue@6.3.0(tinymce@8.10.2)(vue@3.5.46(typescript@6.0.3))':
     dependencies:
       vue: 3.5.46(typescript@6.0.3)
     optionalDependencies:
-      tinymce: 7.9.3
+      tinymce: 8.10.2
 
   '@tiptap/core@3.35.0(@tiptap/pm@3.35.0)':
     dependencies:
@@ -20834,7 +20834,7 @@ snapshots:
       fdir: 6.5.0(picomatch@4.0.7)
       picomatch: 4.0.7
 
-  tinymce@7.9.3: {}
+  tinymce@8.10.2: {}
 
   tinypool@2.2.0: {}
 
