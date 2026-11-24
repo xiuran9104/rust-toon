@@ -1374,14 +1374,13 @@ async fn orchestrate_workflow_run(state: ToonState, workflow_run_id: i64) {
         if node_state == "success" {
             // A run resumed after a Gateway restart rebuilds upstream outputs
             // from the persisted node rows instead of in-memory state.
-            let output: Option<Value> = sqlx::query_scalar(
-                "SELECT output FROM toonflow.workflow_node_runs WHERE id=$1",
-            )
-            .bind(node_run_id)
-            .fetch_optional(&state.pool)
-            .await
-            .unwrap_or(None)
-            .flatten();
+            let output: Option<Value> =
+                sqlx::query_scalar("SELECT output FROM toonflow.workflow_node_runs WHERE id=$1")
+                    .bind(node_run_id)
+                    .fetch_optional(&state.pool)
+                    .await
+                    .unwrap_or(None)
+                    .flatten();
             outputs.insert(node.id.clone(), output.unwrap_or(Value::Null));
             continue;
         }
@@ -1503,12 +1502,7 @@ fn schedule_workflow_run(state: ToonState, workflow_run_id: i64) {
 /// resume from the persisted task handle and quality checks are worker-owned,
 /// so this waiter observes the rows and finishes the node exactly like the
 /// original executor would have.
-fn spawn_video_node_waiter(
-    pool: &PgPool,
-    node_run_id: i64,
-    workflow_run_id: i64,
-    input: Value,
-) {
+fn spawn_video_node_waiter(pool: &PgPool, node_run_id: i64, workflow_run_id: i64, input: Value) {
     let video_ids = serde_json::from_value::<toonflow_video::WorkflowVideoInput>(input)
         .map(|input| input.video_ids)
         .unwrap_or_default();
@@ -1517,13 +1511,12 @@ fn spawn_video_node_waiter(
     let handle = tokio::spawn(async move {
         let _ = start_rx.await;
         loop {
-            let node_state: Option<String> = sqlx::query_scalar(
-                "SELECT state FROM toonflow.workflow_node_runs WHERE id=$1",
-            )
-            .bind(node_run_id)
-            .fetch_optional(&pool)
-            .await
-            .unwrap_or(None);
+            let node_state: Option<String> =
+                sqlx::query_scalar("SELECT state FROM toonflow.workflow_node_runs WHERE id=$1")
+                    .bind(node_run_id)
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap_or(None);
             if node_state.as_deref() != Some("running") {
                 break;
             }
@@ -1534,9 +1527,7 @@ fn spawn_video_node_waiter(
             .fetch_all(&pool)
             .await
             .unwrap_or_default();
-            if states.len() == video_ids.len()
-                && states.iter().all(|state| state != "生成中")
-            {
+            if states.len() == video_ids.len() && states.iter().all(|state| state != "生成中") {
                 let succeeded = states.iter().filter(|state| *state == "生成成功").count();
                 let failed = video_ids.len() - succeeded;
                 let (node_state, output, error_reason) = if failed == 0 {
@@ -1596,12 +1587,11 @@ pub async fn resume_interrupted_workflow_runs(state: &ToonState) -> u64 {
     for (node_run_id, workflow_run_id, input) in running_video_nodes {
         spawn_video_node_waiter(&state.pool, node_run_id, workflow_run_id, input);
     }
-    let run_ids: Vec<i64> = sqlx::query_scalar(
-        "SELECT id FROM toonflow.workflow_runs WHERE state='running'",
-    )
-    .fetch_all(&state.pool)
-    .await
-    .unwrap_or_default();
+    let run_ids: Vec<i64> =
+        sqlx::query_scalar("SELECT id FROM toonflow.workflow_runs WHERE state='running'")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap_or_default();
     let resumed = run_ids.len() as u64;
     for run_id in run_ids {
         schedule_workflow_run(state.clone(), run_id);
@@ -1886,12 +1876,7 @@ mod resume_database_tests {
             .await
             .unwrap();
 
-            spawn_video_node_waiter(
-                &pool,
-                node_run_id,
-                run_id,
-                json!({"videoIds":video_ids}),
-            );
+            spawn_video_node_waiter(&pool, node_run_id, run_id, json!({"videoIds":video_ids}));
             let node_state = node_state_after_wait(&pool, node_run_id).await;
             assert_eq!(node_state, expected_node, "case {case_index} node state");
             let run_state: String =

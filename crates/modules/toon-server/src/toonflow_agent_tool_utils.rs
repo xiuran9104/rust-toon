@@ -19,14 +19,15 @@ pub(crate) async fn changed_flow_data(
     value: Value,
 ) -> Value {
     let serialized = value.to_string();
-    let previous: Option<String> =
-        sqlx::query_scalar("SELECT value FROM toonflow.agent_flow_cache WHERE isolation_key=$1 AND key=$2")
-            .bind(isolation_key)
-            .bind(key)
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten();
+    let previous: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM toonflow.agent_flow_cache WHERE isolation_key=$1 AND key=$2",
+    )
+    .bind(isolation_key)
+    .bind(key)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
     if previous.as_deref() == Some(serialized.as_str()) {
         return json!(format!("{key} 数据未变化，无需更新"));
     }

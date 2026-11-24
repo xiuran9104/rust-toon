@@ -33,9 +33,13 @@ impl ReadEvidence {
 
     pub fn missing(&self, has_novel: bool, needs_workspace: bool) -> Option<&'static str> {
         if needs_workspace && !self.workspace {
-            Some("提交前必须调用 get_planData 读取本项目当前工作区；审核必须依据最新骨架或改编策略，修订必须保留已有内容。")
+            Some(
+                "提交前必须调用 get_planData 读取本项目当前工作区；审核必须依据最新骨架或改编策略，修订必须保留已有内容。",
+            )
         } else if has_novel && self.chapters.is_empty() {
-            Some("本轮尚未成功读取任何原文章节。请用 get_novel_text 核实关键身份、规则或反转所在章节；事件表不能替代原文。读取失败时不得伪造核实结果。")
+            Some(
+                "本轮尚未成功读取任何原文章节。请用 get_novel_text 核实关键身份、规则或反转所在章节；事件表不能替代原文。读取失败时不得伪造核实结果。",
+            )
         } else {
             None
         }
@@ -52,7 +56,11 @@ mod tests {
         let mut evidence = ReadEvidence::default();
         evidence.record("get_novel_events", &json!({}), "章节摘要");
         evidence.record("get_novel_text", &json!({"chapterIndex":1}), "");
-        evidence.record("get_novel_text", &json!({"chapterIndex":1}), "读取失败：数据库不可用");
+        evidence.record(
+            "get_novel_text",
+            &json!({"chapterIndex":1}),
+            "读取失败：数据库不可用",
+        );
         evidence.record("get_planData", &json!({}), "key 'x' 不存在");
         assert!(evidence.missing(true, true).is_some());
         evidence.record("get_planData", &json!({}), "当前骨架");

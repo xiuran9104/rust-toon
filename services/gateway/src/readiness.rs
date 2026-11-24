@@ -219,7 +219,10 @@ async fn check_object_storage(state: &ReadinessState) -> Check {
     {
         Ok(Ok(())) => Check::ok(state.object_storage_required),
         Ok(Err(error)) => Check::failed(state.object_storage_required, error),
-        Err(_) => Check::failed(state.object_storage_required, "object storage check timed out"),
+        Err(_) => Check::failed(
+            state.object_storage_required,
+            "object storage check timed out",
+        ),
     }
 }
 

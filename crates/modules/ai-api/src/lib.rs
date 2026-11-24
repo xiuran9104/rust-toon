@@ -329,7 +329,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn model_type_aliases_are_supported() {
         assert_eq!(AiModelType::parse("text"), Some(AiModelType::Chat));

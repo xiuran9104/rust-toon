@@ -179,11 +179,13 @@ pub async fn load_track_asset_references(
     script_id: i64,
     track_id: i64,
 ) -> Result<Vec<String>, sqlx::Error> {
-    Ok(load_track_asset_reference_manifest(pool, project_id, script_id, track_id)
-        .await?
-        .into_iter()
-        .map(|reference| reference.file_path)
-        .collect())
+    Ok(
+        load_track_asset_reference_manifest(pool, project_id, script_id, track_id)
+            .await?
+            .into_iter()
+            .map(|reference| reference.file_path)
+            .collect(),
+    )
 }
 
 /// P0.4 参考图上限策略：当前镜头主体 > 关键道具 > 场景参考。同类内保持分镜
@@ -195,7 +197,8 @@ pub async fn load_track_asset_reference_selection(
     track_id: i64,
     cap: usize,
 ) -> Result<(Vec<TrackAssetReference>, Vec<Value>), sqlx::Error> {
-    let manifest = load_track_asset_reference_manifest(pool, project_id, script_id, track_id).await?;
+    let manifest =
+        load_track_asset_reference_manifest(pool, project_id, script_id, track_id).await?;
     Ok(select_references_within_cap(manifest, cap))
 }
 

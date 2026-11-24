@@ -188,11 +188,12 @@ pub async fn save_flow(
         .begin()
         .await
         .map_err(|_| AppError::internal("failed to begin image flow transaction"))?;
-    let id: i64 = sqlx::query_scalar("INSERT INTO toonflow.image_flows(flow_data)VALUES($1) RETURNING id")
-        .bind(json!({"edges":req.edges,"nodes":req.nodes}))
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|_| AppError::internal("failed to save image flow"))?;
+    let id: i64 =
+        sqlx::query_scalar("INSERT INTO toonflow.image_flows(flow_data)VALUES($1) RETURNING id")
+            .bind(json!({"edges":req.edges,"nodes":req.nodes}))
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| AppError::internal("failed to save image flow"))?;
     if let Some(asset_id) = req.asset_id {
         sqlx::query("UPDATE toonflow.assets SET flow_id=$2 WHERE id=$1")
             .bind(asset_id)
@@ -457,7 +458,11 @@ fn carried_objects_summary(objects: &[Value]) -> String {
         .iter()
         .filter_map(|item| {
             let name = item.get("name").and_then(Value::as_str)?;
-            match item.get("era").and_then(Value::as_str).filter(|era| !era.is_empty()) {
+            match item
+                .get("era")
+                .and_then(Value::as_str)
+                .filter(|era| !era.is_empty())
+            {
                 Some(era) => Some(format!("{name}（{era}）")),
                 None => Some(name.to_string()),
             }
@@ -547,7 +552,7 @@ async fn generate_storyboard_job(
             return false;
         }
     };
-    let mut generation_prompt = reference_plan.apply_to_prompt(
+    let generation_prompt = reference_plan.apply_to_prompt(
         crate::toonflow_asset_prompt::storyboard_generation_prompt(&job.prompt),
     );
     // P1 视觉质检：与资产图片同构的闭环（初始 + 最多 2 次定向重试，
@@ -561,11 +566,13 @@ async fn generate_storyboard_job(
     .await
     .ok()
     .flatten();
-    let (framing_desc, shot_size, camera_move, time_of_day) = framing
-        .unwrap_or_else(|| (String::new(), String::new(), String::new(), String::new()));
+    let (framing_desc, shot_size, camera_move, time_of_day) =
+        framing.unwrap_or_else(|| (String::new(), String::new(), String::new(), String::new()));
     // 对齐方案 P1 场景日夜状态：昼夜影响光线与氛围，注入生成提示词。
     let mut generation_prompt = if !time_of_day.trim().is_empty() {
-        format!("{generation_prompt}\n时间氛围：{time_of_day}。光线、色温与阴影必须与该时间一致，不得出现矛盾光源。")
+        format!(
+            "{generation_prompt}\n时间氛围：{time_of_day}。光线、色温与阴影必须与该时间一致，不得出现矛盾光源。"
+        )
     } else {
         generation_prompt
     };
@@ -590,7 +597,7 @@ async fn generate_storyboard_job(
     .fetch_all(&pool)
     .await
     .unwrap_or_default();
-    let own_carried = sqlx::query_scalar::<_, Value>(
+    let _own_carried = sqlx::query_scalar::<_, Value>(
         "SELECT carried_objects FROM toonflow.storyboards WHERE id=$1",
     )
     .bind(job.id)
@@ -648,30 +655,34 @@ async fn generate_storyboard_job(
             }
         };
         let object_name = format!("storyboard-{}-{}", job.id, uuid::Uuid::new_v4());
-        let file_path =
-            match crate::toonflow_storage::persist_remote_project_image(
-                &generated,
-                project_id,
-                "storyboards",
-                &object_name,
-            )
-            .await
-            {
-                Ok(file_path) => file_path,
-                Err(reason) => {
-                    let reason = format!("分镜图片持久化失败：{reason}");
-                    let _ = sqlx::query(
-                        "UPDATE toonflow.storyboards SET state='生成失败',reason=$2 WHERE id=$1",
-                    )
-                    .bind(job.id)
-                    .bind(reason)
-                    .execute(&pool)
-                    .await;
-                    return false;
-                }
-            };
-        match crate::toonflow_visual_qc::evaluate_image(&pool, project_id, &file_path, &expectations)
-            .await
+        let file_path = match crate::toonflow_storage::persist_remote_project_image(
+            &generated,
+            project_id,
+            "storyboards",
+            &object_name,
+        )
+        .await
+        {
+            Ok(file_path) => file_path,
+            Err(reason) => {
+                let reason = format!("分镜图片持久化失败：{reason}");
+                let _ = sqlx::query(
+                    "UPDATE toonflow.storyboards SET state='生成失败',reason=$2 WHERE id=$1",
+                )
+                .bind(job.id)
+                .bind(reason)
+                .execute(&pool)
+                .await;
+                return false;
+            }
+        };
+        match crate::toonflow_visual_qc::evaluate_image(
+            &pool,
+            project_id,
+            &file_path,
+            &expectations,
+        )
+        .await
         {
             Ok(report) => {
                 let attempt_entry = if report.passed {
@@ -1173,5 +1184,4 @@ mod tests {
         assert!(merge_carried_objects(&[json!(null), json!([{"era":"现代"}])]).is_empty());
         assert_eq!(carried_objects_summary(&[]), "");
     }
-
 }

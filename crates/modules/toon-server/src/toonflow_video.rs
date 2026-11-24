@@ -200,18 +200,14 @@ async fn finalize_video_with_visual_qc_retries(
 }
 
 /// 返回（带修复指令的完整 payload，修复指令）；None 表示无需或不能重试。
-async fn visual_qc_retry_decision(
-    pool: &sqlx::PgPool,
-    video_id: i64,
-) -> Option<(Value, String)> {
-    let context: Value = sqlx::query_scalar(
-        "SELECT generation_context FROM toonflow.videos WHERE id=$1",
-    )
-    .bind(video_id)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten()?;
+async fn visual_qc_retry_decision(pool: &sqlx::PgPool, video_id: i64) -> Option<(Value, String)> {
+    let context: Value =
+        sqlx::query_scalar("SELECT generation_context FROM toonflow.videos WHERE id=$1")
+            .bind(video_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()?;
     // 技术质检未通过时视频已判失败，不属于视觉重试范围。
     if context["quality"]["state"].as_str() != Some("passed") {
         return None;
@@ -726,10 +722,10 @@ pub async fn update_transition_settings(
     if trim_start_ms < 0 {
         return Err(AppError::bad_request("裁切起点不能为负数"));
     }
-    if let Some(trim_end_ms) = req.trim_end_ms {
-        if trim_end_ms <= trim_start_ms {
-            return Err(AppError::bad_request("裁切终点必须大于裁切起点"));
-        }
+    if let Some(trim_end_ms) = req.trim_end_ms
+        && trim_end_ms <= trim_start_ms
+    {
+        return Err(AppError::bad_request("裁切终点必须大于裁切起点"));
     }
     let (project_id, script_id) = ensure_track_access(&state.pool, &user, req.id).await?;
     let script_id = script_id.ok_or_else(|| AppError::bad_request("视频轨道未关联剧本"))?;
@@ -1093,7 +1089,10 @@ fn references_for_mode(
             Vec::new(),
         ));
     }
-    Ok((json!(frames.into_iter().take(1).collect::<Vec<_>>()), Vec::new()))
+    Ok((
+        json!(frames.into_iter().take(1).collect::<Vec<_>>()),
+        Vec::new(),
+    ))
 }
 
 fn validate_prompt_references(prompt: &str, count: usize) -> Result<(), String> {
@@ -1191,7 +1190,7 @@ struct StructuredShotDescription {
 fn parse_shot_duration(value: &str, position: usize) -> Result<f64, String> {
     let duration = value
         .trim()
-        .trim_end_matches(|character| character == 's' || character == '秒')
+        .trim_end_matches(['s', '秒'])
         .trim()
         .parse::<f64>()
         .map_err(|_| format!("第 {position} 个分镜时长无效"))?;
@@ -1321,9 +1320,7 @@ async fn load_structured_shot_descriptions(
                 storyboard_id: row.id,
                 sequence: row.index.unwrap_or(position as i32 + 1),
                 scene_key: row.scene_key.filter(|value| !value.trim().is_empty()),
-                scene_state_key: row
-                    .scene_state_key
-                    .filter(|value| !value.trim().is_empty()),
+                scene_state_key: row.scene_state_key.filter(|value| !value.trim().is_empty()),
                 shot_size,
                 camera_move,
                 time_of_day,
@@ -1426,9 +1423,7 @@ async fn build_reference_manifest(
 /// P0.5：供应商提交前确认参考图 URL 可访问，避免付费任务因供应商拉取
 /// 失败而作废。只检查 http(s) 引用；本地相对路径与模拟供应商不受影响。
 /// HEAD 被拒（405/403）说明资源存在但服务器限制方法，视为可达。
-async fn preflight_reference_reachability(
-    references: Option<&Vec<Value>>,
-) -> Result<(), String> {
+async fn preflight_reference_reachability(references: Option<&Vec<Value>>) -> Result<(), String> {
     let Some(references) = references else {
         return Ok(());
     };
@@ -1511,14 +1506,8 @@ async fn generate_with_snapshot(
         .2
         .ok_or_else(|| "视频任务未关联视频轨道".to_string())?;
     let structured_shots =
-        load_structured_shot_descriptions(
-            pool,
-            context.0,
-            context.1,
-            track_id,
-            mode == "text",
-        )
-        .await?;
+        load_structured_shot_descriptions(pool, context.0, context.1, track_id, mode == "text")
+            .await?;
     let updated = sqlx::query("UPDATE toonflow.videos SET generation_context=generation_context || jsonb_build_object('request',$2::jsonb) WHERE id=$1 AND state='生成中'")
         .bind(video_id).bind(json!({
             "version":2,
@@ -1894,13 +1883,18 @@ async fn run_workflow_video_job(
             mark_video_generation_failed(&pool, job.id, "视频生成并发控制不可用".into()).await;
             return (track_id, false);
         };
-        generate_with_snapshot(&pool, job.id, &job.model, payload, job.dropped_references.clone())
-            .await
+        generate_with_snapshot(
+            &pool,
+            job.id,
+            &job.model,
+            payload,
+            job.dropped_references.clone(),
+        )
+        .await
     };
     let succeeded = match provider_result {
         Ok(url) => {
-            finalize_video_with_visual_qc_retries(&pool, job.id, project_id, &job.model, url)
-                .await
+            finalize_video_with_visual_qc_retries(&pool, job.id, project_id, &job.model, url).await
         }
         Err(reason) => {
             mark_video_generation_failed(&pool, job.id, reason).await;
@@ -2544,14 +2538,8 @@ pub(crate) async fn create_prompt(
         .collect::<Vec<_>>()
         .join("\n");
     let structured_shots =
-        load_structured_shot_descriptions(
-            pool,
-            project_id,
-            script_id,
-            track_id,
-            mode == "text",
-        )
-        .await?;
+        load_structured_shot_descriptions(pool, project_id, script_id, track_id, mode == "text")
+            .await?;
     let structured_shots_json = serde_json::to_string(&structured_shots)
         .map_err(|error| format!("序列化结构化镜头失败：{error}"))?;
     let storyboard_items = boards
@@ -2855,9 +2843,11 @@ mod prompt_tests {
             .map(|entry| entry["name"].as_str().unwrap().to_string())
             .collect::<Vec<_>>();
         assert_eq!(dropped_names, vec!["S1", "S2"]);
-        assert!(dropped
-            .iter()
-            .all(|entry| entry["reason"].as_str().unwrap().contains("上限")));
+        assert!(
+            dropped
+                .iter()
+                .all(|entry| entry["reason"].as_str().unwrap().contains("上限"))
+        );
     }
 
     #[test]
@@ -2903,8 +2893,7 @@ mod prompt_tests {
             json!(["first"])
         );
         // Text mode keeps assets ahead of frame media and reports the cut.
-        let (references, dropped) =
-            references_for_mode(frames, assets, &json!("text")).unwrap();
+        let (references, dropped) = references_for_mode(frames, assets, &json!("text")).unwrap();
         assert_eq!(references, json!(["role", "scene", "first", "middle"]));
         assert_eq!(dropped, vec!["last".to_string()]);
         assert_eq!(
@@ -2957,18 +2946,18 @@ mod prompt_tests {
                 file_path: "scene.png".into(),
             },
         ];
-        let prompt = compile_video_prompt_with_manifest(
-            "@图1 走向 @图2，镜头缓慢推进。",
-            &references,
-        )
-        .unwrap();
+        let prompt =
+            compile_video_prompt_with_manifest("@图1 走向 @图2，镜头缓慢推进。", &references)
+                .unwrap();
         assert!(prompt.starts_with(
             "参考图清单：@图1 为沈辞（role，资产ID=11，图片ID=101）；@图2 为城楼（scene，资产ID=22，图片ID=202）"
         ));
         assert!(prompt.ends_with("@图1 走向 @图2，镜头缓慢推进。"));
-        assert!(compile_video_prompt_with_manifest("@图1 独自行走", &references)
-            .unwrap_err()
-            .contains("缺少服务端参考清单中的 @图2"));
+        assert!(
+            compile_video_prompt_with_manifest("@图1 独自行走", &references)
+                .unwrap_err()
+                .contains("缺少服务端参考清单中的 @图2")
+        );
         assert!(compile_video_prompt_with_manifest("@图3 出现", &references).is_err());
     }
 
@@ -2977,8 +2966,16 @@ mod prompt_tests {
         assert_eq!(parse_shot_duration("4", 1).unwrap(), 4.0);
         assert_eq!(parse_shot_duration("2.5s", 2).unwrap(), 2.5);
         assert_eq!(parse_shot_duration("3秒", 3).unwrap(), 3.0);
-        assert!(parse_shot_duration("0", 4).unwrap_err().contains("必须大于 0"));
-        assert!(parse_shot_duration("未知", 5).unwrap_err().contains("时长无效"));
+        assert!(
+            parse_shot_duration("0", 4)
+                .unwrap_err()
+                .contains("必须大于 0")
+        );
+        assert!(
+            parse_shot_duration("未知", 5)
+                .unwrap_err()
+                .contains("时长无效")
+        );
     }
 }
 #[derive(Deserialize)]
@@ -3338,8 +3335,8 @@ mod regression_corpus {
     //! 不变；“背影”类角度样例需要先扩展运镜/机位字段再纳入。
 
     use super::{
-        StructuredShotReference, compile_video_prompt_with_manifest, merge_references,
-        references_for_mode, validate_prompt_references, validate_shot_framing_subjects,
+        StructuredShotReference, compile_video_prompt_with_manifest, references_for_mode,
+        validate_prompt_references, validate_shot_framing_subjects,
     };
     use crate::toonflow_asset_context::{TrackAssetReference, select_references_within_cap};
     use crate::toonflow_video_compilers::validate_family_request;
@@ -3381,17 +3378,24 @@ mod regression_corpus {
         let (selected, dropped) = select_references_within_cap(references.clone(), 4);
         assert_eq!(selected.len(), 2);
         assert!(dropped.is_empty());
-        let prompt =
-            compile_video_prompt_with_manifest("@图1 与 @图2 对峙", &selected).unwrap();
+        let prompt = compile_video_prompt_with_manifest("@图1 与 @图2 对峙", &selected).unwrap();
         assert!(prompt.contains("@图1 为沈辞"));
         assert!(prompt.contains("@图2 为林晚"));
         // 双人样例必须同时引用两张图；漏引即失败。
-        assert!(compile_video_prompt_with_manifest("@图1 独白", &selected)
-            .unwrap_err()
-            .contains("缺少服务端参考清单中的 @图2"));
+        assert!(
+            compile_video_prompt_with_manifest("@图1 独白", &selected)
+                .unwrap_err()
+                .contains("缺少服务端参考清单中的 @图2")
+        );
         // 双人镜头不能是特写/近景。
-        assert!(validate_shot_framing_subjects(Some("特写"), &[shot_reference("role"), shot_reference("role")], 1)
-            .is_err());
+        assert!(
+            validate_shot_framing_subjects(
+                Some("特写"),
+                &[shot_reference("role"), shot_reference("role")],
+                1
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -3443,12 +3447,14 @@ mod regression_corpus {
         assert!(validate_shot_framing_subjects(Some("特写"), &[shot_reference("role")], 1).is_ok());
         assert!(validate_shot_framing_subjects(Some("近景"), &[shot_reference("role")], 3).is_ok());
         // 非人物资产不占用特写单主体名额。
-        assert!(validate_shot_framing_subjects(
-            Some("特写"),
-            &[shot_reference("role"), shot_reference("tool")],
-            1
-        )
-        .is_ok());
+        assert!(
+            validate_shot_framing_subjects(
+                Some("特写"),
+                &[shot_reference("role"), shot_reference("tool")],
+                1
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -3468,21 +3474,21 @@ mod regression_corpus {
     fn empty_shot_keeps_environment_only_context() {
         // 空镜：无人物主体，纯场景；任何景别都不触发单主体规则。
         assert!(validate_shot_framing_subjects(Some("全景"), &[], 1).is_ok());
-        assert!(validate_shot_framing_subjects(
-            Some("远景"),
-            &[shot_reference("scene")],
-            1
-        )
-        .is_ok());
+        assert!(
+            validate_shot_framing_subjects(Some("远景"), &[shot_reference("scene")], 1).is_ok()
+        );
         let (selected, _) = select_references_within_cap(vec![reference("天台", "scene")], 4);
         assert_eq!(selected.len(), 1);
     }
 
     #[test]
     fn first_frame_mode_selects_exactly_one_frame() {
-        let (references, dropped) =
-            references_for_mode(json!(["frame-a.png", "frame-b.png", "frame-c.png"]), vec![], &json!("singleImage"))
-                .unwrap();
+        let (references, dropped) = references_for_mode(
+            json!(["frame-a.png", "frame-b.png", "frame-c.png"]),
+            vec![],
+            &json!("singleImage"),
+        )
+        .unwrap();
         assert_eq!(references, json!(["frame-a.png"]));
         assert!(dropped.is_empty());
         assert!(validate_family_request("wan2.2-i2v", "singleImage", 1).is_ok());
@@ -3501,10 +3507,14 @@ mod regression_corpus {
         assert_eq!(references, json!(["first.png", "last.png"]));
         assert!(validate_family_request("seedance-1-5", "startEndRequired", 2).is_ok());
         // 尾帧模式家族校验先于供应商失败。
-        assert!(validate_family_request("wan2.2-i2v", "startEndRequired", 2)
-            .unwrap_err()
-            .contains("不支持尾帧参考模式"));
+        assert!(
+            validate_family_request("wan2.2-i2v", "startEndRequired", 2)
+                .unwrap_err()
+                .contains("不支持尾帧参考模式")
+        );
         // 帧数不足必须明确失败。
-        assert!(references_for_mode(json!(["only.png"]), vec![], &json!("startEndRequired")).is_err());
+        assert!(
+            references_for_mode(json!(["only.png"]), vec![], &json!("startEndRequired")).is_err()
+        );
     }
 }

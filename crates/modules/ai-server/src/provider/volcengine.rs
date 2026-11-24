@@ -226,8 +226,8 @@ impl VolcEngineMediaProvider {
 #[cfg(test)]
 mod tests {
     use super::{
-        VolcEngineMediaProvider, apply_image_generation_options, validate_seedance_duration,
-        normalize_seedream_size,
+        VolcEngineMediaProvider, apply_image_generation_options, normalize_seedream_size,
+        validate_seedance_duration,
     };
     use rust_toon_ai_api::ModelConfig;
     use serde_json::json;

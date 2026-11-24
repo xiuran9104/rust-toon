@@ -155,7 +155,11 @@ pub async fn add_novel(
                (chapter_index, reel, chapter, chapter_data, project_id, event_state, create_time)
                VALUES ($1,$2,$3,$4,$5,0,$6) RETURNING id"#,
         )
-        .bind(if item.index > 0 { item.index } else { chapter_index })
+        .bind(if item.index > 0 {
+            item.index
+        } else {
+            chapter_index
+        })
         .bind(item.reel)
         .bind(item.chapter)
         .bind(item.chapter_data)
@@ -1431,8 +1435,9 @@ async fn validate_storyboard_prompt_inputs(
 /// P0.2 结构化镜头：景别与运镜的合法值域。新增值前先确认生成链路
 /// （结构化编译、供应商提示词）能消费它。
 pub(crate) const SHOT_SIZES: &[&str] = &["特写", "近景", "中景", "全景", "远景", "大远景"];
-pub(crate) const CAMERA_MOVES: &[&str] =
-    &["固定", "推镜", "拉镜", "摇镜", "移镜", "跟镜", "升降", "环绕"];
+pub(crate) const CAMERA_MOVES: &[&str] = &[
+    "固定", "推镜", "拉镜", "摇镜", "移镜", "跟镜", "升降", "环绕",
+];
 
 /// 对齐方案 P1 场景日夜状态：镜头的昼夜时间。空值表示未指定。
 pub(crate) const TIMES_OF_DAY: &[&str] = &["日", "夜", "晨", "黄昏"];
@@ -1441,23 +1446,22 @@ pub(crate) fn validate_shot_framing(
     shot_size: &Option<String>,
     camera_move: &Option<String>,
 ) -> Result<(), AppError> {
-    if let Some(size) = shot_size.as_deref().filter(|value| !value.is_empty()) {
-        if !SHOT_SIZES.contains(&size) {
-            return Err(AppError::bad_request(format!(
-                "景别必须是 {SHOT_SIZES:?} 之一，收到“{size}”"
-            )));
-        }
+    if let Some(size) = shot_size.as_deref().filter(|value| !value.is_empty())
+        && !SHOT_SIZES.contains(&size)
+    {
+        return Err(AppError::bad_request(format!(
+            "景别必须是 {SHOT_SIZES:?} 之一，收到“{size}”"
+        )));
     }
-    if let Some(movement) = camera_move.as_deref().filter(|value| !value.is_empty()) {
-        if !CAMERA_MOVES.contains(&movement) {
-            return Err(AppError::bad_request(format!(
-                "运镜必须是 {CAMERA_MOVES:?} 之一，收到“{movement}”"
-            )));
-        }
+    if let Some(movement) = camera_move.as_deref().filter(|value| !value.is_empty())
+        && !CAMERA_MOVES.contains(&movement)
+    {
+        return Err(AppError::bad_request(format!(
+            "运镜必须是 {CAMERA_MOVES:?} 之一，收到“{movement}”"
+        )));
     }
     Ok(())
 }
-
 
 /// 随身物件的帮助：None（编辑路径未传）视作不改？此处统一为空数组写入，
 /// 创建语义为“未声明”；编辑时前端会回填现有值。
@@ -1491,12 +1495,12 @@ pub(crate) fn validate_carried_objects(value: &Option<Value>) -> Result<(), AppE
 }
 
 pub(crate) fn validate_time_of_day(value: &Option<String>) -> Result<(), AppError> {
-    if let Some(time) = value.as_deref().filter(|value| !value.is_empty()) {
-        if !TIMES_OF_DAY.contains(&time) {
-            return Err(AppError::bad_request(format!(
-                "昼夜时间必须是 {TIMES_OF_DAY:?} 之一，收到“{time}”"
-            )));
-        }
+    if let Some(time) = value.as_deref().filter(|value| !value.is_empty())
+        && !TIMES_OF_DAY.contains(&time)
+    {
+        return Err(AppError::bad_request(format!(
+            "昼夜时间必须是 {TIMES_OF_DAY:?} 之一，收到“{time}”"
+        )));
     }
     Ok(())
 }
@@ -1575,7 +1579,7 @@ async fn insert_storyboard(
 ) -> Result<i64, AppError> {
     let scene_key = normalize_persisted_scene_key(request.scene_key.as_deref())?;
     let scene_state_id = crate::toonflow_scene_consistency::resolve_storyboard_scene_state(
-        &mut **tx,
+        tx,
         project_id,
         script_id,
         scene_key.as_deref(),
@@ -1903,7 +1907,7 @@ pub async fn edit_storyboard_info(
     let state_was_provided = request.scene_state_id.is_some() || request.scene_state_key.is_some();
     let scene_state_id = if scene_changed || state_was_provided {
         crate::toonflow_scene_consistency::resolve_storyboard_scene_state(
-            &mut *tx,
+            &mut tx,
             project_id,
             script_id,
             effective_scene_key,

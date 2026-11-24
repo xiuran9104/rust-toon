@@ -79,8 +79,7 @@ async fn main() -> anyhow::Result<()> {
     let toon_state = rust_toon_toon_server::ToonState::new(database.clone(), tokens.clone());
     let resumed_videos =
         rust_toon_toon_server::resume_interrupted_video_generations(&database).await;
-    let resumed_runs =
-        rust_toon_toon_server::resume_interrupted_workflow_runs(&toon_state).await;
+    let resumed_runs = rust_toon_toon_server::resume_interrupted_workflow_runs(&toon_state).await;
     if resumed_videos > 0 || resumed_runs > 0 {
         info!(
             resumed_videos,
@@ -182,9 +181,12 @@ async fn serve_gateway(
     let listener = TcpListener::bind(addr).await?;
     info!(service = %config.name, address = %addr, "service listening");
 
-    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-        .with_graceful_shutdown(shutdown_signal(drain))
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal(drain))
+    .await?;
 
     Ok(())
 }

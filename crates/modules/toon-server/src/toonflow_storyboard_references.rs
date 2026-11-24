@@ -151,16 +151,16 @@ async fn apply_costume_overrides(
         let candidate = rows.iter().find(|(parent, _, _, scenes)| {
             *parent == reference.asset_id && scene_matches(scene_key, &scenes_of(scenes))
         });
-        if let Some((_, derive_id, file_path, _)) = candidate {
-            if *file_path != reference.file_path {
-                overrides.push(json!({
-                    "assetId": reference.asset_id,
-                    "deriveId": derive_id,
-                    "fromImagePath": reference.file_path,
-                    "toImagePath": file_path,
-                }));
-                reference.file_path = file_path.clone();
-            }
+        if let Some((_, derive_id, file_path, _)) = candidate
+            && *file_path != reference.file_path
+        {
+            overrides.push(json!({
+                "assetId": reference.asset_id,
+                "deriveId": derive_id,
+                "fromImagePath": reference.file_path,
+                "toImagePath": file_path,
+            }));
+            reference.file_path = file_path.clone();
         }
     }
     overrides
@@ -398,10 +398,10 @@ fn append_reference_if_missing(
     }
 }
 
-fn state_chain<'a>(
-    states: &'a [StateConstraint],
+fn state_chain(
+    states: &[StateConstraint],
     current_state_id: i64,
-) -> Result<Vec<&'a StateConstraint>, AppError> {
+) -> Result<Vec<&StateConstraint>, AppError> {
     let by_id = states
         .iter()
         .map(|scene_state| (scene_state.id, scene_state))

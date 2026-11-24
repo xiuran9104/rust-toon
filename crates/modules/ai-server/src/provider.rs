@@ -16,24 +16,22 @@ fn append_utf8_chunk(
     chunk: &[u8],
 ) -> Result<(), String> {
     pending.extend_from_slice(chunk);
-    loop {
-        match std::str::from_utf8(pending) {
-            Ok(text) => {
-                buffer.push_str(text);
-                pending.clear();
-                return Ok(());
-            }
-            Err(error) if error.error_len().is_none() => {
-                let valid = error.valid_up_to();
-                if valid > 0 {
-                    let text = std::str::from_utf8(&pending[..valid]).map_err(|e| e.to_string())?;
-                    buffer.push_str(text);
-                    pending.drain(..valid);
-                }
-                return Ok(());
-            }
-            Err(error) => return Err(format!("模型流包含无效 UTF-8：{error}")),
+    match std::str::from_utf8(pending) {
+        Ok(text) => {
+            buffer.push_str(text);
+            pending.clear();
+            Ok(())
         }
+        Err(error) if error.error_len().is_none() => {
+            let valid = error.valid_up_to();
+            if valid > 0 {
+                let text = std::str::from_utf8(&pending[..valid]).map_err(|e| e.to_string())?;
+                buffer.push_str(text);
+                pending.drain(..valid);
+            }
+            Ok(())
+        }
+        Err(error) => Err(format!("模型流包含无效 UTF-8：{error}")),
     }
 }
 

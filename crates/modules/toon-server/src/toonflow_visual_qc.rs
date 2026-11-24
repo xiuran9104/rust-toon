@@ -106,18 +106,17 @@ fn qc_tool_for(catalog: &[(&str, &str)]) -> Value {
 
 /// 解析模型提交的质检结论。维度名、置信度范围与 passed 一致性都严格校验：
 /// 质检结论驱动自动重试，坏数据宁可拒绝也不能放行。
+#[cfg(test)]
 pub(crate) fn parse_qc_verdict(value: &Value) -> Result<VisualQcReport, String> {
     parse_verdict_for(value, &qc_check_catalog())
 }
 
+#[cfg(test)]
 pub(crate) fn parse_video_qc_verdict(value: &Value) -> Result<VisualQcReport, String> {
     parse_verdict_for(value, &video_qc_check_catalog())
 }
 
-fn parse_verdict_for(
-    value: &Value,
-    catalog: &[(&str, &str)],
-) -> Result<VisualQcReport, String> {
+fn parse_verdict_for(value: &Value, catalog: &[(&str, &str)]) -> Result<VisualQcReport, String> {
     let valid_checks = catalog_names(catalog);
     let passed = value
         .get("passed")
@@ -239,7 +238,9 @@ pub(crate) fn storyboard_expectations(
         sections.push(format!("运镜：{camera_move}"));
     }
     if !time_of_day.is_empty() {
-        sections.push(format!("时间：{time_of_day}（光线、色温与阴影必须与该时间一致）"));
+        sections.push(format!(
+            "时间：{time_of_day}（光线、色温与阴影必须与该时间一致）"
+        ));
     }
     if !carried_objects.is_empty() {
         sections.push(format!(
@@ -268,7 +269,9 @@ pub(crate) fn video_frame_expectations(
         sections.push(format!("运镜要求：{camera_moves}"));
     }
     if !first_frame_summary.is_empty() {
-        sections.push(format!("首帧参考：{first_frame_summary}（视频首帧应与其内容一致）"));
+        sections.push(format!(
+            "首帧参考：{first_frame_summary}（视频首帧应与其内容一致）"
+        ));
     }
     sections.join("\n")
 }
@@ -281,8 +284,7 @@ pub(crate) async fn evaluate_image(
     image_path: &str,
     expectations: &str,
 ) -> Result<VisualQcReport, String> {
-    let data_url =
-        crate::toonflow_storage::image_data_url(image_path).await?;
+    let data_url = crate::toonflow_storage::image_data_url(image_path).await?;
     evaluate_image_parts(
         pool,
         project_id,
@@ -321,9 +323,7 @@ async fn evaluate_image_parts(
     if image_data_urls.is_empty() {
         return Err("没有可质检的图片".into());
     }
-    let mut content = vec![
-        json!({"type":"text","text":format!("期望说明：\n{expectations}")}),
-    ];
+    let mut content = vec![json!({"type":"text","text":format!("期望说明：\n{expectations}")})];
     content.extend(
         image_data_urls
             .iter()
@@ -390,12 +390,14 @@ mod tests {
         let repair = repair_instructions_for(&verdict, &video_qc_check_catalog()).unwrap();
         assert!(repair.contains("首帧与参考清单中的首帧内容一致"));
         // 图片维度不得混入视频结论。
-        assert!(parse_video_qc_verdict(&json!({
-            "passed": false, "summary": "",
-            "failures": [{"check":"costume","evidence":"不对","confidence":0.9}]
-        }))
-        .unwrap_err()
-        .contains("未知质检维度"));
+        assert!(
+            parse_video_qc_verdict(&json!({
+                "passed": false, "summary": "",
+                "failures": [{"check":"costume","evidence":"不对","confidence":0.9}]
+            }))
+            .unwrap_err()
+            .contains("未知质检维度")
+        );
     }
 
     #[test]
@@ -433,25 +435,33 @@ mod tests {
 
     #[test]
     fn rejects_unknown_checks_and_inconsistent_verdicts() {
-        assert!(parse_qc_verdict(&json!({
-            "passed": false, "summary": "", "failures": []
-        }))
-        .is_err());
-        assert!(parse_qc_verdict(&json!({
-            "passed": true, "summary": "",
-            "failures": [{"check":"identity","evidence":"不像","confidence":0.9}]
-        }))
-        .is_err());
-        assert!(parse_qc_verdict(&json!({
-            "passed": false, "summary": "",
-            "failures": [{"check":"vibe","evidence":"不好看","confidence":0.9}]
-        }))
-        .unwrap_err()
-        .contains("未知质检维度"));
-        assert!(parse_qc_verdict(&json!({
-            "passed": false, "summary": "",
-            "failures": [{"check":"identity","evidence":"不像","confidence":1.5}]
-        }))
-        .is_err());
+        assert!(
+            parse_qc_verdict(&json!({
+                "passed": false, "summary": "", "failures": []
+            }))
+            .is_err()
+        );
+        assert!(
+            parse_qc_verdict(&json!({
+                "passed": true, "summary": "",
+                "failures": [{"check":"identity","evidence":"不像","confidence":0.9}]
+            }))
+            .is_err()
+        );
+        assert!(
+            parse_qc_verdict(&json!({
+                "passed": false, "summary": "",
+                "failures": [{"check":"vibe","evidence":"不好看","confidence":0.9}]
+            }))
+            .unwrap_err()
+            .contains("未知质检维度")
+        );
+        assert!(
+            parse_qc_verdict(&json!({
+                "passed": false, "summary": "",
+                "failures": [{"check":"identity","evidence":"不像","confidence":1.5}]
+            }))
+            .is_err()
+        );
     }
 }

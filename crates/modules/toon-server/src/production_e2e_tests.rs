@@ -3,7 +3,7 @@ use std::{process::Command, time::Duration};
 use axum::{
     Json,
     body::to_bytes,
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
 };
 use rust_toon_framework_database::{DatabaseConfig, connect, migrate};

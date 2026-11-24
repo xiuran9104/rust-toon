@@ -1,6 +1,6 @@
 use crate::provider::{
-    AnthropicProvider, AzureOpenAiProvider, ChatProvider, GeminiProvider,
-    OpenAiCompatibleProvider, VolcEngineMediaProvider, provider_app_error,
+    AnthropicProvider, AzureOpenAiProvider, ChatProvider, GeminiProvider, OpenAiCompatibleProvider,
+    VolcEngineMediaProvider, provider_app_error,
 };
 use rust_toon_ai_api::{
     AiModelType, AiPlatform, ChatRequest, ChatResponse, EmbeddingRequest, EmbeddingResponse,

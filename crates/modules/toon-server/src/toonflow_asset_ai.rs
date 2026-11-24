@@ -493,7 +493,7 @@ async fn wait_for_image(pool: &sqlx::PgPool, image_id: i64) -> Result<String, St
                     .filter(|path| !path.is_empty())
                     .ok_or_else(|| "图片任务完成但缺少文件".into());
             }
-            "生成失败" | "已取消" => return Err(error_reason.unwrap_or_else(|| state)),
+            "生成失败" | "已取消" => return Err(error_reason.unwrap_or(state)),
             _ if tokio::time::Instant::now() >= deadline => {
                 return Err("等待图片生成超时，请检查图片服务".into());
             }
@@ -939,14 +939,7 @@ pub async fn generate_image(
         prompt: req.prompt,
         base64: req.base64,
     };
-    let scheduled = new_image(
-        &state.pool,
-        req.project_id,
-        &item,
-        &model,
-        &req.resolution,
-    )
-    .await?;
+    let scheduled = new_image(&state.pool, req.project_id, &item, &model, &req.resolution).await?;
     let result = if let Some(path) = scheduled.file_path.clone() {
         Ok(path)
     } else if scheduled.created {
@@ -980,14 +973,8 @@ pub async fn batch_generate_images(
     let mut queue = Vec::new();
     let mut scheduled_items = Vec::new();
     for item in req.items.into_iter() {
-        let scheduled = new_image(
-            &state.pool,
-            req.project_id,
-            &item,
-            &model,
-            &req.resolution,
-        )
-        .await?;
+        let scheduled =
+            new_image(&state.pool, req.project_id, &item, &model, &req.resolution).await?;
         scheduled_items.push(json!({"id":item.id,"imageId":scheduled.id,"state":scheduled.state,"filePath":scheduled.file_path,"reused":scheduled.reused}));
         if scheduled.created {
             queue.push((scheduled.id, item));

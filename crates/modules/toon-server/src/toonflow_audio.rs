@@ -163,13 +163,7 @@ pub async fn add_audio_assets(
         .bind(request.name).bind(request.describe).bind(request.project_id).bind(now_ms())
         .fetch_one(&mut *tx).await.map_err(|_|AppError::internal("failed to add audio collection"))?;
     for item in request.assets_item.iter() {
-        insert_audio_child(
-            &mut tx,
-            parent_id,
-            request.project_id,
-            item,
-        )
-        .await?;
+        insert_audio_child(&mut tx, parent_id, request.project_id, item).await?;
     }
     tx.commit()
         .await
@@ -228,13 +222,7 @@ pub async fn update_audio_assets(
                     .map_err(|_| AppError::internal("failed to update audio file"))?;
             }
         } else {
-            insert_audio_child(
-                &mut tx,
-                request.id,
-                request.project_id,
-                item,
-            )
-            .await?;
+            insert_audio_child(&mut tx, request.id, request.project_id, item).await?;
         }
     }
     tx.commit()

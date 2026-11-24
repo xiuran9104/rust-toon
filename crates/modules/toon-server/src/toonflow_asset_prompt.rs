@@ -123,6 +123,7 @@ pub(crate) fn image_prompt_with_instruction(
     )
 }
 
+#[allow(clippy::too_many_arguments)] // 与图片供应商请求的字段一一对应
 pub(crate) fn image_prompt_with_source_instruction(
     style: &str,
     asset_type: &str,

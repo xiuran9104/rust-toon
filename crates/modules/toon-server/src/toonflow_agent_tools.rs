@@ -735,7 +735,8 @@ pub(crate) async fn execute_inner(
                 .unwrap_or_else(|| "（当前工作区为空）".to_string());
             let full_system = format!(
                 "{system}\n\n## 当前项目\n{project_hint}\n\n## 服务端预载的最新剧本工作区\n{workspace_context}\n\n你是 Toonflow 的{label}子 Agent。需要核实原著时使用读取工具；完成后直接输出一次最终 XML，不要先输出草稿。{supervision_scope}"
-            ) + &format_instruction + crate::toonflow_script_quality::POLICY;
+            ) + &format_instruction
+                + crate::toonflow_script_quality::POLICY;
             let has_novel: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM toonflow.novels WHERE project_id=$1)",
             )
@@ -743,10 +744,16 @@ pub(crate) async fn execute_inner(
             .fetch_one(&state.pool)
             .await
             .map_err(|_| AppError::internal("failed to inspect source availability"))?;
-            let quality_stage = matches!(agent_key,
-                "scriptAgent:storySkeletonAgent" | "scriptAgent:adaptationStrategyAgent" | "scriptAgent:supervisionAgent");
-            let mut evidence = crate::toonflow_script_quality::ReadEvidence::default();
-            evidence.workspace = true;
+            let quality_stage = matches!(
+                agent_key,
+                "scriptAgent:storySkeletonAgent"
+                    | "scriptAgent:adaptationStrategyAgent"
+                    | "scriptAgent:supervisionAgent"
+            );
+            let mut evidence = crate::toonflow_script_quality::ReadEvidence {
+                workspace: true,
+                ..Default::default()
+            };
             let mut correction_attempts = 0;
 
             // Sub-agent read-only tool definitions
@@ -814,16 +821,16 @@ pub(crate) async fn execute_inner(
                     if candidate.is_empty() {
                         return Err(AppError::bad_request("子 Agent 未返回有效内容"));
                     }
-                    if quality_stage {
-                        if let Some(reason) = evidence.missing(has_novel, true) {
-                            correction_attempts += 1;
-                            if correction_attempts > 2 {
-                                return Err(AppError::bad_request(format!("原著核实未完成，未保存本次生成：{reason}")));
-                            }
-                            messages.push(message);
-                            messages.push(json!({"role":"user","content":reason}));
-                            continue;
+                    if quality_stage && let Some(reason) = evidence.missing(has_novel, true) {
+                        correction_attempts += 1;
+                        if correction_attempts > 2 {
+                            return Err(AppError::bad_request(format!(
+                                "原著核实未完成，未保存本次生成：{reason}"
+                            )));
                         }
+                        messages.push(message);
+                        messages.push(json!({"role":"user","content":reason}));
+                        continue;
                     }
                     if let Some(limit) = supervision_episode_limit {
                         let invalid = explicit_episode_limit(&candidate)
@@ -919,18 +926,13 @@ pub(crate) async fn execute_inner(
                 if !episodes.is_empty() {
                     let mut data:Value=sqlx::query_scalar("SELECT data FROM toonflow.agent_work_data WHERE project_id=$1 AND episodes_id IS NULL AND key='scriptAgent'").bind(request.project_id).fetch_optional(&state.pool).await.map_err(|_|AppError::internal("failed to load script workspace"))?.unwrap_or_else(||json!({"storySkeleton":"","adaptationStrategy":""}));
                     if let Some(store) = data.as_object_mut() {
-                        let entry = store
-                            .entry("scriptEpisodes")
-                            .or_insert_with(|| json!({}));
+                        let entry = store.entry("scriptEpisodes").or_insert_with(|| json!({}));
                         if let Some(map) = entry.as_object_mut() {
                             for (name, content) in episodes {
                                 map.insert(name, json!(content));
                             }
                         }
-                        store.insert(
-                            "scriptEpisodesUpdatedAt".to_string(),
-                            json!(now_ms()),
-                        );
+                        store.insert("scriptEpisodesUpdatedAt".to_string(), json!(now_ms()));
                     }
                     sqlx::query("INSERT INTO toonflow.agent_work_data(project_id,episodes_id,key,data,create_time,update_time)VALUES($1,NULL,'scriptAgent',$2,$3,$3) ON CONFLICT(project_id,key) WHERE episodes_id IS NULL DO UPDATE SET data=excluded.data,update_time=excluded.update_time").bind(request.project_id).bind(data).bind(now_ms()).execute(&state.pool).await.map_err(|_|AppError::internal("failed to save script episode checkpoints"))?;
                 }
@@ -960,7 +962,9 @@ pub(crate) async fn execute_inner(
                 } else {
                     assets
                 };
-                return Ok(changed_flow_data(&state.pool, &request.isolation_key, key, value).await);
+                return Ok(
+                    changed_flow_data(&state.pool, &request.isolation_key, key, value).await,
+                );
             }
             if key == "storyboard" {
                 let data = crate::toonflow_video::load_generate_data(
@@ -1111,9 +1115,7 @@ pub(crate) async fn execute_inner(
             .fetch_optional(&state.pool)
             .await
             .map_err(|_| AppError::internal("failed to find appearance derivative"))?;
-            let id = existing_id.or_else(|| {
-                request.arguments.get("id").and_then(Value::as_i64)
-            });
+            let id = existing_id.or_else(|| request.arguments.get("id").and_then(Value::as_i64));
             let parent_type =
                 parent_type.ok_or_else(|| AppError::not_found("parent asset not found"))?;
             if parent_type != "role" {
@@ -1932,7 +1934,7 @@ pub(crate) async fn execute_inner(
                     .map_err(|_| AppError::internal("failed to add storyboard track"))?
             };
             let scene_state_id = crate::toonflow_scene_consistency::resolve_storyboard_scene_state(
-                &mut *tx,
+                &mut tx,
                 request.project_id,
                 script_id,
                 Some(&scene_key),
@@ -2101,7 +2103,7 @@ pub(crate) async fn execute_inner(
                     sqlx::query_scalar("SELECT asset_id FROM toonflow.assets_storyboards WHERE storyboard_id=$1 ORDER BY sort_order,asset_id").bind(id).fetch_all(&mut *tx).await.map_err(|_|AppError::internal("failed to load storyboard assets"))?
                 };
                 crate::toonflow_scene_consistency::resolve_storyboard_scene_state(
-                    &mut *tx,
+                    &mut tx,
                     request.project_id,
                     script_id,
                     effective_scene_key,

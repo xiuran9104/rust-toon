@@ -7,8 +7,8 @@ use axum::{
     response::IntoResponse,
 };
 use futures_util::{SinkExt, StreamExt};
-use rust_toon_framework_web::AppError;
 use rust_toon_framework_security::{AuthenticatedSession, CurrentUser};
+use rust_toon_framework_web::AppError;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::watch;
@@ -350,12 +350,18 @@ pub async fn ws_handler(
     let _ = toonflow_agents::agent_key_for(agent_type).map_err(|e| AppError::bad_request(&e))?;
 
     require(&user, "toon:project:read")?;
-    toonflow_agents::authorize_context(&state, &user, agent_type, &params.isolation_key, params.project_id, params.script_id).await?;
+    toonflow_agents::authorize_context(
+        &state,
+        &user,
+        agent_type,
+        &params.isolation_key,
+        params.project_id,
+        params.script_id,
+    )
+    .await?;
     let agent_type = agent_type.to_owned();
 
-    Ok(ws.on_upgrade(move |socket| {
-        handle_socket(socket, state, params, agent_type, session)
-    }))
+    Ok(ws.on_upgrade(move |socket| handle_socket(socket, state, params, agent_type, session)))
 }
 
 async fn handle_socket(
@@ -508,12 +514,7 @@ async fn handle_socket(
 
     // durable 第三阶段：若该隔离键仍有运行中的任务（例如用户在运行中途
     // 刷新了页面），通知客户端重新挂载"执行中"指示并跟随到终态。
-    match toonflow_agents::latest_running_run(
-        &state.pool,
-        &agent_type,
-        &params.isolation_key,
-    )
-    .await
+    match toonflow_agents::latest_running_run(&state.pool, &agent_type, &params.isolation_key).await
     {
         Ok(Some((run_id, start_time))) => {
             emitter.send_json(&json!({
@@ -587,12 +588,29 @@ async fn handle_socket(
             }
         };
 
-        let Ok(user) = session.validate().await else { break; };
-        let permission = if matches!(&client_msg, ClientMessage::Chat { .. } | ClientMessage::Stop) {
+        let Ok(user) = session.validate().await else {
+            break;
+        };
+        let permission = if matches!(
+            &client_msg,
+            ClientMessage::Chat { .. } | ClientMessage::Stop
+        ) {
             "toon:project:update"
-        } else { "toon:project:read" };
+        } else {
+            "toon:project:read"
+        };
         if require(&user, permission).is_err()
-            || toonflow_agents::authorize_context(&state, &user, &agent_type, &params.isolation_key, params.project_id, params.script_id).await.is_err() {
+            || toonflow_agents::authorize_context(
+                &state,
+                &user,
+                &agent_type,
+                &params.isolation_key,
+                params.project_id,
+                params.script_id,
+            )
+            .await
+            .is_err()
+        {
             break;
         }
         match client_msg {
@@ -639,7 +657,9 @@ async fn handle_socket(
                     .await
                     {
                         Ok(_) => {}
-                        Err(error) => warn!(%error, run_id = old_run_id, "failed to cancel superseded agent run"),
+                        Err(error) => {
+                            warn!(%error, run_id = old_run_id, "failed to cancel superseded agent run")
+                        }
                     }
                 }
 
@@ -740,8 +760,7 @@ async fn handle_socket(
                 if let Some(run_id) = active_run_id.take() {
                     toonflow_agents::unregister_active_run(run_id);
                     if let Err(error) =
-                        toonflow_agents::mark_run_canceled(&state.pool, run_id, "用户已中止")
-                            .await
+                        toonflow_agents::mark_run_canceled(&state.pool, run_id, "用户已中止").await
                     {
                         warn!(%error, run_id, "failed to cancel agent run");
                     }
@@ -787,12 +806,24 @@ async fn handle_socket(
                 project_id,
                 script_id,
             } => {
-                if toonflow_agents::authorize_context(&state, &user, &agent_type, &isolation_key, project_id, script_id).await.is_err() {
+                if toonflow_agents::authorize_context(
+                    &state,
+                    &user,
+                    &agent_type,
+                    &isolation_key,
+                    project_id,
+                    script_id,
+                )
+                .await
+                .is_err()
+                {
                     emitter.send_json(&json!({"event":"updateContext:ack","data":{"success":false,"message":"无权访问该 Agent 上下文"}}));
                     continue;
                 }
                 let _ = abort_tx.send(true);
-                if let Some(task) = active_task.take() { task.abort(); }
+                if let Some(task) = active_task.take() {
+                    task.abort();
+                }
                 active_message = None;
                 if let Some(run_id) = active_run_id.take() {
                     toonflow_agents::unregister_active_run(run_id);

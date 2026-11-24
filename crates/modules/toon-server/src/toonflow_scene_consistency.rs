@@ -1183,17 +1183,15 @@ async fn ensure_agent_scene_master(
 
     if let Some(existing) = existing {
         let base_candidate = candidates.first();
-        if state_key == BASE_STATE_KEY {
-            if let (Some(locked_asset_id), Some(candidate)) =
+        if state_key == BASE_STATE_KEY
+            && let (Some(locked_asset_id), Some(candidate)) =
                 (existing.scene_asset_id, base_candidate)
-            {
-                if locked_asset_id != candidate.id {
-                    return Err(AppError::bad_request(format!(
-                        "场次 {scene_key} 已锁定其他场景母版；不能在 base 状态混入“{}”",
-                        candidate.name
-                    )));
-                }
-            }
+            && locked_asset_id != candidate.id
+        {
+            return Err(AppError::bad_request(format!(
+                "场次 {scene_key} 已锁定其他场景母版；不能在 base 状态混入“{}”",
+                candidate.name
+            )));
         }
 
         let desired_scene_asset_id = if state_key == BASE_STATE_KEY {
@@ -1298,7 +1296,7 @@ async fn ensure_agent_scene_master(
     .fetch_optional(&mut *connection)
     .await
     .map_err(|_| AppError::internal("failed to create storyboard scene master"))?
-    .unwrap_or_else(|| 0);
+    .unwrap_or(0);
     let expected_master_id = (master_id != 0).then_some(master_id);
     load_scene_master_binding(
         connection,
@@ -1480,6 +1478,7 @@ async fn bind_inferred_state_references(
 /// Resolves the durable state binding for a storyboard write. Existing scene masters are never
 /// silently replaced: automatic inference only fills an empty master from a scene asset already
 /// bound to the storyboard.
+#[allow(clippy::too_many_arguments)] // 分镜落库时的全部场景定位输入
 pub(crate) async fn resolve_storyboard_scene_state(
     connection: &mut PgConnection,
     project_id: i64,
@@ -1521,12 +1520,12 @@ pub(crate) async fn resolve_storyboard_scene_state(
         None
     };
     let state_key = if let Some(scene_state) = requested_state.as_ref() {
-        if let Some(requested_key) = requested_state_key {
-            if normalize_state_key(requested_key)? != scene_state.state_key {
-                return Err(AppError::bad_request(
-                    "sceneStateId 与 sceneStateKey 指向的状态不一致",
-                ));
-            }
+        if let Some(requested_key) = requested_state_key
+            && normalize_state_key(requested_key)? != scene_state.state_key
+        {
+            return Err(AppError::bad_request(
+                "sceneStateId 与 sceneStateKey 指向的状态不一致",
+            ));
         }
         scene_state.state_key.clone()
     } else {
@@ -1623,14 +1622,13 @@ pub(crate) async fn resolve_storyboard_scene_state(
     } else {
         None
     };
-    if let Some(existing_state) = existing_state.as_ref() {
-        if requested_parent_state_id.is_some()
-            && requested_parent_state_id != existing_state.parent_state_id
-        {
-            return Err(AppError::bad_request(
-                "同一 sceneStateKey 的 sceneStateParentKey 必须保持一致",
-            ));
-        }
+    if let Some(existing_state) = existing_state.as_ref()
+        && requested_parent_state_id.is_some()
+        && requested_parent_state_id != existing_state.parent_state_id
+    {
+        return Err(AppError::bad_request(
+            "同一 sceneStateKey 的 sceneStateParentKey 必须保持一致",
+        ));
     }
     let parent_state_id = if let Some(existing_state) = existing_state.as_ref() {
         existing_state

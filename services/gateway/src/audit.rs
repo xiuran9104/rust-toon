@@ -38,9 +38,13 @@ pub async fn record(
     let method = request.method().to_string();
     let uri = request.uri().clone();
     let path = audit_path(&uri);
-    let authenticated_id = request.extensions().get::<CurrentUser>()
+    let authenticated_id = request
+        .extensions()
+        .get::<CurrentUser>()
         .map(|user| user.user_id.clone());
-    let peer_ip = request.extensions().get::<ConnectInfo<SocketAddr>>()
+    let peer_ip = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
         .map(|peer| peer.0.ip());
     let request_headers = request.headers().clone();
     let user_agent = request_headers
@@ -85,7 +89,11 @@ pub async fn record(
         let user_id: Option<i64> = match authenticated_id {
             Some(id) => sqlx::query_scalar(
                 "SELECT id FROM system_users WHERE md5('yudao-user:' || id::text)::uuid::text=$1",
-            ).bind(id).fetch_optional(&pool).await.unwrap_or(None),
+            )
+            .bind(id)
+            .fetch_optional(&pool)
+            .await
+            .unwrap_or(None),
             None => None,
         };
         let user_type: Option<i16> = user_id.map(|_| 2);
@@ -126,12 +134,30 @@ fn audit_path(uri: &Uri) -> String {
         // Keep only numeric pagination/resource selectors in the audit target.
         match Query::<Vec<(String, String)>>::try_from_uri(uri) {
             Ok(Query(pairs)) => {
-                let query = pairs.into_iter().map(|(key, value)| {
-                    let name = normalized_key(&key);
-                    let safe = matches!(name.as_str(), "id" | "projectid" | "scriptid" | "pageno" | "pagesize" | "page" | "limit" | "afterid" | "beforeid")
-                        && !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit());
-                    format!("{}={}", encode_query_key(&key), if safe { value.as_str() } else { "[REDACTED]" })
-                }).collect::<Vec<_>>().join("&");
+                let query = pairs
+                    .into_iter()
+                    .map(|(key, value)| {
+                        let name = normalized_key(&key);
+                        let safe = matches!(
+                            name.as_str(),
+                            "id" | "projectid"
+                                | "scriptid"
+                                | "pageno"
+                                | "pagesize"
+                                | "page"
+                                | "limit"
+                                | "afterid"
+                                | "beforeid"
+                        ) && !value.is_empty()
+                            && value.bytes().all(|byte| byte.is_ascii_digit());
+                        format!(
+                            "{}={}",
+                            encode_query_key(&key),
+                            if safe { value.as_str() } else { "[REDACTED]" }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("&");
                 path.push('?');
                 path.push_str(&query);
             }
@@ -142,17 +168,31 @@ fn audit_path(uri: &Uri) -> String {
 }
 
 fn encode_query_key(key: &str) -> String {
-    key.bytes().map(|byte| {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-            (byte as char).to_string()
-        } else { format!("%{byte:02X}") }
-    }).collect()
+    key.bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                (byte as char).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect()
 }
 
 fn metadata_only(uri: &Uri) -> bool {
     let path = uri.path();
-    ["/system/", "/ai/model", "/setting/", "/infra/config/", "/infra/data-source-config/", "/infra/file-config/", "/infra/api-access-log/", "/infra/api-error-log/"]
-        .iter().any(|prefix| path.starts_with(prefix))
+    [
+        "/system/",
+        "/ai/model",
+        "/setting/",
+        "/infra/config/",
+        "/infra/data-source-config/",
+        "/infra/file-config/",
+        "/infra/api-access-log/",
+        "/infra/api-error-log/",
+    ]
+    .iter()
+    .any(|prefix| path.starts_with(prefix))
 }
 
 async fn capture_request(
@@ -179,7 +219,7 @@ async fn capture_request(
 fn request_preview(method: &str, uri: &Uri, headers: &HeaderMap, body: &str) -> String {
     let mut output = format!("{method} {}\n{}", audit_path(uri), headers_preview(headers));
     if !body.is_empty() {
-        output.push_str("\n");
+        output.push('\n');
         output.push_str(body);
     }
     output
@@ -213,13 +253,19 @@ async fn capture_response(response: Response, status: i32, uri: &Uri) -> (Respon
 }
 
 fn failed_body(error: axum::Error) -> Body {
-    Body::from_stream(futures_util::stream::once(async move { Err::<Bytes, _>(error) }))
+    Body::from_stream(futures_util::stream::once(
+        async move { Err::<Bytes, _>(error) },
+    ))
 }
 
 fn can_capture_body(headers: &HeaderMap, body: &Body) -> bool {
     // Never buffer an unknown-length stream just for logging. HTTP extractors
     // retain responsibility for enforcing the actual request size limit.
-    if !body.size_hint().upper().is_some_and(|length| length <= MAX_AUDIT_BODY_BYTES as u64) {
+    if !body
+        .size_hint()
+        .upper()
+        .is_some_and(|length| length <= MAX_AUDIT_BODY_BYTES as u64)
+    {
         return false;
     }
     let content_type = headers
@@ -241,21 +287,50 @@ fn bytes_preview(bytes: &[u8]) -> String {
 }
 
 fn normalized_key(key: &str) -> String {
-    key.chars().filter(char::is_ascii_alphanumeric).flat_map(char::to_lowercase).collect()
+    key.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn sensitive_key(key: &str) -> bool {
     let key = normalized_key(key);
-    key == "key" || key == "url" || key == "dsn" || ["password", "passwd", "secret", "token", "credential", "authorization", "cookie", "apikey", "accesskey", "privatekey", "connectionstring"].iter().any(|part| key.contains(part))
+    key == "key"
+        || key == "url"
+        || key == "dsn"
+        || [
+            "password",
+            "passwd",
+            "secret",
+            "token",
+            "credential",
+            "authorization",
+            "cookie",
+            "apikey",
+            "accesskey",
+            "privatekey",
+            "connectionstring",
+        ]
+        .iter()
+        .any(|part| key.contains(part))
 }
 
 fn redact_json(value: &mut Value) {
     match value {
-        Value::Object(object) => for (key, value) in object {
-            if sensitive_key(key) { *value = Value::String("[REDACTED]".into()); }
-            else { redact_json(value); }
-        },
-        Value::Array(items) => for item in items { redact_json(item); },
+        Value::Object(object) => {
+            for (key, value) in object {
+                if sensitive_key(key) {
+                    *value = Value::String("[REDACTED]".into());
+                } else {
+                    redact_json(value);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_json(item);
+            }
+        }
         // Free text may contain nested JSON, provider errors or a pasted URL.
         // Store string lengths rather than trying to guess every secret format.
         Value::String(text) => *text = format!("[text omitted: {} chars]", text.chars().count()),
@@ -269,7 +344,9 @@ fn headers_preview(headers: &HeaderMap) -> String {
         .filter_map(|(name, value)| {
             let preview = if matches!(name.as_str(), "content-type" | "content-length" | "accept") {
                 value.to_str().ok()?.to_owned()
-            } else { "[REDACTED]".into() };
+            } else {
+                "[REDACTED]".into()
+            };
             Some(format!("{name}: {preview}"))
         })
         .collect::<Vec<_>>()
@@ -285,10 +362,20 @@ fn operation_metadata(method: &str, path: &str) -> (String, i16) {
     let action = segments.last().copied().unwrap_or("request");
     let resource = if action.parse::<i64>().is_ok()
         || matches!(
-        action,
-        "page" | "list" | "get" | "create" | "update" | "delete" | "export-excel"
-            | "import" | "login" | "logout" | "trigger" | "retry"
-    ) {
+            action,
+            "page"
+                | "list"
+                | "get"
+                | "create"
+                | "update"
+                | "delete"
+                | "export-excel"
+                | "import"
+                | "login"
+                | "logout"
+                | "trigger"
+                | "retry"
+        ) {
         segments.iter().rev().nth(1).copied().unwrap_or("gateway")
     } else {
         action
@@ -346,8 +433,26 @@ mod tests {
             "items": [{"password": "password-secret", "accessToken":"access-secret"}],
             "content":"https://example.com/?token=text-secret", "ok":true
         });
-        let preview = request_preview("POST", &uri, &headers, &bytes_preview(body.to_string().as_bytes()));
-        for secret in ["first-secret", "second-secret", "nested-secret", "header-secret", "cookie-secret", "response-secret", "custom-secret", "api-secret", "private-secret", "password-secret", "access-secret", "text-secret"] {
+        let preview = request_preview(
+            "POST",
+            &uri,
+            &headers,
+            &bytes_preview(body.to_string().as_bytes()),
+        );
+        for secret in [
+            "first-secret",
+            "second-secret",
+            "nested-secret",
+            "header-secret",
+            "cookie-secret",
+            "response-secret",
+            "custom-secret",
+            "api-secret",
+            "private-secret",
+            "password-secret",
+            "access-secret",
+            "text-secret",
+        ] {
             assert!(!preview.contains(secret), "leaked {secret}");
         }
         assert!(preview.contains("projectId=42"));
@@ -359,31 +464,50 @@ mod tests {
     async fn audit_preserves_business_body_and_omits_sensitive_routes() {
         let uri: Uri = "/system/auth/login?token=query-secret".parse().unwrap();
         let payload = r#"{"password":"body-secret","username":"admin"}"#;
-        let request = Request::builder().uri(uri.clone()).header("content-type", "application/json")
-            .body(Body::from(payload)).unwrap();
+        let request = Request::builder()
+            .uri(uri.clone())
+            .header("content-type", "application/json")
+            .body(Body::from(payload))
+            .unwrap();
         let headers = request.headers().clone();
         let (request, preview) = capture_request(request, &headers, &uri).await;
         assert!(!preview.contains("body-secret"));
         assert_eq!(to_bytes(request.into_body(), 1024).await.unwrap(), payload);
-        let response = Response::builder().header("content-type", "application/json")
-            .body(Body::from(r#"{"accessToken":"response-secret"}"#)).unwrap();
+        let response = Response::builder()
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"accessToken":"response-secret"}"#))
+            .unwrap();
         let (response, preview) = capture_response(response, 200, &uri).await;
         assert!(!preview.contains("response-secret"));
-        assert!(String::from_utf8(to_bytes(response.into_body(), 1024).await.unwrap().to_vec()).unwrap().contains("response-secret"));
+        assert!(
+            String::from_utf8(to_bytes(response.into_body(), 1024).await.unwrap().to_vec())
+                .unwrap()
+                .contains("response-secret")
+        );
     }
 
     #[tokio::test]
     async fn audit_does_not_read_unknown_length_or_oversized_streams() {
         let uri = "/example".parse().unwrap();
-        let stream = futures_util::stream::once(async { Ok::<_, std::convert::Infallible>("{\"value\":1}") });
-        let response = Response::builder().header("content-type", "application/json")
-            .body(Body::from_stream(stream)).unwrap();
+        let stream = futures_util::stream::once(async {
+            Ok::<_, std::convert::Infallible>("{\"value\":1}")
+        });
+        let response = Response::builder()
+            .header("content-type", "application/json")
+            .body(Body::from_stream(stream))
+            .unwrap();
         let (response, preview) = capture_response(response, 200, &uri).await;
         assert!(preview.contains("body omitted"));
-        assert_eq!(to_bytes(response.into_body(), 1024).await.unwrap(), "{\"value\":1}");
+        assert_eq!(
+            to_bytes(response.into_body(), 1024).await.unwrap(),
+            "{\"value\":1}"
+        );
         let mut headers = HeaderMap::new();
         headers.insert("content-type", "application/json".parse().unwrap());
-        assert!(!can_capture_body(&headers, &Body::from(vec![b'x'; MAX_AUDIT_BODY_BYTES + 1])));
+        assert!(!can_capture_body(
+            &headers,
+            &Body::from(vec![b'x'; MAX_AUDIT_BODY_BYTES + 1])
+        ));
     }
 
     #[test]

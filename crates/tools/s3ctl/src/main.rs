@@ -8,9 +8,9 @@
 //! 分片、并发恢复的条件写入、多云后端，或希望网关与工具统一到同一
 //! 客户端库时，切换到 `object_store`（Apache Arrow）。命令面保持不变。
 
+use s3::Bucket;
 use s3::creds::Credentials;
 use s3::region::Region;
-use s3::Bucket;
 use std::path::{Path, PathBuf};
 
 struct Config {
@@ -22,7 +22,10 @@ struct Config {
 }
 
 impl Config {
-    fn resolve(overrides: &[(String, String)], bucket_override: Option<&str>) -> Result<Self, String> {
+    fn resolve(
+        overrides: &[(String, String)],
+        bucket_override: Option<&str>,
+    ) -> Result<Self, String> {
         fn pick(
             overrides: &[(String, String)],
             bucket_override: Option<&str>,
@@ -32,10 +35,10 @@ impl Config {
             if let Some(value) = overrides.iter().find(|(name, _)| name == flag) {
                 return Ok(value.1.clone());
             }
-            if flag == "bucket" {
-                if let Some(bucket) = bucket_override {
-                    return Ok(bucket.to_string());
-                }
+            if flag == "bucket"
+                && let Some(bucket) = bucket_override
+            {
+                return Ok(bucket.to_string());
             }
             std::env::var(env_name).map_err(|_| format!("{env_name} is required"))
         }
@@ -77,13 +80,7 @@ async fn list_all_keys(bucket: &Bucket, prefix: &str) -> Result<Vec<String>, Str
     let mut token: Option<String> = None;
     loop {
         let (page, status) = bucket
-            .list_page(
-                prefix.to_string(),
-                None,
-                token,
-                None,
-                None,
-            )
+            .list_page(prefix.to_string(), None, token, None, None)
             .await
             .map_err(|error| format!("list failed: {error}"))?;
         if !(200..300).contains(&status) {
@@ -152,10 +149,12 @@ async fn mirror_to(bucket: &Bucket, target_dir: &Path) -> Result<(), String> {
             .await
             .map_err(|error| format!("download {key} failed: {error}"))?;
         if !(200..300).contains(&response.status_code()) {
-            return Err(format!("download {key} failed: HTTP {}", response.status_code()));
+            return Err(format!(
+                "download {key} failed: HTTP {}",
+                response.status_code()
+            ));
         }
-        std::fs::write(&destination, response.bytes())
-            .map_err(|error| error.to_string())?;
+        std::fs::write(&destination, response.bytes()).map_err(|error| error.to_string())?;
     }
     Ok(())
 }
@@ -185,7 +184,10 @@ async fn mirror_from(
             .await
             .map_err(|error| format!("upload {key} failed: {error}"))?;
         if !(200..300).contains(&response.status_code()) {
-            return Err(format!("upload {key} failed: HTTP {}", response.status_code()));
+            return Err(format!(
+                "upload {key} failed: HTTP {}",
+                response.status_code()
+            ));
         }
         desired_keys.push(key);
     }
@@ -197,7 +199,10 @@ async fn mirror_from(
                     .await
                     .map_err(|error| format!("remove {key} failed: {error}"))?;
                 if !(200..300).contains(&response.status_code()) {
-                    return Err(format!("remove {key} failed: HTTP {}", response.status_code()));
+                    return Err(format!(
+                        "remove {key} failed: HTTP {}",
+                        response.status_code()
+                    ));
                 }
             }
         }
@@ -233,7 +238,9 @@ fn main() {
         match arg.as_str() {
             "--endpoint" | "--access-key" | "--secret-key" | "--region" => {
                 index += 1;
-                let Some(value) = args.get(index) else { usage() };
+                let Some(value) = args.get(index) else {
+                    usage()
+                };
                 overrides.push((arg[2..].to_string(), value.clone()));
             }
             "--bucket" => {
@@ -252,7 +259,9 @@ fn main() {
         }
     };
     let mut commands = positionals;
-    let Some(command) = commands.first().cloned() else { usage() };
+    let Some(command) = commands.first().cloned() else {
+        usage()
+    };
     commands.remove(0);
     let result = tokio::runtime::Runtime::new()
         .expect("tokio runtime")
@@ -313,7 +322,7 @@ async fn run(config: &Config, command: &str, args: Vec<String>) -> Result<(), St
             }
             use std::io::Write;
             std::io::stdout()
-                .write_all(&response.bytes())
+                .write_all(response.bytes())
                 .map_err(|error| error.to_string())?;
             Ok(())
         }
@@ -324,7 +333,10 @@ async fn run(config: &Config, command: &str, args: Vec<String>) -> Result<(), St
                 .await
                 .map_err(|error| format!("delete {key} failed: {error}"))?;
             if !(200..300).contains(&response.status_code()) {
-                return Err(format!("delete {key} failed: HTTP {}", response.status_code()));
+                return Err(format!(
+                    "delete {key} failed: HTTP {}",
+                    response.status_code()
+                ));
             }
             Ok(())
         }
@@ -336,7 +348,10 @@ async fn run(config: &Config, command: &str, args: Vec<String>) -> Result<(), St
             Ok(())
         }
         "mirror-to" => {
-            let dir = args.first().map(PathBuf::from).ok_or("mirror-to requires a directory")?;
+            let dir = args
+                .first()
+                .map(PathBuf::from)
+                .ok_or("mirror-to requires a directory")?;
             mirror_to(&bucket, &dir).await
         }
         "mirror-from" => {

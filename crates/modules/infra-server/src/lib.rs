@@ -36,17 +36,33 @@ const DEFAULT_UPLOAD_MAX_BYTES: usize = 20 * 1024 * 1024;
 
 /// Read an existing application upload without making an HTTP request back to
 /// the Gateway. Only the fixed `infra/` object namespace can be addressed.
-pub async fn read_uploaded_file(pool: &PgPool, path: &str, max_bytes: usize) -> Result<Vec<u8>, AppError> {
+pub async fn read_uploaded_file(
+    pool: &PgPool,
+    path: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>, AppError> {
     let path = path.strip_prefix("/api").unwrap_or(path);
-    let relative = path.strip_prefix("/upload/")
-        .filter(|value| !value.is_empty() && !value.contains(['?', '#', '%', '\\'])
-            && value.split('/').all(|part| !matches!(part, "" | "." | "..")))
+    let relative = path
+        .strip_prefix("/upload/")
+        .filter(|value| {
+            !value.is_empty()
+                && !value.contains(['?', '#', '%', '\\'])
+                && value
+                    .split('/')
+                    .all(|part| !matches!(part, "" | "." | ".."))
+        })
         .ok_or_else(|| AppError::bad_request("无效的上传文件路径"))?;
-    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM infra_file WHERE path=$1 AND deleted=0)")
-        .bind(path).fetch_one(pool).await
-        .map_err(|_| AppError::internal("读取上传文件记录失败"))?;
-    if !exists { return Err(AppError::not_found("上传文件不存在")); }
-    object_storage::get_bounded(&format!("infra/{relative}"), max_bytes).await
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM infra_file WHERE path=$1 AND deleted=0)")
+            .bind(path)
+            .fetch_one(pool)
+            .await
+            .map_err(|_| AppError::internal("读取上传文件记录失败"))?;
+    if !exists {
+        return Err(AppError::not_found("上传文件不存在"));
+    }
+    object_storage::get_bounded(&format!("infra/{relative}"), max_bytes)
+        .await
         .map_err(AppError::bad_request)
 }
 const MAX_CONFIGURABLE_UPLOAD_BYTES: usize = 100 * 1024 * 1024;
@@ -1204,13 +1220,47 @@ async fn api_access_log_page(
     let mut list = QueryBuilder::<sqlx::Postgres>::new(
         "SELECT jsonb_build_object('id', id, 'traceId', trace_id, 'userId', user_id, 'userType', user_type, 'applicationName', application_name, 'requestMethod', request_method, 'requestUrl', request_url, 'requestParams', request_params, 'responseBody', response_body, 'userIp', user_ip, 'userAgent', user_agent, 'operateModule', operate_module, 'operateName', operate_name, 'operateType', operate_type, 'beginTime', begin_time, 'endTime', end_time, 'duration', duration, 'resultCode', result_code, 'resultMsg', result_msg, 'createTime', create_time) FROM infra_api_access_log WHERE deleted=0",
     );
-    if let Some(value) = params.user_id { count.push(" AND user_id=").push_bind(value); list.push(" AND user_id=").push_bind(value); }
-    if let Some(value) = params.user_type { count.push(" AND user_type=").push_bind(value); list.push(" AND user_type=").push_bind(value); }
-    if let Some(value) = params.application_name.as_deref().filter(|value| !value.is_empty()) { count.push(" AND application_name ILIKE ").push_bind(format!("%{value}%")); list.push(" AND application_name ILIKE ").push_bind(format!("%{value}%")); }
-    if let Some(value) = params.duration { count.push(" AND duration=").push_bind(value); list.push(" AND duration=").push_bind(value); }
-    if let Some(value) = params.result_code { count.push(" AND result_code=").push_bind(value); list.push(" AND result_code=").push_bind(value); }
-    let total: i64 = count.build_query_scalar().fetch_one(&state.pool).await.map_err(|_| AppError::internal("failed to count records"))?;
-    let list = list.push(" ORDER BY id DESC LIMIT ").push_bind(page_size).push(" OFFSET ").push_bind(offset).build_query_scalar::<Value>().fetch_all(&state.pool).await.map_err(|_| AppError::internal("failed to list records"))?;
+    if let Some(value) = params.user_id {
+        count.push(" AND user_id=").push_bind(value);
+        list.push(" AND user_id=").push_bind(value);
+    }
+    if let Some(value) = params.user_type {
+        count.push(" AND user_type=").push_bind(value);
+        list.push(" AND user_type=").push_bind(value);
+    }
+    if let Some(value) = params
+        .application_name
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        count
+            .push(" AND application_name ILIKE ")
+            .push_bind(format!("%{value}%"));
+        list.push(" AND application_name ILIKE ")
+            .push_bind(format!("%{value}%"));
+    }
+    if let Some(value) = params.duration {
+        count.push(" AND duration=").push_bind(value);
+        list.push(" AND duration=").push_bind(value);
+    }
+    if let Some(value) = params.result_code {
+        count.push(" AND result_code=").push_bind(value);
+        list.push(" AND result_code=").push_bind(value);
+    }
+    let total: i64 = count
+        .build_query_scalar()
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|_| AppError::internal("failed to count records"))?;
+    let list = list
+        .push(" ORDER BY id DESC LIMIT ")
+        .push_bind(page_size)
+        .push(" OFFSET ")
+        .push_bind(offset)
+        .build_query_scalar::<Value>()
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|_| AppError::internal("failed to list records"))?;
     Ok(Json(ApiResponse::new(Page { list, total })))
 }
 

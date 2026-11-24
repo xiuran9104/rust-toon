@@ -105,20 +105,20 @@ fn inspect_metadata(probe: &Value, expected: &Expectations) -> QualityReport {
         .aspect_ratio
         .as_deref()
         .and_then(|v| v.split_once(':'))
+        && let (Ok(w), Ok(h)) = (w.parse::<f64>(), h.parse::<f64>())
+        && w > 0.0
+        && h > 0.0
+        && height > 0
     {
-        if let (Ok(w), Ok(h)) = (w.parse::<f64>(), h.parse::<f64>()) {
-            if w > 0.0 && h > 0.0 && height > 0 {
-                let sar = video["sample_aspect_ratio"]
-                    .as_str()
-                    .and_then(|v| v.split_once(':'))
-                    .and_then(|(n, d)| Some((n.parse::<f64>().ok()?, d.parse::<f64>().ok()?)))
-                    .filter(|(n, d)| *n > 0.0 && *d > 0.0)
-                    .map(|(n, d)| n / d)
-                    .unwrap_or(1.0);
-                if ((width as f64 * sar / height as f64) / (w / h) - 1.0).abs() > 0.05 {
-                    report.reject(format!("视频显示比例与请求 {w}:{h} 不符"));
-                }
-            }
+        let sar = video["sample_aspect_ratio"]
+            .as_str()
+            .and_then(|v| v.split_once(':'))
+            .and_then(|(n, d)| Some((n.parse::<f64>().ok()?, d.parse::<f64>().ok()?)))
+            .filter(|(n, d)| *n > 0.0 && *d > 0.0)
+            .map(|(n, d)| n / d)
+            .unwrap_or(1.0);
+        if ((width as f64 * sar / height as f64) / (w / h) - 1.0).abs() > 0.05 {
+            report.reject(format!("视频显示比例与请求 {w}:{h} 不符"));
         }
     }
     if expected.audio && !has_audio {
@@ -461,8 +461,9 @@ async fn append_visual_qc(
     .await;
     report.metadata["frames"] = json!(stored_paths);
     report.metadata["visualQc"] = match verdict {
-        Ok(visual) => serde_json::to_value(&visual)
-            .unwrap_or_else(|_| json!({"state": "unavailable"})),
+        Ok(visual) => {
+            serde_json::to_value(&visual).unwrap_or_else(|_| json!({"state": "unavailable"}))
+        }
         Err(reason) => json!({"state": "unavailable", "reason": reason}),
     };
 }
@@ -503,14 +504,13 @@ async fn extract_frames(source: &Path, dir: &Path, duration: f64) -> Result<Vec<
 /// 从视频生成快照编译视频质检期望：镜头描述（含景别）汇总、去重运镜、
 /// 首帧模式下的首帧参考。快照缺失时返回空串，质检仍可运行。
 async fn video_expectations_from_context(pool: &sqlx::PgPool, video_id: i64) -> String {
-    let request: Option<Value> = sqlx::query_scalar(
-        "SELECT generation_context->'request' FROM toonflow.videos WHERE id=$1",
-    )
-    .bind(video_id)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten();
+    let request: Option<Value> =
+        sqlx::query_scalar("SELECT generation_context->'request' FROM toonflow.videos WHERE id=$1")
+            .bind(video_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
     let Some(request) = request else {
         return String::new();
     };

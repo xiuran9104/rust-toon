@@ -180,7 +180,10 @@ async fn save_events(pool: &PgPool, novel_id: i64, raw: &str) -> Result<(), Stri
         return Err("事件提取模型返回了空数组，请调整提示词后重试".into());
     }
     if events.len() != 1 {
-        return Err(format!("每章应概括一条核心事件，模型返回了 {} 条，请重新提取", events.len()));
+        return Err(format!(
+            "每章应概括一条核心事件，模型返回了 {} 条，请重新提取",
+            events.len()
+        ));
     }
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
     // Delete the events this novel owns before writing its replacement. The

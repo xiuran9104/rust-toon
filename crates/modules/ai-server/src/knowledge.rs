@@ -448,7 +448,9 @@ async fn s_split(
 ) -> Result<Json<ApiResponse<Vec<Value>>>, AppError> {
     require(&user, "ai:knowledge:create")?;
     if !(1..=32_768).contains(&q.segment_max_tokens) {
-        return Err(AppError::bad_request("segmentMaxTokens 必须在 1 到 32768 之间"));
+        return Err(AppError::bad_request(
+            "segmentMaxTokens 必须在 1 到 32768 之间",
+        ));
     }
     let content = crate::knowledge_download::download_text(&state.pool, &q.url).await?;
     Ok(Json(ApiResponse::new(vector::split(&content,q.segment_max_tokens).into_iter().map(|content|json!({"contentLength":content.chars().count(),"tokens":content.chars().count()/4,"content":content})).collect())))

@@ -212,10 +212,9 @@ async fn alignment_stage_skills_and_image_prompt_reach_model_boundary() {
     let first = toonflow_asset_ai::new_image(&pool, id, &derived, &(id + 1).to_string(), "2K")
         .await
         .unwrap();
-    let duplicate =
-        toonflow_asset_ai::new_image(&pool, id, &derived, &(id + 1).to_string(), "2K")
-            .await
-            .unwrap();
+    let duplicate = toonflow_asset_ai::new_image(&pool, id, &derived, &(id + 1).to_string(), "2K")
+        .await
+        .unwrap();
     assert_eq!(duplicate.id, first.id);
     assert!(duplicate.reused && !duplicate.created);
     sqlx::query("UPDATE toonflow.assets SET image_id=$2 WHERE id=$1")
@@ -425,15 +424,34 @@ async fn alignment_stage_skills_and_image_prompt_reach_model_boundary() {
         "agentType":"scriptAgent", "isolationKey":format!("script-quality-{id}"),
         "projectId":id, "toolName":"run_sub_agent_storySkeleton",
         "arguments":{"prompt":"根据原著第1章生成骨架"}
-    })).unwrap();
-    let result = toonflow_agent_tools::execute_inner(&state, &skeleton_request).await.unwrap();
+    }))
+    .unwrap();
+    let result = toonflow_agent_tools::execute_inner(&state, &skeleton_request)
+        .await
+        .unwrap();
     assert_eq!(result["evidence"]["sourceChaptersRead"], json!([1]));
     assert_eq!(result["evidence"]["singlePassQualityPolicy"], true);
     let workspace: Value = sqlx::query_scalar("SELECT data FROM toonflow.agent_work_data WHERE project_id=$1 AND key='scriptAgent' AND episodes_id IS NULL")
         .bind(id).fetch_one(&pool).await.unwrap();
-    assert!(workspace["storySkeleton"].as_str().unwrap().contains("尚未完成粮道"));
-    assert!(!workspace["storySkeleton"].as_str().unwrap().contains("未核实草稿"));
-    assert_eq!(workspace["storySkeletonEvidence"]["sourceChaptersRead"], json!([1]));
-    assert_eq!(workspace["storySkeletonEvidence"]["singlePassQualityPolicy"], true);
+    assert!(
+        workspace["storySkeleton"]
+            .as_str()
+            .unwrap()
+            .contains("尚未完成粮道")
+    );
+    assert!(
+        !workspace["storySkeleton"]
+            .as_str()
+            .unwrap()
+            .contains("未核实草稿")
+    );
+    assert_eq!(
+        workspace["storySkeletonEvidence"]["sourceChaptersRead"],
+        json!([1])
+    );
+    assert_eq!(
+        workspace["storySkeletonEvidence"]["singlePassQualityPolicy"],
+        true
+    );
     server.abort();
 }

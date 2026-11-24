@@ -9,25 +9,23 @@ mod toonflow_agent_events;
 mod toonflow_agent_history;
 mod toonflow_agent_plan;
 mod toonflow_agent_read_tools;
-mod toonflow_script_quality;
 mod toonflow_agent_runtime;
 mod toonflow_agent_tool_record;
 mod toonflow_agent_tool_utils;
 mod toonflow_agent_tools;
 mod toonflow_agents;
+#[cfg(test)]
+mod toonflow_alignment_tests;
 mod toonflow_asset_ai;
 mod toonflow_asset_context;
 mod toonflow_asset_library;
 mod toonflow_asset_prompt;
-mod toonflow_prompt_trace;
-#[cfg(test)]
-mod toonflow_alignment_tests;
-mod toonflow_image_contract;
-mod toonflow_face_identity;
 mod toonflow_audio;
 mod toonflow_character_identity;
 mod toonflow_episode_renders;
+mod toonflow_face_identity;
 mod toonflow_flow_version;
+mod toonflow_image_contract;
 mod toonflow_image_edit_prompt;
 mod toonflow_image_workflow;
 mod toonflow_manuals;
@@ -38,6 +36,7 @@ mod toonflow_project;
 mod toonflow_project_crud;
 mod toonflow_project_helpers;
 mod toonflow_prompt_store;
+mod toonflow_prompt_trace;
 mod toonflow_resources;
 mod toonflow_scene_analysis_parse;
 mod toonflow_scene_consistency;
@@ -45,6 +44,7 @@ mod toonflow_scene_consistency_auto;
 mod toonflow_scene_state_plan;
 mod toonflow_scene_transitions;
 mod toonflow_script_ai;
+mod toonflow_script_quality;
 mod toonflow_status;
 mod toonflow_storage;
 mod toonflow_storyboard_asset_validation;
@@ -80,14 +80,14 @@ use rust_toon_framework_database::PgPool;
 use rust_toon_framework_security::{TokenService, authenticate};
 use rust_toon_toon_api::ToonCapability;
 
+pub use toonflow_agents::spawn_agent_event_retention;
+pub use toonflow_agents::spawn_agent_run_recovery;
+pub use toonflow_video::resume_interrupted_video_generations;
 pub use toonflow_video_export::{
     VIDEO_EXPORT_JOB_KIND, cleanup_stale_export_workdirs, execute_distributed_export,
 };
 pub use toonflow_video_quality::{VIDEO_QUALITY_JOB_KIND, execute_distributed_quality};
-pub use toonflow_video::resume_interrupted_video_generations;
 pub use toonflow_workflow::resume_interrupted_workflow_runs;
-pub use toonflow_agents::spawn_agent_event_retention;
-pub use toonflow_agents::spawn_agent_run_recovery;
 
 const STORAGE_CLEANUP_CONCURRENCY: usize = 8;
 const STORAGE_CLEANUP_REFERENCE_RECHECK_SECONDS: u64 = 30;
@@ -142,7 +142,10 @@ pub async fn repair_gateway_interrupted_state(pool: &PgPool) -> Result<u64, sqlx
     )
     .fetch_all(&mut *tx)
     .await?;
-    let node_ids = interrupted_nodes.iter().map(|row| row.0).collect::<Vec<_>>();
+    let node_ids = interrupted_nodes
+        .iter()
+        .map(|row| row.0)
+        .collect::<Vec<_>>();
     let run_ids = interrupted_nodes
         .iter()
         .map(|row| row.1)
@@ -1165,7 +1168,10 @@ pub fn routes(state: ToonState) -> Router {
         // Keep these aliases alongside the original /api/task compatibility API.
         .route("/task/getTaskApi", post(toonflow_resources::query_tasks))
         .route("/task/taskDetails", post(toonflow_resources::task_details))
-        .route("/task/getTaskCategories", post(toonflow_resources::task_categories))
+        .route(
+            "/task/getTaskCategories",
+            post(toonflow_resources::task_categories),
+        )
         .route("/task/getProject", post(toonflow_resources::task_projects))
         .route(
             "/toonflow/projects/{project_id}/video-archive",
@@ -1200,7 +1206,10 @@ pub fn routes(state: ToonState) -> Router {
             "/api/setting/skillManagement/saveSkillContent",
             post(toonflow_resources::save_skill_content),
         )
-        .route("/setting/skillManagement/saveSkillContent", post(toonflow_resources::save_skill_content))
+        .route(
+            "/setting/skillManagement/saveSkillContent",
+            post(toonflow_resources::save_skill_content),
+        )
         .route(
             "/api/artStyle/getArtStyle",
             post(toonflow_resources::list_art_styles),
@@ -1270,32 +1279,50 @@ pub fn routes(state: ToonState) -> Router {
             "/api/project/addVisualManual",
             post(toonflow_manuals::save_visual),
         )
-        .route("/project/addVisualManual", post(toonflow_manuals::save_visual))
+        .route(
+            "/project/addVisualManual",
+            post(toonflow_manuals::save_visual),
+        )
         .route(
             "/api/project/editVisualManual",
             post(toonflow_manuals::save_visual),
         )
-        .route("/project/editVisualManual", post(toonflow_manuals::save_visual))
+        .route(
+            "/project/editVisualManual",
+            post(toonflow_manuals::save_visual),
+        )
         .route(
             "/api/project/addDirectorManual",
             post(toonflow_manuals::save_director),
         )
-        .route("/project/addDirectorManual", post(toonflow_manuals::save_director))
+        .route(
+            "/project/addDirectorManual",
+            post(toonflow_manuals::save_director),
+        )
         .route(
             "/api/project/editDirectorlManual",
             post(toonflow_manuals::save_director),
         )
-        .route("/project/editDirectorlManual", post(toonflow_manuals::save_director))
+        .route(
+            "/project/editDirectorlManual",
+            post(toonflow_manuals::save_director),
+        )
         .route(
             "/api/project/deleteVisualManual",
             post(toonflow_manuals::delete_visual),
         )
-        .route("/project/deleteVisualManual", post(toonflow_manuals::delete_visual))
+        .route(
+            "/project/deleteVisualManual",
+            post(toonflow_manuals::delete_visual),
+        )
         .route(
             "/api/project/deleteDirectorManual",
             post(toonflow_manuals::delete_director),
         )
-        .route("/project/deleteDirectorManual", post(toonflow_manuals::delete_director))
+        .route(
+            "/project/deleteDirectorManual",
+            post(toonflow_manuals::delete_director),
+        )
         .route(
             "/api/novel/event/generateEvents",
             post(toonflow_novel_events::generate),
@@ -1561,8 +1588,14 @@ pub fn routes(state: ToonState) -> Router {
             "/api/production/workbench/checkVideoStateList",
             post(toonflow_video::check_states),
         )
-        .route("/production/workbench/inspectVideo", post(toonflow_video_quality::inspect))
-        .route("/api/production/workbench/inspectVideo", post(toonflow_video_quality::inspect))
+        .route(
+            "/production/workbench/inspectVideo",
+            post(toonflow_video_quality::inspect),
+        )
+        .route(
+            "/api/production/workbench/inspectVideo",
+            post(toonflow_video_quality::inspect),
+        )
         .route(
             "/api/production/workbench/generateVideoPrompt",
             post(toonflow_video::generate_prompt),
@@ -2227,30 +2260,55 @@ mod proxy_route_tests {
         // No database or user data is needed: a registered protected route must
         // return 401 for these requests, not fall through to 404.
         let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused").unwrap();
-        let tokens = TokenService::new(SecurityConfig::new(
-            "route-test-secret-with-at-least-32-bytes", "test", "test", Duration::from_secs(60),
-        ).unwrap());
+            .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+            .unwrap();
+        let tokens = TokenService::new(
+            SecurityConfig::new(
+                "route-test-secret-with-at-least-32-bytes",
+                "test",
+                "test",
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let app = routes(ToonState::new(pool, tokens));
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let mut results = Vec::new();
         for path in [
-            "/task/getTaskApi", "/task/taskDetails", "/task/getTaskCategories", "/task/getProject",
-            "/setting/skillManagement/saveSkillContent", "/assets/uploadClip",
-            "/project/editVisualManual", "/project/addVisualManual", "/project/editDirectorlManual",
-            "/project/addDirectorManual", "/project/deleteVisualManual", "/project/deleteDirectorManual",
+            "/task/getTaskApi",
+            "/task/taskDetails",
+            "/task/getTaskCategories",
+            "/task/getProject",
+            "/setting/skillManagement/saveSkillContent",
+            "/assets/uploadClip",
+            "/project/editVisualManual",
+            "/project/addVisualManual",
+            "/project/editDirectorlManual",
+            "/project/addDirectorManual",
+            "/project/deleteVisualManual",
+            "/project/deleteDirectorManual",
             "/production/workbench/inspectVideo",
         ] {
             for prefix in ["", "/api"] {
                 let url = format!("http://{address}{prefix}{path}");
-                let status = client.post(&url).json(&serde_json::json!({})).send().await.unwrap().status();
+                let status = client
+                    .post(&url)
+                    .json(&serde_json::json!({}))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status();
                 results.push((url, status));
             }
         }
         server.abort();
-        for (url, status) in results { assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED, "{url}"); }
+        for (url, status) in results {
+            assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED, "{url}");
+        }
     }
 }

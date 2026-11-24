@@ -256,20 +256,23 @@ pub async fn query_tasks(
     Json(request): Json<TaskQuery>,
 ) -> Result<Json<ApiResponse<TaskPage>>, AppError> {
     require(&user, "toon:project:read")?;
-    load_task_page(&state.pool, request).await.map(|page| Json(ApiResponse::new(page)))
+    load_task_page(&state.pool, request)
+        .await
+        .map(|page| Json(ApiResponse::new(page)))
 }
 
 async fn load_task_page(pool: &sqlx::PgPool, request: TaskQuery) -> Result<TaskPage, AppError> {
     let page = request.page.max(1);
     let limit = request.limit.clamp(1, 100);
     let task_class = request.task_class.filter(|value| !value.is_empty());
-    let task_state = request.state.filter(|value| !value.is_empty()).map(|value| {
-        match value.to_lowercase().as_str() {
+    let task_state = request
+        .state
+        .filter(|value| !value.is_empty())
+        .map(|value| match value.to_lowercase().as_str() {
             "success" => "completed".to_string(),
             "error" => "failed".to_string(),
             _ => value.to_lowercase(),
-        }
-    });
+        });
     let rows = sqlx::query_as::<_, Task>(
         r#"SELECT t.id,t.project_id,p.name project_name,t.task_class,
                   coalesce(n.chapter,t.related_objects) related_objects,
@@ -301,8 +304,13 @@ async fn load_task_page(pool: &sqlx::PgPool, request: TaskQuery) -> Result<TaskP
          AND ($2::text IS NULL OR CASE lower(state) WHEN 'success' THEN 'completed'
               WHEN 'error' THEN 'failed' ELSE lower(state) END=$2)
          AND ($3::bigint IS NULL OR project_id=$3)",
-    ).bind(&task_class).bind(task_state).bind(request.project_id)
-     .fetch_one(pool).await.map_err(|_| AppError::internal("failed to count tasks"))?;
+    )
+    .bind(&task_class)
+    .bind(task_state)
+    .bind(request.project_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|_| AppError::internal("failed to count tasks"))?;
     // Summary cards cover all states for the selected project/category, not just
     // the current page or selected state.
     let stats = sqlx::query_as::<_, TaskStats>(
@@ -339,14 +347,20 @@ fn serialize_task_id<S: serde::Serializer>(id: &i64, serializer: S) -> Result<S:
     serializer.collect_str(id)
 }
 
-fn serialize_optional_task_id<S: serde::Serializer>(id: &Option<i64>, serializer: S) -> Result<S::Ok, S::Error> {
+fn serialize_optional_task_id<S: serde::Serializer>(
+    id: &Option<i64>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
     id.map(|value| value.to_string()).serialize(serializer)
 }
 
 fn deserialize_task_id<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<i64, D::Error> {
     #[derive(Deserialize)]
     #[serde(untagged)]
-    enum Id { Text(String), Number(i64) }
+    enum Id {
+        Text(String),
+        Number(i64),
+    }
     match Id::deserialize(deserializer)? {
         Id::Text(value) => value.parse().map_err(serde::de::Error::custom),
         Id::Number(value) => Ok(value),
@@ -360,18 +374,37 @@ mod task_pagination_tests {
     #[test]
     fn task_ids_survive_browser_json_round_trips() {
         let id = 1_789_003_357_277_804_801_i64;
-        let task = Task { id, project_id: None, project_name: None,
-            task_class: "image".into(), related_objects: String::new(), model: String::new(),
-            description: String::new(), state: "completed".into(), start_time: None,
-            reason: None, input: serde_json::json!({}), retry_of_id: Some(id - 1),
-            progress_current: None, progress_total: None };
+        let task = Task {
+            id,
+            project_id: None,
+            project_name: None,
+            task_class: "image".into(),
+            related_objects: String::new(),
+            model: String::new(),
+            description: String::new(),
+            state: "completed".into(),
+            start_time: None,
+            reason: None,
+            input: serde_json::json!({}),
+            retry_of_id: Some(id - 1),
+            progress_current: None,
+            progress_total: None,
+        };
         let json = serde_json::to_value(task).unwrap();
         assert_eq!(json["id"], id.to_string());
         assert_eq!(json["retryOfId"], (id - 1).to_string());
-        let request: TaskId = serde_json::from_value(serde_json::json!({"taskId": json["id"]})).unwrap();
+        let request: TaskId =
+            serde_json::from_value(serde_json::json!({"taskId": json["id"]})).unwrap();
         assert_eq!(request.task_id, id);
-        assert_eq!(serde_json::from_value::<TaskId>(serde_json::json!({"taskId": 42})).unwrap().task_id, 42);
-        assert!(serde_json::from_value::<TaskId>(serde_json::json!({"taskId": "invalid"})).is_err());
+        assert_eq!(
+            serde_json::from_value::<TaskId>(serde_json::json!({"taskId": 42}))
+                .unwrap()
+                .task_id,
+            42
+        );
+        assert!(
+            serde_json::from_value::<TaskId>(serde_json::json!({"taskId": "invalid"})).is_err()
+        );
     }
 
     #[tokio::test]
@@ -379,13 +412,21 @@ mod task_pagination_tests {
     async fn filters_pages_and_summarizes_legacy_task_states() {
         let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is required");
         // A single connection keeps every fixture inside one rolled-back transaction.
-        let pool = sqlx::postgres::PgPoolOptions::new().max_connections(1)
-            .connect(&url).await.unwrap();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
         sqlx::query("BEGIN").execute(&pool).await.unwrap();
-        sqlx::query("INSERT INTO toonflow.projects(id,name,create_time,update_time)
-            VALUES(-91001,'pagination A',0,0),(-91002,'pagination B',0,0)")
-            .execute(&pool).await.unwrap();
-        sqlx::query("INSERT INTO toonflow.tasks(id,project_id,task_class,state,start_time) VALUES
+        sqlx::query(
+            "INSERT INTO toonflow.projects(id,name,create_time,update_time)
+            VALUES(-91001,'pagination A',0,0),(-91002,'pagination B',0,0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO toonflow.tasks(id,project_id,task_class,state,start_time) VALUES
             (-91101,-91001,'pagination-test','success',100),
             (-91102,-91001,'pagination-test','COMPLETED',100),
             (-91103,-91001,'pagination-test','error',100),
@@ -393,17 +434,40 @@ mod task_pagination_tests {
             (-91105,-91001,'pagination-test','running',100),
             (-91106,-91002,'pagination-test','success',100),
             (-91107,-91001,'other-test','success',100),
-            (-91108,-91001,'text','success',100)")
-            .execute(&pool).await.unwrap();
-        for (filter, expected) in [("completed", vec![-91101, -91102]), ("ERROR", vec![-91103, -91104])] {
+            (-91108,-91001,'text','success',100)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (filter, expected) in [
+            ("completed", vec![-91101, -91102]),
+            ("ERROR", vec![-91103, -91104]),
+        ] {
             for (index, id) in expected.into_iter().enumerate() {
-                let result = load_task_page(&pool, TaskQuery { page: index as i64 + 1, limit: 1,
-                    task_class: Some("pagination-test".into()), state: Some(filter.into()),
-                    project_id: Some(-91001) }).await.unwrap();
+                let result = load_task_page(
+                    &pool,
+                    TaskQuery {
+                        page: index as i64 + 1,
+                        limit: 1,
+                        task_class: Some("pagination-test".into()),
+                        state: Some(filter.into()),
+                        project_id: Some(-91001),
+                    },
+                )
+                .await
+                .unwrap();
                 assert_eq!(result.total, 2);
                 assert_eq!(result.data.len(), 1);
                 assert_eq!(result.data[0].id, id);
-                assert_eq!((result.stats.total, result.stats.running, result.stats.success, result.stats.failed), (5, 1, 2, 2));
+                assert_eq!(
+                    (
+                        result.stats.total,
+                        result.stats.running,
+                        result.stats.success,
+                        result.stats.failed
+                    ),
+                    (5, 1, 2, 2)
+                );
             }
         }
         sqlx::query("ROLLBACK").execute(&pool).await.unwrap();

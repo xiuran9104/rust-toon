@@ -36,8 +36,11 @@ pub fn seal_secret(value: &str) -> Result<String, SecretSealError> {
     }
     let source_key = env::var("SECRET_ENCRYPTION_KEY")
         .ok()
-        .filter(|key| key.as_bytes().len() >= 32)
+        .filter(|key| key.len() >= 32)
         .ok_or(SecretSealError::MissingKey)?;
+    // ring::digest 接收具体的 &[u8]，String 必须显式转字节切片；
+    // needless_as_bytes 在这里是误报。
+    #[allow(clippy::needless_as_bytes)]
     let key_material = digest(&SHA256, source_key.as_bytes());
     let key = UnboundKey::new(&AES_256_GCM, key_material.as_ref())
         .map_err(|_| SecretSealError::Encryption)?;

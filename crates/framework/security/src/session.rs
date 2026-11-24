@@ -31,25 +31,38 @@ impl AuthenticatedSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use crate::{DataScope, PermissionSet};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
-    struct Validator { active: AtomicBool }
+    struct Validator {
+        active: AtomicBool,
+    }
     impl SessionValidator for Validator {
-        fn validate<'a>(&'a self, token: &'a str) -> Pin<Box<dyn Future<Output = Result<CurrentUser, SecurityError>> + Send + 'a>> {
+        fn validate<'a>(
+            &'a self,
+            token: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<CurrentUser, SecurityError>> + Send + 'a>> {
             Box::pin(async move {
                 if token != "test-token" || !self.active.load(Ordering::SeqCst) {
                     return Err(SecurityError::InvalidCredentials);
                 }
-                Ok(CurrentUser { user_id: "test".into(), username: "test".into(), tenant_id: None,
-                    role_codes: vec![], permissions: PermissionSet::default(), data_scope: DataScope::SelfOnly })
+                Ok(CurrentUser {
+                    user_id: "test".into(),
+                    username: "test".into(),
+                    tenant_id: None,
+                    role_codes: vec![],
+                    permissions: PermissionSet::default(),
+                    data_scope: DataScope::SelfOnly,
+                })
             })
         }
     }
 
     #[tokio::test]
     async fn a_cloned_long_lived_session_rechecks_revocation() {
-        let validator = Arc::new(Validator { active: AtomicBool::new(true) });
+        let validator = Arc::new(Validator {
+            active: AtomicBool::new(true),
+        });
         let session = AuthenticatedSession::new("test-token".into(), validator.clone());
         let connection = session.clone();
         assert!(connection.validate().await.is_ok());

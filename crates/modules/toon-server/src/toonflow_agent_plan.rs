@@ -133,14 +133,13 @@ pub async fn set_plan(
             // can update its own scripts; otherwise PostgreSQL allocates one.
             let script_id = item.get("id").and_then(Value::as_i64);
             if let Some(script_id) = script_id
-                && let Some(existing_project_id) =
-                    sqlx::query_scalar::<_, i64>(
-                        "SELECT project_id FROM toonflow.scripts WHERE id=$1",
-                    )
-                    .bind(script_id)
-                    .fetch_optional(&state.pool)
-                    .await
-                    .map_err(|_| AppError::internal("failed to validate agent script"))?
+                && let Some(existing_project_id) = sqlx::query_scalar::<_, i64>(
+                    "SELECT project_id FROM toonflow.scripts WHERE id=$1",
+                )
+                .bind(script_id)
+                .fetch_optional(&state.pool)
+                .await
+                .map_err(|_| AppError::internal("failed to validate agent script"))?
                 && existing_project_id != request.project_id
             {
                 return Err(AppError::bad_request("script 不属于当前项目"));

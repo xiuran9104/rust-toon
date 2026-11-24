@@ -103,7 +103,10 @@ fn storage_client() -> &'static ResilientHttpClient {
 pub async fn put(key: &str, bytes: Vec<u8>) -> Result<(), String> {
     let bucket = request(Method::PUT, "", Vec::new()).await?;
     if !bucket.status().is_success() && bucket.status().as_u16() != 409 {
-        return Err(format!("对象存储 bucket 初始化失败：HTTP {}", bucket.status()));
+        return Err(format!(
+            "对象存储 bucket 初始化失败：HTTP {}",
+            bucket.status()
+        ));
     }
     let response = request(Method::PUT, key, bytes).await?;
     if response.status().is_success() {
@@ -130,7 +133,10 @@ pub async fn get_bounded(key: &str, max_bytes: usize) -> Result<Vec<u8>, String>
     if !response.status().is_success() {
         return Err("读取上传文件失败".into());
     }
-    if response.content_length().is_some_and(|length| length > max_bytes as u64) {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
         return Err("上传文件超过知识库读取上限".into());
     }
     let mut bytes = Vec::new();

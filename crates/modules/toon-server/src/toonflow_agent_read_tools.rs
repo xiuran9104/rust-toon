@@ -13,7 +13,7 @@ pub(crate) fn format_events(events_json: &str) -> String {
                 format!("  {}. {}：{}", index + 1, name, detail)
             })
             .collect::<Vec<_>>()
-                .join("\n")
+            .join("\n")
     } else {
         events_json.to_string()
     }

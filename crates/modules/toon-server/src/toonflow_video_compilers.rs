@@ -90,7 +90,10 @@ mod tests {
 
     #[test]
     fn detects_families_from_model_names() {
-        assert_eq!(family_of("doubao-seedance-1-5-pro"), VideoModelFamily::Seedance);
+        assert_eq!(
+            family_of("doubao-seedance-1-5-pro"),
+            VideoModelFamily::Seedance
+        );
         assert_eq!(family_of("Wan2.2-T2V"), VideoModelFamily::Wan);
         assert_eq!(family_of("seedream-4.0"), VideoModelFamily::Seedream);
         assert_eq!(family_of("1784249635985"), VideoModelFamily::Generic);
@@ -104,8 +107,7 @@ mod tests {
 
     #[test]
     fn rejects_last_frame_modes_for_first_frame_families() {
-        let error =
-            validate_family_request("wan2.2-i2v", "startEndRequired", 2).unwrap_err();
+        let error = validate_family_request("wan2.2-i2v", "startEndRequired", 2).unwrap_err();
         assert!(error.contains("不支持尾帧参考模式"));
         assert!(validate_family_request("wan2.2-i2v", "singleImage", 1).is_ok());
         assert!(validate_family_request("wan2.2-i2v", "text", 1).is_ok());

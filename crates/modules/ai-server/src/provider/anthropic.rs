@@ -263,7 +263,6 @@ mod tests {
                 ],
                 temperature: None,
                 max_tokens: None,
-                ..Default::default()
             },
             false,
         );

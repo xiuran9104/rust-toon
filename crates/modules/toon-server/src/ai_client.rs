@@ -281,7 +281,6 @@ fn chat_request(
         ],
         temperature: Some(temperature as f64),
         max_tokens: (tokens > 0).then_some(tokens as u32),
-        ..Default::default()
     }
 }
 pub async fn project_text(
@@ -406,6 +405,7 @@ pub async fn image_with_references_for_project(
     .await
 }
 
+#[allow(clippy::too_many_arguments)] // 一条完整的图片生成请求本身就有这么多输入
 pub(crate) async fn image_with_provenance_for_project(
     pool: &PgPool,
     project_id: Option<i64>,
@@ -747,35 +747,41 @@ mod tests {
             video_audio: Some(false),
             ..Default::default()
         };
-        assert!(validate_video_payload(
-            "测试视频模型",
-            "video-v1",
-            &capabilities,
-            &json!({
-                "mode":"startEndRequired",
-                "references":["first","last"],
-                "duration":6,
-                "resolution":"1080p",
-                "audio":false
-            }),
-        )
-        .is_ok());
-        assert!(validate_video_payload(
-            "测试视频模型",
-            "video-v1",
-            &capabilities,
-            &json!({"mode":"startEndRequired","references":["first"],"duration":6}),
-        )
-        .unwrap_err()
-        .contains("需要 2 至 2 张参考图"));
-        assert!(validate_video_payload(
-            "测试视频模型",
-            "video-v1",
-            &capabilities,
-            &json!({"mode":"singleImage","references":["first"],"duration":6,"audio":true}),
-        )
-        .unwrap_err()
-        .contains("不支持同步生成音频"));
+        assert!(
+            validate_video_payload(
+                "测试视频模型",
+                "video-v1",
+                &capabilities,
+                &json!({
+                    "mode":"startEndRequired",
+                    "references":["first","last"],
+                    "duration":6,
+                    "resolution":"1080p",
+                    "audio":false
+                }),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_video_payload(
+                "测试视频模型",
+                "video-v1",
+                &capabilities,
+                &json!({"mode":"startEndRequired","references":["first"],"duration":6}),
+            )
+            .unwrap_err()
+            .contains("需要 2 至 2 张参考图")
+        );
+        assert!(
+            validate_video_payload(
+                "测试视频模型",
+                "video-v1",
+                &capabilities,
+                &json!({"mode":"singleImage","references":["first"],"duration":6,"audio":true}),
+            )
+            .unwrap_err()
+            .contains("不支持同步生成音频")
+        );
     }
 
     #[test]
@@ -786,27 +792,33 @@ mod tests {
             video_max_duration: Some(8),
             ..Default::default()
         };
-        assert!(validate_video_payload(
-            "限制模型",
-            "video-v1",
-            &capabilities,
-            &json!({"mode":"text","references":[],"duration":4,"resolution":"720p"}),
-        )
-        .is_err());
-        assert!(validate_video_payload(
-            "限制模型",
-            "video-v1",
-            &capabilities,
-            &json!({"mode":"text","references":[],"duration":6,"resolution":"1080p"}),
-        )
-        .is_err());
-        assert!(validate_video_payload(
-            "Seedance 1.5",
-            "doubao-seedance-1-5-pro",
-            &ModelCapabilities::default(),
-            &json!({"mode":"text","references":[],"duration":3}),
-        )
-        .unwrap_err()
-        .contains("允许范围为 4 至 12 秒"));
+        assert!(
+            validate_video_payload(
+                "限制模型",
+                "video-v1",
+                &capabilities,
+                &json!({"mode":"text","references":[],"duration":4,"resolution":"720p"}),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_video_payload(
+                "限制模型",
+                "video-v1",
+                &capabilities,
+                &json!({"mode":"text","references":[],"duration":6,"resolution":"1080p"}),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_video_payload(
+                "Seedance 1.5",
+                "doubao-seedance-1-5-pro",
+                &ModelCapabilities::default(),
+                &json!({"mode":"text","references":[],"duration":3}),
+            )
+            .unwrap_err()
+            .contains("允许范围为 4 至 12 秒")
+        );
     }
 }

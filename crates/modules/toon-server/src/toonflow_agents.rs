@@ -247,9 +247,12 @@ fn session_scope(agent_type: &str, isolation_key: &str) -> Result<(i64, Option<i
     if !(2..=3).contains(&parts.len()) || parts[0] != agent_type {
         return Err(AppError::bad_request("invalid agent isolation key"));
     }
-    let parse_id = |text: &str| text.parse::<i64>().ok()
-        .filter(|id| *id > 0 && id.to_string() == text)
-        .ok_or_else(|| AppError::bad_request("invalid agent scope id"));
+    let parse_id = |text: &str| {
+        text.parse::<i64>()
+            .ok()
+            .filter(|id| *id > 0 && id.to_string() == text)
+            .ok_or_else(|| AppError::bad_request("invalid agent scope id"))
+    };
     let project_id = parse_id(parts[1])?;
     let script_id = match parts.get(2).copied() {
         None => None,
@@ -262,7 +265,10 @@ fn session_scope(agent_type: &str, isolation_key: &str) -> Result<(i64, Option<i
 }
 
 pub(crate) async fn authorize_session(
-    state: &ToonState, user: &CurrentUser, agent_type: &str, isolation_key: &str,
+    state: &ToonState,
+    user: &CurrentUser,
+    agent_type: &str,
+    isolation_key: &str,
 ) -> Result<(i64, Option<i64>), AppError> {
     let (project_id, script_id) = session_scope(agent_type, isolation_key)?;
     ensure_project_access(&state.pool, user, project_id).await?;
@@ -273,12 +279,18 @@ pub(crate) async fn authorize_session(
 }
 
 pub(crate) async fn authorize_context(
-    state: &ToonState, user: &CurrentUser, agent_type: &str,
-    isolation_key: &str, project_id: i64, script_id: Option<i64>,
+    state: &ToonState,
+    user: &CurrentUser,
+    agent_type: &str,
+    isolation_key: &str,
+    project_id: i64,
+    script_id: Option<i64>,
 ) -> Result<(), AppError> {
     let scope = session_scope(agent_type, isolation_key)?;
     if scope.0 != project_id || (agent_type == "productionAgent" && scope.1 != script_id) {
-        return Err(AppError::bad_request("agent context does not match isolation key"));
+        return Err(AppError::bad_request(
+            "agent context does not match isolation key",
+        ));
     }
     authorize_session(state, user, agent_type, isolation_key).await?;
     if let Some(script_id) = script_id {
@@ -288,13 +300,17 @@ pub(crate) async fn authorize_context(
 }
 
 async fn authorize_run(state: &ToonState, user: &CurrentUser, run_id: i64) -> Result<(), AppError> {
-    let (project_id, script_id): (i64, Option<i64>) = sqlx::query_as(
-        "SELECT project_id,script_id FROM toonflow.agent_runs WHERE id=$1"
-    ).bind(run_id).fetch_optional(&state.pool).await
-        .map_err(|_| AppError::internal("failed to authorize agent run"))?
-        .ok_or_else(|| AppError::not_found("agent run not found"))?;
+    let (project_id, script_id): (i64, Option<i64>) =
+        sqlx::query_as("SELECT project_id,script_id FROM toonflow.agent_runs WHERE id=$1")
+            .bind(run_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|_| AppError::internal("failed to authorize agent run"))?
+            .ok_or_else(|| AppError::not_found("agent run not found"))?;
     ensure_project_access(&state.pool, user, project_id).await?;
-    if let Some(script_id) = script_id { ensure_script_in_project(&state.pool, project_id, script_id).await?; }
+    if let Some(script_id) = script_id {
+        ensure_script_in_project(&state.pool, project_id, script_id).await?;
+    }
     Ok(())
 }
 
@@ -1252,10 +1268,7 @@ async fn run_with_tools(
     Err("Agent 工具调用超过最大轮数".to_string())
 }
 
-pub(crate) async fn create_run(
-    state: &ToonState,
-    request: &ChatRequest,
-) -> Result<i64, AppError> {
+pub(crate) async fn create_run(state: &ToonState, request: &ChatRequest) -> Result<i64, AppError> {
     validate_agent(&request.agent_type)?;
     if request.isolation_key.trim().is_empty() || request.content.trim().is_empty() {
         return Err(AppError::bad_request("isolationKey 和 content 不能为空"));
@@ -1679,7 +1692,15 @@ pub async fn start(
     Json(request): Json<ChatRequest>,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
     require(&user, "toon:project:update")?;
-    authorize_context(&state, &user, &request.agent_type, &request.isolation_key, request.project_id, request.script_id).await?;
+    authorize_context(
+        &state,
+        &user,
+        &request.agent_type,
+        &request.isolation_key,
+        request.project_id,
+        request.script_id,
+    )
+    .await?;
     recover_stale(&state).await;
     let run_id = create_run(&state, &request).await?;
     let task_state = state.clone();
@@ -1719,10 +1740,12 @@ pub async fn stop(
     authorize_run(&state, &user, request.id).await?;
     // durable 第二阶段：先落取消标志，跨副本运行中的循环会在下一轮感知；
     // 同进程句柄保留为即时中止的快速路径。
-    let _ = sqlx::query("UPDATE toonflow.agent_runs SET cancel_requested=true WHERE id=$1 AND state='running'")
-        .bind(request.id)
-        .execute(&state.pool)
-        .await;
+    let _ = sqlx::query(
+        "UPDATE toonflow.agent_runs SET cancel_requested=true WHERE id=$1 AND state='running'",
+    )
+    .bind(request.id)
+    .execute(&state.pool)
+    .await;
     if let Some(handle) = ACTIVE_RUNS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1924,12 +1947,11 @@ pub async fn retry(
         row.ok_or_else(|| AppError::bad_request("仅失败、中止或中断的运行可重试"))?;
     // 对齐方案 P1 断点续跑：生产 Agent 重试时注入已完成阶段与继续点，
     // 避免整单重放（重做剧本/重建分镜表/重复出图）。
-    if agent_type == "productionAgent" {
-        if let Some(resume) =
+    if agent_type == "productionAgent"
+        && let Some(resume) =
             production_resume_context(&state.pool, Some(project_id), script_id).await
-        {
-            content = format!("{content}\n\n{resume}");
-        }
+    {
+        content = format!("{content}\n\n{resume}");
     }
     let request = ChatRequest {
         agent_type,
@@ -1940,7 +1962,15 @@ pub async fn retry(
         think,
         think_level,
     };
-    authorize_context(&state, &user, &request.agent_type, &request.isolation_key, request.project_id, request.script_id).await?;
+    authorize_context(
+        &state,
+        &user,
+        &request.agent_type,
+        &request.isolation_key,
+        request.project_id,
+        request.script_id,
+    )
+    .await?;
     let run_id = create_run(&state, &request).await?;
     sqlx::query("UPDATE toonflow.agent_runs SET retry_of_id=$2 WHERE id=$1")
         .bind(run_id)
@@ -2102,9 +2132,9 @@ pub(crate) async fn clear_memory_records(
 #[cfg(test)]
 mod tests {
     use super::{
-        DeltaBatcher, build_resume_directive, format_chapter_ranges,
-        parse_native_tool_arguments, parse_tool_calls, pipeline_rule,
-        stop_run_after_tool_failure, terminal_state_for_error, tool_names,
+        DeltaBatcher, build_resume_directive, format_chapter_ranges, parse_native_tool_arguments,
+        parse_tool_calls, pipeline_rule, stop_run_after_tool_failure, terminal_state_for_error,
+        tool_names,
     };
 
     #[test]
@@ -2132,12 +2162,36 @@ mod tests {
 
     #[test]
     fn session_keys_bind_history_to_a_canonical_project_and_script() {
-        assert_eq!(super::session_scope("scriptAgent", "scriptAgent:42:project").unwrap(), (42, None));
-        assert_eq!(super::session_scope("scriptAgent", "scriptAgent:42").unwrap(), (42, None));
-        assert_eq!(super::session_scope("productionAgent", "productionAgent:42:99").unwrap(), (42, Some(99)));
-        assert_eq!(super::session_scope("productionAgent", "productionAgent:42:none").unwrap(), (42, None));
-        for key in ["other:42", "productionAgent:42:99", "scriptAgent:42:99", "scriptAgent:42:project:extra", "scriptAgent:-1", "scriptAgent:042", "scriptAgent:0", "unscoped"] {
-            assert!(super::session_scope("scriptAgent", key).is_err(), "accepted {key}");
+        assert_eq!(
+            super::session_scope("scriptAgent", "scriptAgent:42:project").unwrap(),
+            (42, None)
+        );
+        assert_eq!(
+            super::session_scope("scriptAgent", "scriptAgent:42").unwrap(),
+            (42, None)
+        );
+        assert_eq!(
+            super::session_scope("productionAgent", "productionAgent:42:99").unwrap(),
+            (42, Some(99))
+        );
+        assert_eq!(
+            super::session_scope("productionAgent", "productionAgent:42:none").unwrap(),
+            (42, None)
+        );
+        for key in [
+            "other:42",
+            "productionAgent:42:99",
+            "scriptAgent:42:99",
+            "scriptAgent:42:project:extra",
+            "scriptAgent:-1",
+            "scriptAgent:042",
+            "scriptAgent:0",
+            "unscoped",
+        ] {
+            assert!(
+                super::session_scope("scriptAgent", key).is_err(),
+                "accepted {key}"
+            );
         }
     }
 
@@ -2266,9 +2320,7 @@ mod agent_event_retention_database_tests {
         let now = now_ms();
         let day = 86_400_000_i64;
         // 40 天前的事件落入 30 天保留窗口之外；1 天前的必须存活。
-        for (id, create_time) in
-            [(9_300_010_i64, now - 40 * day), (9_300_011_i64, now - day)]
-        {
+        for (id, create_time) in [(9_300_010_i64, now - 40 * day), (9_300_011_i64, now - day)] {
             sqlx::query("INSERT INTO toonflow.agent_run_events(id,run_id,event_type,data,create_time) VALUES($1,$2,'delta',$3,$4)")
                 .bind(id)
                 .bind(run_id)
@@ -2293,13 +2345,12 @@ mod agent_event_retention_database_tests {
         // 关闭保留（<=0）时不删除任何行。
         let disabled = prune_agent_run_events(&pool, 0).await.unwrap();
         assert_eq!(disabled, 0);
-        let remaining: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM toonflow.agent_run_events WHERE run_id=$1",
-        )
-        .bind(run_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM toonflow.agent_run_events WHERE run_id=$1")
+                .bind(run_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(remaining, 1);
 
         sqlx::query("DELETE FROM toonflow.projects WHERE id=$1")
@@ -2345,7 +2396,9 @@ mod agent_run_lifecycle_database_tests {
 
         // 无运行时查询为空。
         assert_eq!(
-            latest_running_run(&pool, "scriptAgent", isolation).await.unwrap(),
+            latest_running_run(&pool, "scriptAgent", isolation)
+                .await
+                .unwrap(),
             None
         );
 
@@ -2368,14 +2421,20 @@ mod agent_run_lifecycle_database_tests {
         );
 
         // 守卫式取消只影响 running 行，重复取消返回 false。
-        assert!(mark_run_canceled(&pool, 9_400_011, "用户已中止")
-            .await
-            .unwrap());
-        assert!(!mark_run_canceled(&pool, 9_400_011, "用户已中止")
-            .await
-            .unwrap());
+        assert!(
+            mark_run_canceled(&pool, 9_400_011, "用户已中止")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !mark_run_canceled(&pool, 9_400_011, "用户已中止")
+                .await
+                .unwrap()
+        );
         assert_eq!(
-            latest_running_run(&pool, "scriptAgent", isolation).await.unwrap(),
+            latest_running_run(&pool, "scriptAgent", isolation)
+                .await
+                .unwrap(),
             Some((9_400_010, 1_000))
         );
 

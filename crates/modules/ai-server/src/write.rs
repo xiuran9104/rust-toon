@@ -94,7 +94,6 @@ async fn generate_stream(
         }],
         temperature: Some(0.7),
         max_tokens: Some(4096),
-        ..Default::default()
     };
     let (tx, rx) = mpsc::channel::<Result<String, std::convert::Infallible>>(32);
     let pool = s.pool.clone();

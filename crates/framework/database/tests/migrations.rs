@@ -65,20 +65,23 @@ async fn applies_all_migrations_to_empty_postgres() {
         "video_tracks_trim_range_check",
         "video_tracks_transition_duration_check",
     ] {
-        let exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM pg_constraint WHERE conname=$1)",
-        )
-        .bind(constraint)
-        .fetch_one(&pool)
-        .await
-        .expect("inspect video export timeline constraint");
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_constraint WHERE conname=$1)")
+                .bind(constraint)
+                .fetch_one(&pool)
+                .await
+                .expect("inspect video export timeline constraint");
         assert!(exists, "missing constraint {constraint}");
     }
 
     let before: (String, String) = sqlx::query_as("SELECT data::text, images::text FROM toonflow.creative_manuals WHERE path='realpeople_cinematic_base' AND kind='visual'")
         .fetch_one(&pool).await.expect("read refined manual");
-    sqlx::raw_sql(include_str!("../../../../sql/postgresql/0021_refine_live_action_manual_references.sql"))
-        .execute(&pool).await.expect("refined manual migration is idempotent");
+    sqlx::raw_sql(include_str!(
+        "../../../../sql/postgresql/0021_refine_live_action_manual_references.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("refined manual migration is idempotent");
     let after: (String, String) = sqlx::query_as("SELECT data::text, images::text FROM toonflow.creative_manuals WHERE path='realpeople_cinematic_base' AND kind='visual'")
         .fetch_one(&pool).await.expect("read repeated refined manual");
     assert_eq!(before, after);
@@ -99,7 +102,10 @@ async fn applies_all_migrations_to_empty_postgres() {
     .fetch_one(&pool)
     .await
     .expect("inspect merged creative manual menu");
-    assert_eq!(manual_menu, ("创作手册".into(), "toonflow/manuals/index".into()));
+    assert_eq!(
+        manual_menu,
+        ("创作手册".into(), "toonflow/manuals/index".into())
+    );
 
     let duplicated_builtin_styles: i64 = sqlx::query_scalar(
         "SELECT count(*)
@@ -132,7 +138,11 @@ async fn applies_all_migrations_to_empty_postgres() {
     .expect("inspect generic live-action visual manual");
     assert_eq!(generic_live_action_manual.0, "通用真人影视基底");
     assert_eq!(generic_live_action_manual.1, 12);
-    assert!(generic_live_action_manual.2.contains("基础画风控制“怎么拍”"));
+    assert!(
+        generic_live_action_manual
+            .2
+            .contains("基础画风控制“怎么拍”")
+    );
     assert!(generic_live_action_manual.2.contains("不得自动现代化"));
     assert!(generic_live_action_manual.2.contains("不得自动古风化"));
     assert!(!generic_live_action_manual.2.contains("禁止古风"));

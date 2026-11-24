@@ -345,6 +345,7 @@ async fn extract_or_load_last_frame(
     Ok(reference)
 }
 
+#[allow(clippy::too_many_arguments)] // 轨道衔接的全部上下文
 pub(crate) async fn apply_frame_policy(
     pool: &sqlx::PgPool,
     project_id: i64,

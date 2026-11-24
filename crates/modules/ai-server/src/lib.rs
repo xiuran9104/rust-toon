@@ -529,8 +529,7 @@ async fn discover_models(
             Some((id, declared))
         })
         .filter_map(|(id, declared)| {
-            let model_type =
-                declared.or_else(|| AiModelType::parse(discovered_model_type(&id)))?;
+            let model_type = declared.or_else(|| AiModelType::parse(discovered_model_type(&id)))?;
             platform
                 .supports(model_type)
                 .then(|| json!({"id":id,"type":model_type.code()}))
@@ -607,7 +606,6 @@ async fn test(
                         }],
                         temperature: Some(0.2),
                         max_tokens: Some(256),
-                        ..Default::default()
                     },
                 )
                 .await?;

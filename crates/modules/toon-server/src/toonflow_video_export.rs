@@ -419,7 +419,10 @@ fn build_timeline_plan(
             _ => 0,
         };
         let (next_video, next_audio) = (format!("xv{index}"), format!("xa{index}"));
-        match (clip.transition_type.as_str(), overlap_ms >= MIN_TRANSITION_MS) {
+        match (
+            clip.transition_type.as_str(),
+            overlap_ms >= MIN_TRANSITION_MS,
+        ) {
             ("dissolve", true) => {
                 graph.push_str(&format!(
                     "[{current_video}][v{index}]xfade=transition=fade:duration={}:offset={}[{next_video}];",
@@ -699,7 +702,14 @@ async fn resolve_export_sources(
     let mut locked_by_id = locked_rows
         .into_iter()
         .map(
-            |(video_id, file_path, transition_type, transition_duration_ms, trim_start_ms, trim_end_ms)| {
+            |(
+                video_id,
+                file_path,
+                transition_type,
+                transition_duration_ms,
+                trim_start_ms,
+                trim_end_ms,
+            )| {
                 (
                     video_id,
                     (
@@ -717,7 +727,13 @@ async fn resolve_export_sources(
         .into_iter()
         .map(|video_id| {
             locked_by_id.remove(&video_id).map(
-                |(file_path, transition_type, transition_duration_ms, trim_start_ms, trim_end_ms)| {
+                |(
+                    file_path,
+                    transition_type,
+                    transition_duration_ms,
+                    trim_start_ms,
+                    trim_end_ms,
+                )| {
                     (
                         video_id,
                         file_path,
@@ -743,7 +759,14 @@ async fn resolve_export_sources(
     Ok(rows
         .into_iter()
         .map(
-            |(video_id, file_path, transition_type, transition_duration_ms, trim_start_ms, trim_end_ms)| {
+            |(
+                video_id,
+                file_path,
+                transition_type,
+                transition_duration_ms,
+                trim_start_ms,
+                trim_end_ms,
+            )| {
                 VideoExportSource {
                     video_id,
                     file_path,
@@ -867,12 +890,12 @@ async fn run_export(
     };
     let mut clips = Vec::with_capacity(files.len());
     for (file, source) in files.iter().zip(sources.iter()) {
-        let duration = probe_duration(file).await.map_err(|reason| {
-            format!("源视频 {} 无法探测时长：{reason}", source.video_id)
-        })?;
-        let has_audio = probe_has_audio(file).await.map_err(|reason| {
-            format!("源视频 {} 无法探测音轨：{reason}", source.video_id)
-        })?;
+        let duration = probe_duration(file)
+            .await
+            .map_err(|reason| format!("源视频 {} 无法探测时长：{reason}", source.video_id))?;
+        let has_audio = probe_has_audio(file)
+            .await
+            .map_err(|reason| format!("源视频 {} 无法探测音轨：{reason}", source.video_id))?;
         clips.push(TimelineClip {
             duration_ms: (duration * 1000.0).round() as i64,
             has_audio,
@@ -1252,9 +1275,7 @@ pub async fn export(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        TimelineClip, build_timeline_plan, ip_is_non_public, resolve_export_sources,
-    };
+    use super::{TimelineClip, build_timeline_plan, ip_is_non_public, resolve_export_sources};
     use rust_toon_framework_database::{DatabaseConfig, connect, migrate};
     use serde_json::json;
     use std::{
@@ -1287,9 +1308,8 @@ mod tests {
 
     #[test]
     fn dissolve_crossfades_video_and_audio_with_overlap() {
-        let plan =
-            build_timeline_plan(&[clip(4_000, "cut"), clip(5_000, "dissolve")], 1920, 1080)
-                .expect("dissolve timeline");
+        let plan = build_timeline_plan(&[clip(4_000, "cut"), clip(5_000, "dissolve")], 1920, 1080)
+            .expect("dissolve timeline");
         assert_eq!(plan.total_duration_ms, 8_400);
         assert!(
             plan.filter_graph
@@ -1361,7 +1381,10 @@ mod tests {
             .expect("clamped dissolve timeline");
         // 90% of the shorter 1s clip caps the overlap at 900ms.
         assert_eq!(plan.total_duration_ms, 4_100);
-        assert!(plan.filter_graph.contains("xfade=transition=fade:duration=0.900:offset=3.100"));
+        assert!(
+            plan.filter_graph
+                .contains("xfade=transition=fade:duration=0.900:offset=3.100")
+        );
     }
 
     #[test]
