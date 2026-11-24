@@ -219,7 +219,8 @@ mod database_tests {
     }
 
     async fn run(pool: &PgPool, statement: &str, binds: &[i64]) {
-        let mut query = sqlx::query(statement);
+        // 语句来自测试内的编译期字面量；sqlx 0.9 要求显式声明。
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(statement.to_owned()));
         for value in binds {
             query = query.bind(*value);
         }

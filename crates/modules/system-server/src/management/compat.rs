@@ -1078,6 +1078,13 @@ fn yudao_spec(kind: &str) -> Option<YudaoSpec> {
     })
 }
 
+/// sqlx 0.9 要求动态 SQL 显式声明已审计。本模块的动态 SQL 仅拼接
+/// `yudao_spec` / `core_*_sql` 静态匹配表中的表名与列名（编译期字面量或
+/// 数据库目录里真实存在的列名，均非用户输入），值一律走绑定参数。
+fn audited_sql(sql: impl Into<String>) -> sqlx::AssertSqlSafe<String> {
+    sqlx::AssertSqlSafe(sql.into())
+}
+
 async fn yudao_page(
     pool: &PgPool,
     spec: YudaoSpec,
@@ -1087,7 +1094,7 @@ async fn yudao_page(
     let page_size = params.page_size.unwrap_or(10).clamp(1, 200);
     let offset = (page_no - 1) * page_size;
     let total_sql = format!("SELECT count(*) FROM {} WHERE deleted = 0", spec.table);
-    let total = sqlx::query_scalar::<_, i64>(&total_sql)
+    let total = sqlx::query_scalar::<_, i64>(audited_sql(total_sql))
         .fetch_one(pool)
         .await
         .map_err(|_| AppError::internal("failed to count records"))?;
@@ -1095,7 +1102,7 @@ async fn yudao_page(
         "SELECT to_jsonb(t) FROM {} t WHERE deleted = 0 ORDER BY id DESC LIMIT $1 OFFSET $2",
         spec.table
     );
-    let rows = sqlx::query_scalar::<_, Value>(&list_sql)
+    let rows = sqlx::query_scalar::<_, Value>(audited_sql(list_sql))
         .bind(page_size)
         .bind(offset)
         .fetch_all(pool)
@@ -1115,7 +1122,7 @@ async fn yudao_list(
         "SELECT to_jsonb(t) FROM {} t WHERE deleted = 0 ORDER BY id DESC",
         spec.table
     );
-    let rows = sqlx::query_scalar::<_, Value>(&sql)
+    let rows = sqlx::query_scalar::<_, Value>(audited_sql(sql))
         .fetch_all(pool)
         .await
         .map_err(|_| AppError::internal("failed to list records"))?;
@@ -1134,7 +1141,7 @@ async fn yudao_get(
         "SELECT to_jsonb(t) FROM {} t WHERE id = $1 AND deleted = 0",
         spec.table
     );
-    let row = sqlx::query_scalar::<_, Value>(&sql)
+    let row = sqlx::query_scalar::<_, Value>(audited_sql(sql.clone()))
         .bind(id)
         .fetch_optional(pool)
         .await
@@ -1163,7 +1170,7 @@ async fn yudao_create(
         "INSERT INTO {} (id, {}) SELECT nextval('{}'), {} FROM jsonb_populate_record(NULL::{}, $1::jsonb) AS r RETURNING id",
         spec.table, column_sql, spec.seq, record_sql, spec.table
     );
-    let id = sqlx::query_scalar::<_, i64>(&sql)
+    let id = sqlx::query_scalar::<_, i64>(audited_sql(sql))
         .bind(db_payload)
         .fetch_one(pool)
         .await
@@ -1191,7 +1198,7 @@ async fn yudao_update(
         "UPDATE {} t SET {}, update_time = now() FROM jsonb_populate_record(NULL::{}, $2::jsonb) AS r WHERE t.id = $1 AND t.deleted = 0",
         spec.table, set_sql, spec.table
     );
-    let result = sqlx::query(&sql)
+    let result = sqlx::query(audited_sql(sql))
         .bind(id)
         .bind(db_payload)
         .execute(pool)
@@ -1213,7 +1220,7 @@ async fn yudao_delete(
         "UPDATE {} SET deleted = 1, update_time = now() WHERE id = $1",
         spec.table
     );
-    sqlx::query(&sql)
+    sqlx::query(audited_sql(sql))
         .bind(id)
         .execute(pool)
         .await
@@ -1231,7 +1238,7 @@ async fn yudao_delete_list(
             "UPDATE {} SET deleted = 1, update_time = now() WHERE id = $1",
             spec.table
         );
-        sqlx::query(&sql)
+        sqlx::query(audited_sql(sql))
             .bind(id)
             .execute(pool)
             .await
@@ -1481,7 +1488,7 @@ async fn core_page(
         .await
         .map_err(|_| AppError::internal("failed to count records"))?;
     let select_sql = core_select_sql(kind, true)?;
-    let rows = sqlx::query_scalar::<_, Value>(&select_sql)
+    let rows = sqlx::query_scalar::<_, Value>(audited_sql(select_sql))
         .bind(page_size)
         .bind(offset)
         .fetch_all(pool)
@@ -1492,7 +1499,7 @@ async fn core_page(
 
 async fn core_list(pool: &PgPool, kind: &str) -> Result<Json<ApiResponse<Vec<Value>>>, AppError> {
     let select_sql = core_select_sql(kind, false)?;
-    let rows = sqlx::query_scalar::<_, Value>(&select_sql)
+    let rows = sqlx::query_scalar::<_, Value>(audited_sql(select_sql))
         .fetch_all(pool)
         .await
         .map_err(|_| AppError::internal("failed to list records"))?;

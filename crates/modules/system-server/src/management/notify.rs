@@ -262,7 +262,9 @@ async fn message_list(
          ORDER BY create_time DESC, id DESC
          LIMIT $3"
     );
-    sqlx::query_scalar::<_, Value>(&sql)
+    // read_filter 是内部二选一的静态片段（未读过滤），非用户输入；
+    // sqlx 0.9 要求动态 SQL 显式声明已审计。
+    sqlx::query_scalar::<_, Value>(sqlx::AssertSqlSafe(sql))
         .bind(user_id)
         .bind(tenant_id)
         .bind(limit)

@@ -210,9 +210,11 @@ pub async fn delete_project(
         ("video_continuity_frames", "previous_video_id"),
         ("episode_renders", "id"),
     ] {
-        sqlx::query(&format!(
+        // (table, id_column) 均为上方静态清单的字面量，非用户输入；
+        // sqlx 0.9 要求动态 SQL 显式声明已审计。
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {id_column} FROM toonflow.{table} WHERE project_id=$1 FOR UPDATE"
-        ))
+        )))
         .bind(request.id)
         .fetch_all(&mut *tx)
         .await

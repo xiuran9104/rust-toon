@@ -2536,10 +2536,13 @@ async fn applies_all_migrations_to_empty_postgres() {
         "system_operate_log",
         "system_notify_message",
     ] {
-        let rows: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {runtime_table}"))
-            .fetch_one(&pool)
-            .await
-            .expect("read runtime table");
+        // runtime_table 来自上方静态表名清单（编译期字面量），非用户输入。
+        let rows: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT count(*) FROM {runtime_table}"
+        )))
+        .fetch_one(&pool)
+        .await
+        .expect("read runtime table");
         assert_eq!(rows, 0, "{runtime_table} must start empty");
     }
 

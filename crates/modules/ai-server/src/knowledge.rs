@@ -296,13 +296,15 @@ where
 {
     let p = q.page_no.unwrap_or(1).max(1);
     let n = q.page_size.unwrap_or(10).clamp(1, 100);
-    let query = format!(
+    // table 与 column 均为调用方传入的静态字面量；用户输入走绑定参数。
+    // sqlx 0.9 要求动态 SQL 显式声明已审计。
+    let query = sqlx::AssertSqlSafe(format!(
         "SELECT * FROM {table} WHERE ($1::bigint IS NULL OR {column}=$1) AND ($2::int IS NULL OR status=$2) ORDER BY id DESC LIMIT $3 OFFSET $4"
-    );
-    let count = format!(
+    ));
+    let count = sqlx::AssertSqlSafe(format!(
         "SELECT count(*) FROM {table} WHERE ($1::bigint IS NULL OR {column}=$1) AND ($2::int IS NULL OR status=$2)"
-    );
-    let rows = sqlx::query(&query)
+    ));
+    let rows = sqlx::query(query)
         .bind(parent)
         .bind(status)
         .bind(n)
@@ -310,7 +312,7 @@ where
         .fetch_all(&s.pool)
         .await
         .map_err(|_| AppError::internal("读取分页数据失败"))?;
-    let total: i64 = sqlx::query_scalar(&count)
+    let total: i64 = sqlx::query_scalar(count)
         .bind(parent)
         .bind(status)
         .fetch_one(&s.pool)

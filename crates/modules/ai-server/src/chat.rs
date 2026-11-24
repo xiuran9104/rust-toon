@@ -178,9 +178,11 @@ async fn my_conversations(
     user: CurrentUser,
     State(state): State<AiState>,
 ) -> Result<Json<ApiResponse<Vec<Value>>>, AppError> {
-    let rows = sqlx::query(&format!(
+    // CONVERSATION_SELECT 为编译期常量，用户输入走绑定参数；
+    // sqlx 0.9 要求动态 SQL 显式声明已审计。
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "{CONVERSATION_SELECT} WHERE c.user_id=$1 ORDER BY c.pinned DESC,c.update_time DESC"
-    ))
+    )))
     .bind(&user.user_id)
     .fetch_all(&state.pool)
     .await
@@ -194,9 +196,9 @@ async fn get_conversation(
     State(state): State<AiState>,
     Query(v): Query<Id>,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
         "{CONVERSATION_SELECT} WHERE c.id=$1 AND c.user_id=$2"
-    ))
+    )))
     .bind(v.id)
     .bind(&user.user_id)
     .fetch_optional(&state.pool)

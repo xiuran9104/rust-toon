@@ -43,7 +43,8 @@ ignore = [
 
     # libsqlite3-sys 0.30.1 不参与任何编译：cargo tree -e normal,build,dev --workspace
     # 中不存在它。sqlx 没有启用 sqlite 特性，它只作为 sqlx-sqlite 的可选依赖留在
-    # Cargo.lock 里。sqlx 0.8.x 把 libsqlite3-sys 钉在 0.30.x，修复（>=0.39.0）需要
-    # sqlx 0.9；那次升级要求逐处审计并标注约 30 处动态 SQL，需要单独安排。
+    # Cargo.lock 里。sqlx 已升级 0.9.1（libsqlite3-sys 允许范围扩到 <0.40），但
+    # sqlite 特性仍关闭，锁文件里停留在 0.30.1；该版本范围内的告警持续豁免，
+    # 直至某次依赖刷新把它推出 0.30.x。
     "RUSTSEC-2026-0459",
 ]

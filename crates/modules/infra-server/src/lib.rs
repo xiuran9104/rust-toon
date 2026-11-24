@@ -1885,7 +1885,7 @@ async fn demo03_grade_get_by_student_id(
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
     let student_id = id_named_param(&params, "studentId")?;
     let sql = "SELECT to_jsonb(t) FROM yudao_demo03_grade t WHERE student_id=$1 AND deleted=0 ORDER BY id DESC LIMIT 1";
-    let value = sqlx::query_scalar::<_, Value>(sql)
+    let value = sqlx::query_scalar::<_, Value>(audited_sql(sql.to_owned()))
         .bind(student_id)
         .fetch_optional(&state.pool)
         .await
@@ -1893,6 +1893,12 @@ async fn demo03_grade_get_by_student_id(
         .map(table_value)
         .unwrap_or_else(|| json!({}));
     Ok(Json(ApiResponse::new(value)))
+}
+
+/// sqlx 0.9 要求动态 SQL 显式声明已审计。本文件的动态 SQL 仅拼接
+/// `TableSpec` 静态常量的表名（编译期字面量，非用户输入），值一律走绑定参数。
+fn audited_sql(sql: impl Into<String>) -> sqlx::AssertSqlSafe<String> {
+    sqlx::AssertSqlSafe(sql.into())
 }
 
 async fn table_page(
@@ -1904,7 +1910,7 @@ async fn table_page(
     let page_size = params.page_size.unwrap_or(10).clamp(1, 200);
     let offset = (page_no - 1) * page_size;
     let total_sql = format!("SELECT count(*) FROM {} WHERE deleted=0", spec.table);
-    let total = sqlx::query_scalar::<_, i64>(&total_sql)
+    let total = sqlx::query_scalar::<_, i64>(audited_sql(total_sql))
         .fetch_one(pool)
         .await
         .map_err(|_| AppError::internal("failed to count records"))?;
@@ -1912,7 +1918,7 @@ async fn table_page(
         "SELECT to_jsonb(t) FROM {} t WHERE deleted=0 ORDER BY id DESC LIMIT $1 OFFSET $2",
         spec.table
     );
-    let list = sqlx::query_scalar::<_, Value>(&list_sql)
+    let list = sqlx::query_scalar::<_, Value>(audited_sql(list_sql))
         .bind(page_size)
         .bind(offset)
         .fetch_all(pool)
@@ -1932,7 +1938,7 @@ async fn table_list(
         "SELECT to_jsonb(t) FROM {} t WHERE deleted=0 ORDER BY id",
         spec.table
     );
-    let list = sqlx::query_scalar::<_, Value>(&sql)
+    let list = sqlx::query_scalar::<_, Value>(audited_sql(sql))
         .fetch_all(pool)
         .await
         .map_err(|_| AppError::internal("failed to list records"))?
@@ -1952,7 +1958,7 @@ async fn table_list_by_i64(
         "SELECT to_jsonb(t) FROM {} t WHERE {column}=$1 AND deleted=0 ORDER BY id",
         spec.table
     );
-    let list = sqlx::query_scalar::<_, Value>(&sql)
+    let list = sqlx::query_scalar::<_, Value>(audited_sql(sql))
         .bind(value)
         .fetch_all(pool)
         .await
@@ -1978,7 +1984,7 @@ async fn table_get_value(pool: &PgPool, spec: TableSpec, id: i64) -> Result<Valu
         "SELECT to_jsonb(t) FROM {} t WHERE id=$1 AND deleted=0",
         spec.table
     );
-    let value = sqlx::query_scalar::<_, Value>(&sql)
+    let value = sqlx::query_scalar::<_, Value>(audited_sql(sql))
         .bind(id)
         .fetch_optional(pool)
         .await
@@ -2007,7 +2013,7 @@ async fn table_create(
         "INSERT INTO {} (id, {}) SELECT nextval('{}'), {} FROM jsonb_populate_record(NULL::{}, $1::jsonb) AS r RETURNING id",
         spec.table, column_sql, spec.seq, record_sql, spec.table
     );
-    let id = sqlx::query_scalar::<_, i64>(&sql)
+    let id = sqlx::query_scalar::<_, i64>(audited_sql(sql))
         .bind(db_payload)
         .fetch_one(pool)
         .await
@@ -2038,7 +2044,7 @@ async fn table_update(
         "UPDATE {} t SET {}, update_time=now() FROM jsonb_populate_record(NULL::{}, $2::jsonb) AS r WHERE t.id=$1 AND t.deleted=0",
         spec.table, set_sql, spec.table
     );
-    sqlx::query(&sql)
+    sqlx::query(audited_sql(sql))
         .bind(id)
         .bind(db_payload)
         .execute(pool)
@@ -2086,11 +2092,11 @@ async fn page(
     let page_no = params.page_no.unwrap_or(1).max(1);
     let page_size = params.page_size.unwrap_or(10).clamp(1, 200);
     let offset = (page_no - 1) * page_size;
-    let total = sqlx::query_scalar::<_, i64>(count_sql)
+    let total = sqlx::query_scalar::<_, i64>(audited_sql(count_sql.to_owned()))
         .fetch_one(pool)
         .await
         .map_err(|_| AppError::internal("failed to count records"))?;
-    let list = sqlx::query_scalar::<_, Value>(list_sql)
+    let list = sqlx::query_scalar::<_, Value>(audited_sql(list_sql.to_owned()))
         .bind(page_size)
         .bind(offset)
         .fetch_all(pool)
@@ -2100,7 +2106,7 @@ async fn page(
 }
 
 async fn get_one(pool: &PgPool, sql: &str, id: i64) -> Result<Json<ApiResponse<Value>>, AppError> {
-    let value = sqlx::query_scalar::<_, Value>(sql)
+    let value = sqlx::query_scalar::<_, Value>(audited_sql(sql.to_owned()))
         .bind(id)
         .fetch_optional(pool)
         .await
@@ -2115,7 +2121,7 @@ async fn soft_delete(
     id: i64,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
     let sql = format!("UPDATE {table} SET deleted=1, update_time=now() WHERE id=$1");
-    sqlx::query(&sql)
+    sqlx::query(audited_sql(sql))
         .bind(id)
         .execute(pool)
         .await
