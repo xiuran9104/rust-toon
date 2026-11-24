@@ -147,7 +147,35 @@ fi
 docker exec "$postgres_container" psql -U rust_toon -d rust_toon_test -v ON_ERROR_STOP=1 -c \
   "INSERT INTO toonflow.tasks (id,task_class,state) VALUES (1789003357277804801,'api-contract','completed')" >/dev/null
 
+# The smoke test runs in two passes. The first leaves its project behind and
+# reports its id. A run is then inserted as if another session had started it
+# and disconnected while it was still executing; the second pass must be told
+# about that run and must be able to stop it. Its lease reaches into the
+# future so the periodic stale-run sweep leaves it alone.
 E2E_TASK_ID="1789003357277804801" E2E_BASE_URL="http://127.0.0.1:${gateway_port}" \
+  E2E_KEEP_PROJECT=1 \
+  node script/e2e/gateway-smoke.mjs | tee "$work_dir/smoke.log"
+smoke_project_id="$(
+  tail -n 1 "$work_dir/smoke.log" | node -e '
+    let text = "";
+    process.stdin
+      .on("data", (chunk) => { text += chunk; })
+      .on("end", () => {
+        const { projectId } = JSON.parse(text);
+        if (!Number.isSafeInteger(projectId)) process.exit(1);
+        process.stdout.write(String(projectId));
+      });
+  '
+)"
+reattach_run_id="$(
+  # -q suppresses the "INSERT 0 1" command tag; -At leaves only the returned id.
+  docker exec "$postgres_container" psql -U rust_toon -d rust_toon_test -Atqc \
+    "INSERT INTO toonflow.agent_runs(agent_type,isolation_key,project_id,input,state,think,think_level,start_time,heartbeat_at,lease_until)
+     VALUES('scriptAgent','scriptAgent:${smoke_project_id}:project',${smoke_project_id},'started by a session that disconnected','running',false,0,0,0,now()+interval '10 minutes')
+     RETURNING id"
+)"
+E2E_BASE_URL="http://127.0.0.1:${gateway_port}" \
+  E2E_REATTACH_PROJECT_ID="$smoke_project_id" E2E_REATTACH_RUN_ID="$reattach_run_id" \
   node script/e2e/gateway-smoke.mjs
 
 sleep 1
