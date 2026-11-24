@@ -112,6 +112,36 @@ mod memory_tool_tests {
 
 pub use crate::toonflow_agent_plan::{get_plan, set_plan, update_plan};
 
+/// 运行租约句柄：子 Agent 循环在每个检查点续租并感知取消。
+/// AgentRun = 决策 Agent 的 durable 运行；WorkflowNode = 工作流节点任务。
+#[derive(Clone)]
+pub(crate) enum RunLease {
+    AgentRun(i64),
+    WorkflowNode(i64),
+}
+
+impl RunLease {
+    /// `Err(原因)` 表示租约对应的运行已被取消或已结束，调用方应立即停止。
+    pub(crate) async fn check(&self, pool: &sqlx::PgPool) -> Result<(), String> {
+        match self {
+            RunLease::AgentRun(run_id) => {
+                crate::toonflow_agents::renew_lease_and_check_cancel(pool, *run_id).await
+            }
+            RunLease::WorkflowNode(node_run_id) => {
+                crate::toonflow_workflow::workflow_node_checkpoint(pool, *node_run_id)
+                    .await
+                    .and_then(|stop| {
+                        if stop {
+                            Err("工作流已取消".into())
+                        } else {
+                            Ok(())
+                        }
+                    })
+            }
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ToolRequest {
@@ -129,6 +159,10 @@ pub(crate) struct ToolRequest {
     pub(crate) arguments: Value,
     #[serde(skip, default)]
     pub(crate) emitter: Option<WsEmitter>,
+    /// 取消句柄：由调用方（决策循环 / 工作流节点）注入，子 Agent 循环在
+    /// 每个检查点续租并感知取消。API 不可伪造。
+    #[serde(skip, default)]
+    pub(crate) lease: Option<RunLease>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -794,6 +828,14 @@ pub(crate) async fn execute_inner(
             messages.push(json!({"role":"user","content":format!("{prompt}{format_instruction}")}));
             let mut output = String::new();
             for _round in 0..24 {
+                // 取消检查点：每轮 LLM 调用前续租并感知取消——子 Agent
+                // 单次运行可达数分钟，不能等到外层轮次边界才停。
+                if let Some(lease) = &request.lease {
+                    lease
+                        .check(&state.pool)
+                        .await
+                        .map_err(AppError::bad_request)?;
+                }
                 let raw = ai_client::project_text_tools(
                     &state.pool,
                     agent_key,
@@ -1471,6 +1513,7 @@ pub(crate) async fn execute_inner(
                 request.script_id,
                 allowed_tools,
                 request.emitter.as_ref(),
+                request.lease.clone(),
             ));
             let panel_batch_context = (agent_key == "productionAgent:storyboardPanelAgent")
                 .then(|| std::sync::Arc::new(StoryboardPanelBatchContext::default()));
@@ -1656,6 +1699,7 @@ pub(crate) async fn execute_inner(
                         request.script_id,
                         allowed_tools,
                         request.emitter.as_ref(),
+                        request.lease.clone(),
                     ))
                     .await?;
                     let still_missing =
@@ -1728,6 +1772,7 @@ pub(crate) async fn execute_inner(
                         request.script_id,
                         allowed_tools,
                         request.emitter.as_ref(),
+                        request.lease.clone(),
                     ))
                     .await?;
                 }
@@ -1780,6 +1825,7 @@ pub(crate) async fn execute_inner(
                     request.script_id,
                     &["get_flowData"],
                     request.emitter.as_ref(),
+                    request.lease.clone(),
                 ))
                 .await?;
                 toonflow_agents::add_memory(

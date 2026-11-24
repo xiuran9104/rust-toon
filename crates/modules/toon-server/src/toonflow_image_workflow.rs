@@ -737,6 +737,7 @@ pub(crate) async fn run_storyboard_generation(
     jobs: Vec<StoryboardImageJob>,
     concurrent_count: usize,
     workflow_node_run_id: Option<i64>,
+    workflow_run_id: Option<i64>,
 ) -> StoryboardGenerationSummary {
     let mut summary = StoryboardGenerationSummary {
         total: jobs.len(),
@@ -800,6 +801,25 @@ pub(crate) async fn run_storyboard_generation(
             .execute(&pool)
             .await;
         }
+        // 取消检查点：租约续期 + 感知运行/节点取消。收到取消后停止派发，
+        // 未派发的分镜置「已取消」；在途任务照常完成（结果落在已取消的
+        // 节点行之外，由用户在画布上处置）。
+        if let (Some(node_run_id), Some(_)) = (workflow_node_run_id, workflow_run_id) {
+            match crate::toonflow_workflow::workflow_node_checkpoint(&pool, node_run_id).await {
+                Ok(false) => {}
+                _ => {
+                    let remaining: Vec<i64> = jobs.by_ref().map(|job| job.id).collect();
+                    let _ = sqlx::query(
+                        "UPDATE toonflow.storyboards SET state='已取消',reason='用户取消工作流'
+                         WHERE id=ANY($1) AND state='未生成'",
+                    )
+                    .bind(&remaining)
+                    .execute(&pool)
+                    .await;
+                    break;
+                }
+            }
+        }
         if let Some(job) = jobs.next() {
             running.spawn(generate_storyboard_job(
                 pool.clone(),
@@ -855,9 +875,16 @@ pub async fn schedule_storyboard_generation(
             .await?;
     let pool = pool.clone();
     tokio::spawn(async move {
-        let _ =
-            run_storyboard_generation(pool, project_id, script_id, jobs, concurrent_count, None)
-                .await;
+        let _ = run_storyboard_generation(
+            pool,
+            project_id,
+            script_id,
+            jobs,
+            concurrent_count,
+            None,
+            None,
+        )
+        .await;
     });
     Ok(response)
 }

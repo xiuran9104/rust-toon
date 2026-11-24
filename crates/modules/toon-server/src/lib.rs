@@ -88,6 +88,7 @@ pub use toonflow_video_export::{
 };
 pub use toonflow_video_quality::{VIDEO_QUALITY_JOB_KIND, execute_distributed_quality};
 pub use toonflow_workflow::resume_interrupted_workflow_runs;
+pub use toonflow_workflow::spawn_workflow_run_recovery;
 
 const STORAGE_CLEANUP_CONCURRENCY: usize = 8;
 const STORAGE_CLEANUP_REFERENCE_RECHECK_SECONDS: u64 = 30;
@@ -855,6 +856,7 @@ mod agent_memory_database_tests {
                     tool_name: "save_scripts".into(),
                     arguments: json!({"scripts":[{"name":"episode one","content":content}]}),
                     emitter: None,
+                    lease: None,
                 },
             )
             .await

@@ -438,10 +438,9 @@ pub async fn create_run(
 }
 
 pub(crate) async fn recover_stale_node_runs(state: &ToonState) {
-    // Gateway startup repairs process-owned work immediately. This runtime
-    // sweep is only a panic fallback, so require an age threshold; otherwise
-    // a freshly CAS-claimed node can be mistaken for stale while it is still
-    // preparing references before its execution handle is registered.
+    // durable 租约化后，租约过期的运行节点即判 stale（执行任务的检查点每轮
+    // 续租 300 秒）。租约为 NULL 的迁移前旧行仍按旧的时间阈值判定；本地活跃
+    // 集始终排除——正在本进程执行（即使在两次检查点之间）的节点不会被误判。
     let stale_after_seconds = std::env::var("TOON_WORKFLOW_STALE_SECONDS")
         .ok()
         .and_then(|value| value.parse::<i64>().ok())
@@ -458,9 +457,12 @@ pub(crate) async fn recover_stale_node_runs(state: &ToonState) {
          FROM toonflow.workflow_node_runs nr
          JOIN toonflow.workflow_runs r ON r.id=nr.workflow_run_id
          WHERE nr.state='running' AND NOT(nr.id=ANY($1))
-           AND nr.start_time IS NOT NULL
-           AND nr.start_time <
-             (extract(epoch FROM clock_timestamp()) * 1000)::bigint - ($2 * 1000)",
+           AND (
+             (nr.lease_until IS NOT NULL AND nr.lease_until < clock_timestamp())
+             OR (nr.lease_until IS NULL AND nr.start_time IS NOT NULL
+                 AND nr.start_time <
+                   (extract(epoch FROM clock_timestamp()) * 1000)::bigint - ($2 * 1000))
+           )",
     )
     .bind(&active)
     .bind(stale_after_seconds)
@@ -517,6 +519,85 @@ pub(crate) async fn recover_stale_node_runs(state: &ToonState) {
     .bind(time)
     .execute(&state.pool)
     .await;
+}
+
+/// 长任务检查点（分镜出图循环、编排器轮询等）：续节点与运行租约，并返回
+/// 「是否应停止任务」——节点或所属运行已被取消（cancel 端点直接落终态行），
+/// 或运行已不在 running 状态。任务停止后由取消端点负责的终态行已经就位，
+/// 后续 finish_node_run 的 running 守卫会自动变为空操作。
+pub(crate) async fn workflow_node_checkpoint(
+    pool: &PgPool,
+    node_run_id: i64,
+) -> Result<bool, String> {
+    let time = chrono::Utc::now().timestamp_millis();
+    let row: Option<(bool, String)> = sqlx::query_as(
+        "UPDATE toonflow.workflow_node_runs nr
+         SET lease_until=now()+interval '300 seconds',heartbeat_at=$2
+         FROM toonflow.workflow_runs r
+         WHERE nr.id=$1 AND nr.workflow_run_id=r.id
+         RETURNING (r.cancel_requested OR nr.cancel_requested) AS cancelled, r.state",
+    )
+    .bind(node_run_id)
+    .bind(time)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    let Some((cancelled, run_state)) = row else {
+        return Ok(true);
+    };
+    Ok(cancelled || run_state != "running")
+}
+
+/// 编排器运行租约续期（500ms 轮询 tick 调用），返回是否收到取消请求。
+/// 行不存在或已非 running（被取消端点/清扫收走）时返回 Ok(false)——
+/// 调用方的下一个循环迭代会读取运行状态并正常退出。
+pub(crate) async fn renew_workflow_run_lease(
+    pool: &PgPool,
+    workflow_run_id: i64,
+) -> Result<bool, String> {
+    let time = chrono::Utc::now().timestamp_millis();
+    let row: Option<(bool,)> = sqlx::query_as(
+        "UPDATE toonflow.workflow_runs
+         SET lease_until=now()+interval '300 seconds',heartbeat_at=$2
+         WHERE id=$1 AND state='running'
+         RETURNING cancel_requested",
+    )
+    .bind(workflow_run_id)
+    .bind(time)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(row.map(|(cancel,)| cancel).unwrap_or(false))
+}
+
+/// 运行级回收：编排器任务死亡（panic/进程重启间隙）后，running 的运行不再
+/// 有租约续期，租约过期且无 running 节点时标记失败。节点级副作用回滚由
+/// recover_stale_node_runs 先行完成。
+pub(crate) async fn sweep_orphaned_workflow_runs(state: &ToonState) {
+    let time = chrono::Utc::now().timestamp_millis();
+    let _ = sqlx::query(
+        "UPDATE toonflow.workflow_runs r
+         SET state='failed',error_reason='服务重启导致任务中断',finish_time=$1
+         WHERE r.state='running' AND r.lease_until IS NOT NULL AND r.lease_until < clock_timestamp()
+           AND NOT EXISTS(SELECT 1 FROM toonflow.workflow_node_runs nr
+                           WHERE nr.workflow_run_id=r.id AND nr.state='running')",
+    )
+    .bind(time)
+    .execute(&state.pool)
+    .await;
+}
+
+/// 周期回收：recover_stale_node_runs（节点）+ 孤儿运行清扫。gateway 启动
+/// 时挂载，60 秒一轮；任务幂等。
+pub fn spawn_workflow_run_recovery(state: ToonState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            recover_stale_node_runs(&state).await;
+            sweep_orphaned_workflow_runs(&state).await;
+        }
+    })
 }
 
 async fn finish_node_run(
@@ -590,7 +671,8 @@ async fn claim_node_run(
     let claimed: Option<i64> = sqlx::query_scalar(
         "UPDATE toonflow.workflow_node_runs
          SET state='running',input=$2,output=NULL,error_reason=NULL,
-             progress_current=0,progress_total=0,start_time=$3,finish_time=NULL
+             progress_current=0,progress_total=0,start_time=$3,finish_time=NULL,
+             lease_until=now()+interval '300 seconds',heartbeat_at=$3,cancel_requested=false
          WHERE id=$1 AND workflow_run_id=$4 AND state IN('pending','blocked')
          RETURNING id",
     )
@@ -612,7 +694,8 @@ async fn claim_node_run(
     }
     sqlx::query(
         "UPDATE toonflow.workflow_runs
-         SET state='running',error_reason=NULL,start_time=coalesce(start_time,$2),finish_time=NULL
+         SET state='running',error_reason=NULL,start_time=coalesce(start_time,$2),finish_time=NULL,
+             lease_until=now()+interval '300 seconds',heartbeat_at=$2,cancel_requested=false
          WHERE id=$1",
     )
     .bind(workflow_run_id)
@@ -721,6 +804,7 @@ async fn launch_storyboard_node(
             jobs,
             concurrency,
             Some(node_run_id),
+            Some(workflow_run_id),
         )
         .await;
         let (node_state, error_reason) = if summary.failed == 0 {
@@ -1031,6 +1115,7 @@ async fn launch_standard_node(
             } => async {
                 let request = toonflow_agent_tools::ToolRequest {
                     emitter: None,
+                    lease: Some(toonflow_agent_tools::RunLease::WorkflowNode(node_run_id)),
                     agent_type: "productionAgent".into(),
                     agent_key: Some("productionAgent:decisionAgent".into()),
                     isolation_key: format!("productionAgent:{project_id}:{script_id}"),
@@ -1066,6 +1151,7 @@ async fn launch_standard_node(
                     .map_err(|error| error.to_string())?;
                     let panel_request = toonflow_agent_tools::ToolRequest {
                         emitter: None,
+                        lease: Some(toonflow_agent_tools::RunLease::WorkflowNode(node_run_id)),
                         agent_type: "productionAgent".into(),
                         agent_key: Some("productionAgent:decisionAgent".into()),
                         isolation_key: format!("productionAgent:{project_id}:{script_id}"),
@@ -1442,7 +1528,53 @@ async fn orchestrate_workflow_run(state: ToonState, workflow_run_id: i64) {
                     break;
                 }
                 Ok(None) | Err(_) => break,
-                _ => tokio::time::sleep(std::time::Duration::from_millis(500)).await,
+                _ => {
+                    // 编排器持有运行与当前节点的租约（500ms tick 续期）；
+                    // 收到取消请求时收尾运行并中止节点任务（业务行已由
+                    // cancel 端点的事务先行清理）。
+                    let _ = sqlx::query(
+                        "UPDATE toonflow.workflow_node_runs
+                         SET lease_until=now()+interval '300 seconds',heartbeat_at=$2
+                         WHERE id=$1 AND state='running'",
+                    )
+                    .bind(node_run_id)
+                    .bind(chrono::Utc::now().timestamp_millis())
+                    .execute(&state.pool)
+                    .await;
+                    let cancel = renew_workflow_run_lease(&state.pool, workflow_run_id)
+                        .await
+                        .unwrap_or(false);
+                    if cancel {
+                        if let Some(handle) = active_node_runs()
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .remove(&node_run_id)
+                        {
+                            handle.abort();
+                        }
+                        let time = chrono::Utc::now().timestamp_millis();
+                        let _ = sqlx::query(
+                            "UPDATE toonflow.workflow_node_runs
+                             SET state='cancelled',error_reason='用户取消工作流',finish_time=$2
+                             WHERE id=$1 AND state='running'",
+                        )
+                        .bind(node_run_id)
+                        .bind(time)
+                        .execute(&state.pool)
+                        .await;
+                        let _ = sqlx::query(
+                            "UPDATE toonflow.workflow_runs
+                             SET state='cancelled',error_reason='用户取消工作流',finish_time=$2
+                             WHERE id=$1 AND state='running'",
+                        )
+                        .bind(workflow_run_id)
+                        .bind(time)
+                        .execute(&state.pool)
+                        .await;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
             }
         }
         let terminal_state: Option<String> =
@@ -1511,6 +1643,27 @@ fn spawn_video_node_waiter(pool: &PgPool, node_run_id: i64, workflow_run_id: i64
     let handle = tokio::spawn(async move {
         let _ = start_rx.await;
         loop {
+            // waiter 是该节点租约的唯一持有者：每个 tick 续节点与运行租约，
+            // 周期清扫才不会把仍在执行的节点判为中断。
+            let time = chrono::Utc::now().timestamp_millis();
+            let _ = sqlx::query(
+                "UPDATE toonflow.workflow_node_runs
+                 SET lease_until=now()+interval '300 seconds',heartbeat_at=$2
+                 WHERE id=$1 AND state='running'",
+            )
+            .bind(node_run_id)
+            .bind(time)
+            .execute(&pool)
+            .await;
+            let _ = sqlx::query(
+                "UPDATE toonflow.workflow_runs
+                 SET lease_until=now()+interval '300 seconds',heartbeat_at=$2
+                 WHERE id=$1 AND state='running'",
+            )
+            .bind(workflow_run_id)
+            .bind(time)
+            .execute(&pool)
+            .await;
             let node_state: Option<String> =
                 sqlx::query_scalar("SELECT state FROM toonflow.workflow_node_runs WHERE id=$1")
                     .bind(node_run_id)
@@ -1893,5 +2046,268 @@ mod resume_database_tests {
             .execute(&pool)
             .await
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod workflow_lease_database_tests {
+    use std::time::Duration;
+
+    use rust_toon_framework_database::{DatabaseConfig, connect, migrate};
+    use rust_toon_framework_security::{SecurityConfig, TokenService};
+    use serde_json::json;
+
+    use super::{
+        recover_stale_node_runs, renew_workflow_run_lease, sweep_orphaned_workflow_runs,
+        workflow_node_checkpoint,
+    };
+    use crate::ToonState;
+
+    /// 每个测试用独立的项目 ID 段：三个用例在同一测试二进制内并行运行，
+    /// 共享固定 ID 会互相删除对方的数据。
+    async fn state_with_base(base: i64) -> (sqlx::PgPool, ToonState, LeaseIds) {
+        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is required");
+        let config = DatabaseConfig::new(url, 1, 5, Duration::from_secs(10)).unwrap();
+        let pool = connect(&config).await.unwrap();
+        migrate(&pool).await.unwrap();
+        let tokens = TokenService::new(
+            SecurityConfig::new(
+                "workflow-lease-test-secret-at-least-32-bytes",
+                "test",
+                "test",
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+        );
+        let state = ToonState::new(pool.clone(), tokens);
+        let ids = LeaseIds {
+            project: base,
+            script: base + 10,
+            definition: base + 20,
+            run: base + 30,
+            node: base + 31,
+            storyboard: base + 40,
+            other_run: base + 50,
+        };
+        (pool, state, ids)
+    }
+
+    struct LeaseIds {
+        project: i64,
+        script: i64,
+        definition: i64,
+        run: i64,
+        node: i64,
+        storyboard: i64,
+        other_run: i64,
+    }
+
+    async fn cleanup(pool: &sqlx::PgPool, ids: &LeaseIds) {
+        // storyboards 对项目没有外键，必须先于项目删除。
+        sqlx::query("DELETE FROM toonflow.storyboards WHERE id=$1")
+            .bind(ids.storyboard)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM toonflow.workflow_runs WHERE id IN ($1,$2)")
+            .bind(ids.run)
+            .bind(ids.other_run)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM toonflow.workflow_definitions WHERE id=$1")
+            .bind(ids.definition)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM toonflow.scripts WHERE id=$1")
+            .bind(ids.script)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM toonflow.projects WHERE id=$1")
+            .bind(ids.project)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn seed(pool: &sqlx::PgPool, ids: &LeaseIds) {
+        cleanup(pool, ids).await;
+        sqlx::query("INSERT INTO toonflow.projects(id,name,create_time,update_time) VALUES($1,'workflow lease test',0,0)")
+            .bind(ids.project).execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO toonflow.scripts(id,name,content,project_id,create_time) VALUES($1,'wf 剧本','',$2,0)")
+            .bind(ids.script).bind(ids.project).execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO toonflow.workflow_definitions(id,project_id,script_id,version,create_time,update_time) VALUES($1,$2,$3,1,0,0)")
+            .bind(ids.definition).bind(ids.project).bind(ids.script).execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO toonflow.workflow_runs(id,workflow_definition_id,project_id,script_id,definition_version,state,create_time) VALUES($1,$2,$3,$4,1,'running',0)")
+            .bind(ids.run).bind(ids.definition).bind(ids.project).bind(ids.script).execute(pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO toonflow.workflow_node_runs(id,workflow_run_id,node_id,node_type,state,input,create_time)
+             VALUES($1,$2,'storyboard','storyboard.image','running',$3,0)",
+        )
+        .bind(ids.node)
+        .bind(ids.run)
+        .bind(json!({"storyboardIds":[ids.storyboard],"concurrentCount":1,"compulsory":false}))
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO toonflow.storyboards(id,script_id,prompt,project_id,create_time,state) VALUES($1,$2,'',$3,0,'生成中')")
+            .bind(ids.storyboard).bind(ids.script).bind(ids.project).execute(pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "run with script/test-database-migrations.sh"]
+    async fn checkpoints_renew_leases_and_surface_cancellation() {
+        let (pool, _state, ids) = state_with_base(9_600_000).await;
+        seed(&pool, &ids).await;
+
+        // 无取消：检查点续租（lease_until 进入未来）且不报告取消。
+        sqlx::query("UPDATE toonflow.workflow_node_runs SET lease_until=NULL, cancel_requested=false WHERE id=$1")
+            .bind(ids.node).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE toonflow.workflow_runs SET lease_until=NULL, cancel_requested=false WHERE id=$1")
+            .bind(ids.run).execute(&pool).await.unwrap();
+        assert!(!workflow_node_checkpoint(&pool, ids.node).await.unwrap());
+        let renewed: bool = sqlx::query_scalar(
+            "SELECT lease_until > clock_timestamp() FROM toonflow.workflow_node_runs WHERE id=$1",
+        )
+        .bind(ids.node)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(renewed, "checkpoint must renew the node lease");
+
+        // 运行级取消标志：检查点报告取消。
+        sqlx::query("UPDATE toonflow.workflow_runs SET cancel_requested=true WHERE id=$1")
+            .bind(ids.run)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(workflow_node_checkpoint(&pool, ids.node).await.unwrap());
+        sqlx::query("UPDATE toonflow.workflow_runs SET cancel_requested=false WHERE id=$1")
+            .bind(ids.run)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // 运行级租约续期：正常续约返回 false，取消标志返回 true。
+        assert!(!renew_workflow_run_lease(&pool, ids.run).await.unwrap());
+        sqlx::query("UPDATE toonflow.workflow_runs SET cancel_requested=true WHERE id=$1")
+            .bind(ids.run)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(renew_workflow_run_lease(&pool, ids.run).await.unwrap());
+
+        cleanup(&pool, &ids).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "run with script/test-database-migrations.sh"]
+    async fn stale_sweep_fails_expired_nodes_and_rolls_back_side_effects() {
+        let (pool, state, ids) = state_with_base(9_610_000).await;
+        seed(&pool, &ids).await;
+
+        // 过期租约的 running 节点：清扫后节点 failed、分镜回滚为「生成失败」。
+        sqlx::query("UPDATE toonflow.workflow_node_runs SET state='running',lease_until=now()-interval '5 minutes',start_time=0 WHERE id=$1")
+            .bind(ids.node).execute(&pool).await.unwrap();
+        recover_stale_node_runs(&state).await;
+        let (node_state, storyboard_state): (String, String) = sqlx::query_as(
+            "SELECT (SELECT state FROM toonflow.workflow_node_runs WHERE id=$1),
+                    (SELECT coalesce(state,'') FROM toonflow.storyboards WHERE id=$2)",
+        )
+        .bind(ids.node)
+        .bind(ids.storyboard)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(node_state, "failed");
+        assert_eq!(storyboard_state, "生成失败");
+
+        // 无租约旧行的回退判定：start_time 新鲜不判 stale，超过阈值的判 stale。
+        sqlx::query("DELETE FROM toonflow.storyboards WHERE id=$1")
+            .bind(ids.storyboard)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO toonflow.storyboards(id,script_id,prompt,project_id,create_time,state) VALUES($1,$2,'',$3,0,'生成中')")
+            .bind(ids.storyboard).bind(ids.script).bind(ids.project).execute(&pool).await.unwrap();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        sqlx::query("UPDATE toonflow.workflow_node_runs SET state='running',lease_until=NULL,start_time=$2 WHERE id=$1")
+            .bind(ids.node).bind(now_ms).execute(&pool).await.unwrap();
+        recover_stale_node_runs(&state).await;
+        let fresh_state: String =
+            sqlx::query_scalar("SELECT state FROM toonflow.workflow_node_runs WHERE id=$1")
+                .bind(ids.node)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            fresh_state, "running",
+            "无租约但 start_time 新鲜的行不应被判 stale"
+        );
+        sqlx::query("UPDATE toonflow.workflow_node_runs SET start_time=$2 WHERE id=$1")
+            .bind(ids.node)
+            .bind(now_ms - 8000 * 1000)
+            .execute(&pool)
+            .await
+            .unwrap();
+        recover_stale_node_runs(&state).await;
+        let stale_state: String =
+            sqlx::query_scalar("SELECT state FROM toonflow.workflow_node_runs WHERE id=$1")
+                .bind(ids.node)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            stale_state, "failed",
+            "无租约且超过时间阈值的行必须判 stale"
+        );
+
+        cleanup(&pool, &ids).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "run with script/test-database-migrations.sh"]
+    async fn orphaned_runs_are_failed_and_lease_renewal_is_per_run() {
+        let (pool, state, ids) = state_with_base(9_620_000).await;
+        seed(&pool, &ids).await;
+
+        // 其他剧本的 running 运行（租约有效）不受本运行的清扫影响。
+        sqlx::query("INSERT INTO toonflow.workflow_runs(id,workflow_definition_id,project_id,script_id,definition_version,state,create_time,lease_until) VALUES($1,$2,$3,$4,1,'running',0,now()+interval '10 minutes')")
+            .bind(ids.other_run).bind(ids.definition).bind(ids.project).bind(ids.script).execute(&pool).await.unwrap();
+
+        // 本运行：编排器死亡——租约过期且无 running 节点（节点清扫已先行
+        // 将其置 failed）→ 孤儿清扫标记失败。
+        sqlx::query("UPDATE toonflow.workflow_node_runs SET state='failed' WHERE id=$1")
+            .bind(ids.node)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE toonflow.workflow_runs SET lease_until=now()-interval '5 minutes' WHERE id=$1",
+        )
+        .bind(ids.run)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sweep_orphaned_workflow_runs(&state).await;
+        let states: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT id,state FROM toonflow.workflow_runs WHERE id IN ($1,$2) ORDER BY id",
+        )
+        .bind(ids.run)
+        .bind(ids.other_run)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            states,
+            vec![
+                (ids.run, "failed".to_string()),
+                (ids.other_run, "running".to_string())
+            ]
+        );
+
+        cleanup(&pool, &ids).await;
     }
 }

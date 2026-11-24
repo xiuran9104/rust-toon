@@ -1,7 +1,10 @@
 use crate::toonflow_agent_events::record as record_run_event;
 use crate::toonflow_episode_renders::{ensure_project_access, ensure_script_in_project};
 use crate::{
-    ToonState, ai_client, shared::require, toonflow_agent_runtime, toonflow_agent_tools,
+    ToonState, ai_client,
+    shared::require,
+    toonflow_agent_runtime,
+    toonflow_agent_tools::{self, RunLease},
     toonflow_ws::WsEmitter,
 };
 use axum::{Json, extract::State};
@@ -126,6 +129,30 @@ fn terminal_state_for_error(error: &str) -> &'static str {
         "canceled"
     } else {
         "failed"
+    }
+}
+
+/// durable 运行每轮的租约续期 + 跨会话取消感知。HTTP 路径与 WS 路径共用：
+/// `Err(原因)` 表示应当立即中止本轮运行（其他会话已 stop 或运行已结束）。
+pub(crate) async fn renew_lease_and_check_cancel(
+    pool: &sqlx::PgPool,
+    run_id: i64,
+) -> Result<(), String> {
+    let row: Option<(bool,)> = sqlx::query_as(
+        "UPDATE toonflow.agent_runs
+         SET lease_until=now()+interval '90 seconds',heartbeat_at=$2
+         WHERE id=$1 AND state='running'
+         RETURNING cancel_requested",
+    )
+    .bind(run_id)
+    .bind(now_ms())
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    match row {
+        Some((true,)) => Err("用户已中止".into()),
+        Some(_) => Ok(()),
+        None => Err("运行已结束".into()),
     }
 }
 
@@ -832,6 +859,7 @@ pub(crate) async fn run_scoped_production_agent(
         script_id,
         allowed_tools,
         None,
+        None,
     )
     .await
 }
@@ -846,6 +874,7 @@ pub(crate) async fn run_scoped_production_agent_with_emitter(
     script_id: Option<i64>,
     allowed_tools: &[&str],
     emitter: Option<&WsEmitter>,
+    lease: Option<crate::toonflow_agent_tools::RunLease>,
 ) -> Result<String, AppError> {
     let stage_message = emitter.map(|emitter| {
         let name = match agent_key.rsplit(':').next().unwrap_or(agent_key) {
@@ -870,6 +899,7 @@ pub(crate) async fn run_scoped_production_agent_with_emitter(
         project_id,
         script_id,
         allowed_tools,
+        lease,
     )
     .await;
     if let Some((message_id, content_id, emitter)) = stage_message {
@@ -896,6 +926,7 @@ async fn run_scoped_production_agent_inner(
     project_id: i64,
     script_id: Option<i64>,
     allowed_tools: &[&str],
+    lease: Option<crate::toonflow_agent_tools::RunLease>,
 ) -> Result<String, AppError> {
     let allowed_tools = scoped_production_tools(allowed_tools);
     let definitions = allowed_tools
@@ -918,6 +949,14 @@ async fn run_scoped_production_agent_inner(
         json!({"role":"user","content":prompt}),
     ];
     for _ in 0..24 {
+        // 取消检查点：工作流节点任务在此续租并感知取消（这些节点任务
+        // 一次可达数分钟，不能只靠外层轮次边界）。
+        if let Some(lease) = &lease {
+            lease
+                .check(&state.pool)
+                .await
+                .map_err(AppError::bad_request)?;
+        }
         let raw = ai_client::project_text_tools(
             &state.pool,
             agent_key,
@@ -975,6 +1014,7 @@ async fn run_scoped_production_agent_inner(
             };
             let request = toonflow_agent_tools::ToolRequest {
                 emitter: None,
+                lease: lease.clone(),
                 agent_type: "productionAgent".to_string(),
                 agent_key: Some(agent_key.to_string()),
                 isolation_key: String::new(),
@@ -1079,6 +1119,7 @@ async fn run_native_tools(
                 serde_json::from_str(arguments).map_err(|_| "工具参数不是合法 JSON".to_string())?;
             let tool_request = toonflow_agent_tools::ToolRequest {
                 emitter: None,
+                lease: Some(RunLease::AgentRun(run_id)),
                 agent_type: request.agent_type.clone(),
                 agent_key: Some(agent_key.to_string()),
                 isolation_key: request.isolation_key.clone(),
@@ -1160,22 +1201,7 @@ async fn run_with_tools(
     for attempt in 0..4 {
         // durable 第二阶段：每轮续租 90 秒并感知跨副本取消；任一副本
         // stop 都会置 cancel_requested，租约过期由 recover_stale 判中断。
-        let canceled: Option<bool> = sqlx::query_scalar(
-            "UPDATE toonflow.agent_runs
-             SET lease_until=now()+interval '90 seconds',heartbeat_at=$2
-             WHERE id=$1 AND state='running'
-             RETURNING cancel_requested",
-        )
-        .bind(run_id)
-        .bind(now_ms())
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(|error| error.to_string())?;
-        match canceled {
-            Some(true) => return Err("用户已中止".into()),
-            None => return Err("运行已结束".into()),
-            Some(false) => {}
-        }
+        renew_lease_and_check_cancel(&state.pool, run_id).await?;
         if attempt > 0 {
             record_run_event(
                 &state.pool,
@@ -1223,6 +1249,7 @@ async fn run_with_tools(
             record_run_event(&state.pool, run_id, "tool_call", json!({"tool": name})).await;
             let tool_request = toonflow_agent_tools::ToolRequest {
                 emitter: None,
+                lease: Some(RunLease::AgentRun(run_id)),
                 agent_type: request.agent_type.clone(),
                 agent_key: Some(agent_key.to_string()),
                 isolation_key: request.isolation_key.clone(),
@@ -1488,22 +1515,9 @@ async fn run_with_emitter_inner(
         }
         // durable 第三阶段：每轮续租并感知跨会话取消；其他会话 stop
         // 置 cancel_requested 后，本轮结束即中止。
-        let canceled: Option<bool> = sqlx::query_scalar(
-            "UPDATE toonflow.agent_runs
-             SET lease_until=now()+interval '90 seconds',heartbeat_at=$2
-             WHERE id=$1 AND state='running'
-             RETURNING cancel_requested",
-        )
-        .bind(run_id)
-        .bind(now_ms())
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(|error| error.to_string())?;
-        match canceled {
-            Some(true) => return Err("用户已中止".into()),
-            None => return Err("运行已结束".into()),
-            Some(false) => {}
-        }
+        // durable 第三阶段：每轮续租并感知跨会话取消；其他会话 stop
+        // 置 cancel_requested 后，本轮结束即中止。
+        renew_lease_and_check_cancel(&state.pool, run_id).await?;
 
         // WS 增量照常推送；同时按窗口合并落库一份，供重连后的
         // 事件查看与审计回放。
@@ -1623,6 +1637,7 @@ async fn run_with_emitter_inner(
             .await;
 
             let tool_request = toonflow_agent_tools::ToolRequest {
+                lease: Some(RunLease::AgentRun(target.run_id)),
                 agent_type: request.agent_type.clone(),
                 agent_key: Some(agent_key.to_string()),
                 isolation_key: request.isolation_key.clone(),

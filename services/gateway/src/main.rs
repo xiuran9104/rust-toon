@@ -98,6 +98,9 @@ async fn main() -> anyhow::Result<()> {
     // durable 第三阶段：周期回收租约过期的僵尸运行（本地活跃集除外），
     // 进程崩溃遗留的 running 行在一分钟内被标记 interrupted。
     rust_toon_toon_server::spawn_agent_run_recovery(toon_state.clone());
+    // durable 第三批：workflow 运行/节点的周期回收（租约过期判失败，
+    // 副作用回滚沿用节点清扫）。
+    rust_toon_toon_server::spawn_workflow_run_recovery(toon_state.clone());
     let media_state = rust_toon_media_server::MediaState::new(database.clone(), tokens);
     system_state.bootstrap().await?;
     let database_auth = system_state.database_auth_state();

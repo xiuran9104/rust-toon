@@ -38,6 +38,14 @@ pub async fn cancel_run(
     if matches!(run.0.as_str(), "success" | "failed" | "cancelled") {
         return Err(AppError::bad_request("workflow run has already finished"));
     }
+    // 先置取消标志：节点任务在下一个检查点即停止（对其他副本同样生效），
+    // 本进程的 abort 仍然即时。
+    let _ = sqlx::query(
+        "UPDATE toonflow.workflow_runs SET cancel_requested=true WHERE id=$1 AND state='running'",
+    )
+    .bind(request.id)
+    .execute(&state.pool)
+    .await;
     if let Some(handle) = active_workflow_runs()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -174,6 +182,22 @@ pub async fn cancel_node(
     .map_err(|_| AppError::internal("failed to load running workflow node"))?
     .ok_or_else(|| AppError::bad_request("workflow node run has already finished"))?;
     ensure_workflow_run_access(&state.pool, &user, row.0).await?;
+    // 先置取消标志（节点与所属运行）：节点任务在下一个检查点即停止。
+    let _ = sqlx::query(
+        "UPDATE toonflow.workflow_node_runs nr
+         SET cancel_requested=true
+         FROM toonflow.workflow_runs r
+         WHERE nr.id=$1 AND nr.state='running'",
+    )
+    .bind(request.id)
+    .execute(&state.pool)
+    .await;
+    let _ = sqlx::query(
+        "UPDATE toonflow.workflow_runs SET cancel_requested=true WHERE id=$1 AND state='running'",
+    )
+    .bind(row.0)
+    .execute(&state.pool)
+    .await;
     if let Some(handle) = active_node_runs()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
