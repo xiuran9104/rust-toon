@@ -145,12 +145,14 @@ AI 能力域：
 - 项目成果接口为 `GET /toonflow/projects/{project_id}/video-archive`；单集版本接口为 `GET /toonflow/projects/{project_id}/episodes/{script_id}/renders`；`PATCH /toonflow/episode-renders/{render_id}/current` 可恢复历史版本。接口同时检查权限、项目所有权及剧本归属。
 - 项目详情第五阶段“剧集成果”消费上述接口，展示的是合并后的最终成片而非单个生成片段，支持播放、下载、版本切换和回到对应剧集继续制作。
 
+**制作画布增量刷新**（`toonflow_flow_version.rs`）：`getFlowData` 在读取数据之前计算 `flowVersion` 并随响应返回，`/toonflow/production/getFlowVersion` 只返回版本号。版本号是画布三个加载器与 `latest_node_run` 实际读取的 17 张表行集的摘要，按行的 `xmin` 计算：`storyboards`、`videos`、`video_tracks`、`images` 都没有 `update_time`，而任何插入、更新、删除都会改变 `xmin`，误判方向只会是多刷新一次。前端在制作 Agent 运行期间（1.8s）与衍生资产生成轮询（3s）时先比对版本号，未变化不拉全量数据；遇到没有该端点的旧网关则退回每次刷新。探针端点同时执行 `recover_stale_node_runs`（原本由 `latest_node_run` 顺带触发），否则节点运行转为 interrupted 时版本号不会变化。`save_flow_data` 剔除 `flowVersion`，旧前端把整份文档回存时不会写入这个派生值。**新增画布读取路径时必须同步加入 `FLOW_VERSION_SQL`**；`toonflow_flow_version::database_tests` 对每张表做一次代表性变更并断言版本号翻转。
+
 **Agent 运行时**（`toonflow_agents.rs` / `toonflow_agent_runtime.rs` / `toonflow_agent_tools.rs`）：
 
 - HTTP 接口 `/api/agents/*`（chat / start / runState / stop / events / retry / memories / runs / clearMemory / tools/execute）与剧本计划接口 `/api/scriptAgent/*`。
 - WebSocket：`GET /api/socket/{agent}`（别名 `/socket/{agent}`，`toonflow_ws.rs`），query 参数 `token`、`isolationKey`、`projectId`、`scriptId` 鉴权与隔离；客户端消息类型 `chat` / `stop` / `updateThinkConfig` / `updateContext`，协议对齐 Toonflow-app 的 socket 协议。
 - **运行生命周期与断连语义**：WS 会话断开（切页面、刷新）不再中止运行中的任务，任务分离继续执行并把记忆、工具记录与工作区写入持久化，下次进入可恢复；显式 `stop`、发起新会话或「重新开始」仍会中止当前运行。「重新开始」先 stop 再清理，并同步清空持久化剧本工作区（故事骨架/改编策略），剧本库中的成集剧本不受影响。
-- **durable 第三阶段——WS 运行入库与跨会话停止**：WS 发起的运行与 HTTP 运行同级持久化。`chat` 消息创建 `agent_runs` 行并回发 `run:started` 帧；执行期间 `started/tool_call/tool_result/delta(~200ms 合并)/completed/failed` 事件写 `agent_run_events`，每轮循环续租 90 秒并检查 `cancel_requested`；结束时回写终态与 `output`。连接建立时若隔离键存在 running 运行则回发 `run:active` 帧，前端恢复"执行中"指示并轮询 `runState` 到终态后刷新历史与工作区。WS 任务注册进进程活跃集，任何会话可通过 HTTP `stop`（先置 `cancel_requested` 再 abort）停止它；Chat/Stop/UpdateContext 中止任务时同步把运行行标记 canceled。Gateway 启动后每 60 秒执行 `recover_stale`（排除本地活跃集，仅清理租约过期的僵尸行），配合 `agent_runs(state) WHERE state='running'` 部分索引（0030）。
+- **durable 第三阶段——WS 运行入库与跨会话停止**：WS 发起的运行与 HTTP 运行同级持久化。`chat` 消息创建 `agent_runs` 行并回发 `run:started` 帧；执行期间 `started/tool_call/tool_result/delta(~200ms 合并)/completed/failed` 事件写 `agent_run_events`，每轮循环续租 90 秒并检查 `cancel_requested`；结束时回写终态与 `output`。连接建立时若隔离键存在 running 运行则回发 `run:active` 帧，前端恢复"执行中"指示并轮询 `runState` 到终态后刷新历史与工作区；同时从事件表增量回放成一条"重连同步中"消息（`agent-run-replay.ts`）：文本按工具调用分段，工具调用只显示名称与结果状态（事件不保存参数和返回值），文本块保持 streaming 状态不经过 HTML 渲染，运行结束后该消息被权威历史替换。`script/test-gateway-e2e.sh` 覆盖这几帧：WS 聊天产生 `run:started` 与入库的运行/事件，另一会话的 running 运行在新连接上以 `run:active` 下发并可被该会话通过 HTTP `stop` 取消。WS 任务注册进进程活跃集，任何会话可通过 HTTP `stop`（先置 `cancel_requested` 再 abort）停止它；Chat/Stop/UpdateContext 中止任务时同步把运行行标记 canceled。Gateway 启动后每 60 秒执行 `recover_stale`（排除本地活跃集，仅清理租约过期的僵尸行），配合 `agent_runs(state) WHERE state='running'` 部分索引（0030）。
 - **剧本工作区持久化**：故事骨架/改编策略在每个子 Agent 成功后写入 `agent_work_data`；剧本子 Agent 每完成一集立即写入 `scriptEpisodes` 按集断点缓存，`save_scripts` 落库成功后清空。前端三个工作区 tab 进入页面时从 `getPlanData` 恢复，未保存的断点集数以提示样式展示；失败的工具结果不会写入工作区内容，也不会推进流水线阶段。
 - **事件历史与保留**：durable 运行的流式 delta 约 200ms 合并写入一行 `agent_run_events`；Gateway 启动时及每 6 小时按 `AGENT_RUN_EVENTS_RETENTION_DAYS`（默认 30，`<=0` 关闭）清理过期事件（`spawn_agent_event_retention`）。
 - 记忆向量化：取 `ai.model_configs` 中启用的 embedding 模型，经 `AiModelFactory` 生成向量写入 `toonflow.agent_memories`；写入长期记忆前会剥离协议 XML 标签。
@@ -180,6 +182,24 @@ AI 能力域：
 - 构建产物：`apps/web/apps/web-antd/dist`（`VITE_ARCHIVER=true` 时额外生成 `dist.zip`）。
 - 项目详情五个阶段均为异步组件；FormCreate/Designer 仅在 `/infra/build` 安装，TinyMCE 在表单实际使用时加载，避免这些重资源进入业务首页首屏。
 - 前端环境变量（`VITE_*`）详见 [configuration.md](configuration.md)。
+- Agent 对话（`AgentChat.vue`）在重连后从运行事件回放进度，见 5.5 的 durable 第三阶段。消息区采用 stick-to-bottom：贴近底部（≤40px）时跟随新输出，用户向上滚动即停止跟随，底部出现"回到底部/有新消息"入口。
+- 依赖管理：CI 使用 pnpm 11.13.0（`.github/workflows/ci.yml`），它不再读取 `package.json` 里的 `pnpm.overrides`，所有覆盖统一写在 `pnpm-workspace.yaml` 的 `overrides`。改动锁文件后用同版本校验：`npx pnpm@11.13.0 --dir apps/web install --frozen-lockfile --lockfile-only`。`pnpm audit` 需加 `--registry=https://registry.npmjs.org`，npmmirror 没有 audit 端点。
+
+### 6.1 依赖审计
+
+Rust 侧 `cargo audit` 当前为 0 漏洞。`.cargo/audit.toml` 登记了 zip（7.4.0 / 8.6.0）与 libsqlite3-sys 的豁免，每条都写明了核实过的不可达理由和复核命令；新增读取压缩包的代码、启用 zip 的 `legacy-zip` 特性或启用 sqlx 的 sqlite 特性之前，先重新核对这些理由。sqlx 0.9 的升级（可同时解除 libsqlite3-sys 豁免）要求逐处审计并标注约 30 处动态 SQL，尚未进行。另有 chrono 被标记为停止维护（RUSTSEC-2026-0543），无修复版本。
+
+前端用 CI 同版本的 pnpm 执行 `pnpm audit --prod`（2026-11-24）：critical 0、high 4、moderate 3、low 1。声明范围内可修复的都已更新（`27645c7`），剩下的告警在各自声明的版本范围内都没有修复版本，逐条理由如下。上游发布修复或完成升级后，移除对应条目。
+
+| 包 | 严重度 | 引入路径 | 未修复原因 |
+| --- | --- | --- | --- |
+| tinymce 7.9.3 | high | `@tinymce/tinymce-vue`，富文本编辑器 | 修复只在 8.x，需要跨大版本升级。该 XSS 需要 media 插件处理恶意内容，而默认配置（`components/tinymce/tinymce.ts`）启用了 `media`。升级前可从默认 `plugins`/`toolbar` 移除 `media` 关闭这条路径，代价是失去插入音视频的功能，属于产品取舍。 |
+| wangeditor 4.7.15 | high | `@form-create/antd-designer` → `@form-create/component-wangeditor` | 上游已停止维护，无修复版本。应用源码没有使用 wangeditor 字段；只有在表单设计器里拖入该控件并加载恶意内容时才可达。 |
+| zod 3.25.76 | high | `@vben-core/form-ui` → `@vee-validate/zod` | 修复需要 zod 4，`form-ui` 的目录范围是 `^3.25.76`。问题是校验超大集合时的内存耗尽，输入来自本应用的表单。 |
+| glob 10.4.5 | high / moderate | `@form-create/antd-designer` → `js-beautify@1` → `glob` | `js-beautify@1` 精确钉住。两条告警分别是 glob CLI 的 `-c/--cmd` 命令注入和文件系统遍历的取消绕过，都是 Node 专有路径，在浏览器产物中不可达。 |
+| minimatch 9.x / 10.x | moderate | 同上链路的 `editorconfig`，以及 lint 与构建工具链 | 修复需要 11.x。问题是 glob 模式解析的 CPU 耗尽，处理的不是外部输入。 |
+| postcss-selector-parser 6.0.10 | moderate | `internal/tailwind-config` → `@tailwindcss/typography` | 该插件精确钉住 6.0.10，只在构建期解析项目自身的选择器。 |
+| katex 0.16.47 | low | `@vben-plugins` → `markmap-lib` → `@vscode/markdown-it-katex` | 修复需要 0.18。利用前提是已经存在别的原型污染。 |
 
 ## 7. 关键外部依赖端口
 
