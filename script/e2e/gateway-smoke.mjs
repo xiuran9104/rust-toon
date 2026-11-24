@@ -257,6 +257,8 @@ async function reattachPass() {
   const token = await login();
   const authenticated = { authorization: `Bearer ${token}` };
   const projectId = reattachProjectId;
+  // A third pass (workflow cancel) reuses this token: a third login would
+  // trip the deliberately tiny rate limit on /system/auth/login.
 
   // The run was started by a session that has since disconnected. A new
   // session is told about it and can stop it.
@@ -285,6 +287,38 @@ async function reattachPass() {
     'a stopped run must not attach to a new session',
   );
   await closeAgentSocket(fresh);
+  return { authenticated, projectId, token };
+}
+
+/// The caller injects a running workflow run + node for this project; this
+/// pass must see it running, stop it through cancelRun, and never see it
+/// running again.
+async function workflowPass(session) {
+  const authenticated = session.authenticated;
+  const projectId = session.projectId;
+  const runId = Number(process.env.E2E_WORKFLOW_RUN_ID);
+  assert.ok(Number.isSafeInteger(runId));
+
+  const running = await request('/toonflow/production/workflowRuns/state', {
+    method: 'POST',
+    headers: authenticated,
+    body: JSON.stringify({ id: runId }),
+  });
+  assert.equal(running.data.state, 'running');
+
+  const cancelled = await request('/toonflow/production/workflowRuns/cancel', {
+    method: 'POST',
+    headers: authenticated,
+    body: JSON.stringify({ id: runId }),
+  });
+  assert.equal(cancelled.data.state, 'cancelled');
+
+  const after = await request('/toonflow/production/workflowRuns/state', {
+    method: 'POST',
+    headers: authenticated,
+    body: JSON.stringify({ id: runId }),
+  });
+  assert.equal(after.data.state, 'cancelled');
 
   await request('/toonflow/project/delProject', {
     method: 'POST',
@@ -295,7 +329,11 @@ async function reattachPass() {
 
 let keptProjectId;
 if (reattachProjectId && reattachRunId) {
-  await reattachPass();
+  // Second and third passes: the caller injected a running agent run (from a
+  // disconnected session) and a running workflow run for this project; each
+  // pass deletes the project when it is done with it.
+  const session = await reattachPass();
+  if (process.env.E2E_WORKFLOW_RUN_ID) await workflowPass(session);
 } else {
   keptProjectId = await firstPass();
 }

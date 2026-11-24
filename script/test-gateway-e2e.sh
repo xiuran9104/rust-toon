@@ -174,8 +174,28 @@ reattach_run_id="$(
      VALUES('scriptAgent','scriptAgent:${smoke_project_id}:project',${smoke_project_id},'started by a session that disconnected','running',false,0,0,0,now()+interval '10 minutes')
      RETURNING id"
 )"
-E2E_BASE_URL="http://127.0.0.1:${gateway_port}" \
+# Inject a running workflow run + node as if an orchestrator on another
+# session owned them; the workflow pass must see it running and stop it.
+workflow_run_id="$(
+  docker exec "$postgres_container" psql -U rust_toon -d rust_toon_test -Atqc \
+    "WITH s AS (
+       INSERT INTO toonflow.scripts(id,name,content,project_id,create_time)
+       VALUES(97000000000001,'gateway-e2e wf script','',${smoke_project_id},0) RETURNING id
+     ), d AS (
+       INSERT INTO toonflow.workflow_definitions(id,project_id,script_id,version,create_time,update_time)
+       VALUES(97000000000002,${smoke_project_id},(SELECT id FROM s),1,0,0) RETURNING id
+     ), r AS (
+       INSERT INTO toonflow.workflow_runs(id,workflow_definition_id,project_id,script_id,definition_version,state,create_time,lease_until,heartbeat_at)
+       VALUES(97000000000003,(SELECT id FROM d),${smoke_project_id},(SELECT id FROM s),1,'running',0,now()+interval '30 minutes',0) RETURNING id
+     ), n AS (
+       INSERT INTO toonflow.workflow_node_runs(id,workflow_run_id,node_id,node_type,state,input,create_time,lease_until,heartbeat_at)
+       VALUES(97000000000004,(SELECT id FROM r),'director','director.plan','running','{}'::jsonb,0,now()+interval '30 minutes',0) RETURNING id
+     )
+     SELECT r.id FROM r"
+)"
+E2E_TASK_ID="1789003357277804801" E2E_BASE_URL="http://127.0.0.1:${gateway_port}" \
   E2E_REATTACH_PROJECT_ID="$smoke_project_id" E2E_REATTACH_RUN_ID="$reattach_run_id" \
+  E2E_WORKFLOW_PROJECT_ID="$smoke_project_id" E2E_WORKFLOW_RUN_ID="$workflow_run_id" \
   node script/e2e/gateway-smoke.mjs
 
 sleep 1
