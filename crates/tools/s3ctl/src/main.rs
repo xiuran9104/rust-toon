@@ -120,12 +120,30 @@ fn collect_files(root: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// 对象键来自对象存储，内容不受本工具控制。只有每个路径分量都是普通文件名、
+/// 且不含反斜杠的键才会落在目标目录内；形如 `../../etc/x`、`/etc/x`、
+/// `C:\x` 的键必须拒绝，否则镜像会把文件写到目标目录之外。
+fn mirror_destination(target_dir: &Path, key: &str) -> Result<PathBuf, String> {
+    let components: Vec<_> = Path::new(key).components().collect();
+    let escapes = key.contains('\\')
+        || components.is_empty()
+        || components
+            .iter()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)));
+    if escapes {
+        return Err(format!(
+            "refusing to mirror object key that escapes the target directory: {key:?}"
+        ));
+    }
+    Ok(target_dir.join(key))
+}
+
 async fn mirror_to(bucket: &Bucket, target_dir: &Path) -> Result<(), String> {
     for key in list_all_keys(bucket, "").await? {
         if key.is_empty() {
             continue;
         }
-        let destination = target_dir.join(&key);
+        let destination = mirror_destination(target_dir, &key)?;
         if let Some(parent) = destination.parent() {
             std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
@@ -332,5 +350,48 @@ async fn run(config: &Config, command: &str, args: Vec<String>) -> Result<(), St
             mirror_from(&bucket, &dir, remove_missing).await
         }
         _ => usage(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mirror_destination;
+    use std::path::Path;
+
+    #[test]
+    fn mirror_destination_keeps_ordinary_keys_inside_the_target_directory() {
+        let target = Path::new("/tmp/mirror");
+        for key in [
+            "rust-toon/uploads/2026/image.png",
+            "with space/中文 文件名.txt",
+            "folder-marker/",
+        ] {
+            assert_eq!(
+                mirror_destination(target, key).unwrap(),
+                target.join(key),
+                "wrong destination for {key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mirror_destination_rejects_keys_that_escape_the_target_directory() {
+        let target = Path::new("/tmp/mirror");
+        for key in [
+            "../outside.txt",
+            "a/../../outside.txt",
+            "/etc/passwd",
+            "..",
+            ".",
+            "C:\\Windows\\system32\\evil.dll",
+            "a\\..\\b.txt",
+        ] {
+            let destination = mirror_destination(target, key);
+            assert!(
+                destination.is_err(),
+                "accepted {key:?} as {:?}",
+                destination.unwrap()
+            );
+        }
     }
 }
