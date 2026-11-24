@@ -114,7 +114,12 @@ describe('dateUtils', () => {
     it('should return a valid IANA timezone string', () => {
       const tz = getSystemTimezone();
       expect(typeof tz).toBe('string');
-      expect(tz).toMatch(/^[A-Z]+\/[A-Z_]+/i);
+      expect(tz.length).toBeGreaterThan(0);
+      // `dayjs.tz.guess()` 在 UTC 环境返回不带斜杠的 "UTC"，这也是合法的
+      // IANA 名称；有效性以 Intl 是否接受为准，而不是名称的形状。
+      expect(() =>
+        new Intl.DateTimeFormat(undefined, { timeZone: tz }),
+      ).not.toThrow();
     });
   });
 
