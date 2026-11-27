@@ -111,6 +111,11 @@ gateway 全局挂 `authenticate_from_database`（`system-server/src/database_aut
 
 管理域：认证（login / refresh-token / logout / me / get-permission-info）、用户、角色、菜单、部门、岗位、字典、通知公告、租户、地区（内置 `area.csv`）、社交用户、登录/操作日志等，路由前缀 `/system/*`。公开路由仅有 `/system/capabilities`、`/system/auth/login`、租户简单列表等少数几个（`transport.rs`）。
 
+**角色挂载部门树与租户管理员体系**（自 rustset 同步，0032）：
+
+- `system_role.dept_id`：0 = 公司级角色（虚拟租户根，可分配给租户内任何用户，仅公司级管理员可发放），非 0 = 挂载到部门树节点。分配前双侧校验（`management/role_binding.rs`）：规则一——角色只能分配给「挂载节点子树内」的用户；规则二——非公司级管理员（super_admin / 任一角色 data_scope=1 之外）只能发放「挂载节点落在自己部门子树内」的角色，发放权不逆向流。校验点覆盖用户创建/更新（`replace_roles`）、调动部门（`ensure_roles_cover_dept`）、角色改挂载点（`ensure_holders_within_mount`）、角色下拉过滤（`assignable_role_ids` + `assignableDeptId`/`includeUserHeld` 参数）。数据权限（data_scope 1-5）语义不变。
+- 租户创建为专用事务链路（`tenant_create`）：租户行 + 根部门（以租户名命名）+ tenant_admin 角色（data_scope=1）+ 套餐菜单发放（package_id=0 跳过）+ 管理员账号（payload 可选 `username`/`password`，默认 `Admin#123456`）。tenant_admin 的菜单在 `authorized_menus` 中直接由 `package.menu_ids` 推导（单一数据源，套餐调整即时生效）；0032 对存量租户补根部门/管理员部门绑定/role_menu 增量。救援通道：`system:tenant:update-password`（菜单 1273）+ `/system/tenant/reset-admin-password`；引导管理员（tenant_admin 最早持有人）禁止删除。
+
 ### 5.2 infra（`crates/modules/infra-server`）
 
 基础设施域：参数配置、数据源配置、文件与文件配置、分布式定时任务（job / job-log）、代码生成（codegen）、API 访问日志、监控（`monitor.rs`，上报 `RUST_ENV`）等，路由前缀 `/infra/*`。除能力探针和文件读取外，管理路由全部要求登录，并按现有 `infra:*` 权限码在后端授权。上传有服务端体积上限并使用不可猜对象名；公开 `GET /upload/{*path}` 只允许栅格图片 inline，其余类型强制 attachment，同时返回 CSP 与 `nosniff`。`infra_job` 由所有 Worker 通过 PostgreSQL 行锁协调到期触发，再复用 outbox/JetStream/lease/fencing 执行；仓库内置安全诊断 Handler，新增业务 job kind 必须显式注册 Rust Handler。

@@ -218,6 +218,26 @@ async fn authorized_menus(
          JOIN system_menu m ON m.deleted = 0 AND m.status = 0 AND m.type <> 3
              AND (
                  r.code = 'super_admin'
+                 OR (
+                     -- 租户管理员：菜单直接由套餐推导（单一数据源，不依赖
+                     -- role_menu 快照；套餐调整即时生效）。
+                     r.code = 'tenant_admin'
+                     AND EXISTS (
+                         SELECT 1
+                         FROM jsonb_array_elements_text(package.menu_ids::jsonb) ta(menu_id)
+                         WHERE ta.menu_id::bigint = m.id
+                     )
+                 )
+                 OR (
+                     r.code = 'tenant_admin'
+                     AND m.visible = false
+                     AND m.active_menu_id IS NOT NULL
+                     AND EXISTS (
+                         SELECT 1
+                         FROM jsonb_array_elements_text(package.menu_ids::jsonb) ta(menu_id)
+                         WHERE ta.menu_id::bigint = m.active_menu_id
+                     )
+                 )
                  OR m.id = rm.menu_id
                  OR (
                      m.visible = false
