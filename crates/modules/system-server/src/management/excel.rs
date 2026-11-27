@@ -462,15 +462,9 @@ async fn import_one_user(
         )
         .await
         .map_err(|_| "岗位不存在".to_owned())?;
-        super::user_relations::replace_roles(
-            &mut tx,
-            id,
-            &record.role_ids,
-            &user.username,
-            tenant_id,
-        )
-        .await
-        .map_err(|_| "角色不存在".to_owned())?;
+        super::user_relations::replace_roles(&mut tx, Some(user), id, &record.role_ids, tenant_id)
+            .await
+            .map_err(|_| "角色不存在".to_owned())?;
         tx.commit().await.map_err(|_| "提交事务失败".to_owned())?;
         return Ok(ImportAction::Updated);
     }
@@ -509,7 +503,7 @@ async fn import_one_user(
     super::user_relations::replace_posts(&mut tx, id, &record.post_ids, &user.username, tenant_id)
         .await
         .map_err(|_| "岗位不存在".to_owned())?;
-    super::user_relations::replace_roles(&mut tx, id, &record.role_ids, &user.username, tenant_id)
+    super::user_relations::replace_roles(&mut tx, Some(user), id, &record.role_ids, tenant_id)
         .await
         .map_err(|_| "角色不存在".to_owned())?;
     tx.commit().await.map_err(|_| "提交事务失败".to_owned())?;

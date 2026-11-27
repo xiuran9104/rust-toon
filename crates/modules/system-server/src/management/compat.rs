@@ -261,9 +261,18 @@ pub fn routes() -> axum::Router<SystemState> {
             axum::routing::get(generic_page_tenant),
         )
         .route("/system/tenant/get", axum::routing::get(generic_get_tenant))
+        .route("/system/tenant/create", axum::routing::post(tenant_create))
         .route(
-            "/system/tenant/create",
-            axum::routing::post(generic_create_tenant),
+            "/system/tenant/admin-user",
+            axum::routing::get(tenant_admin_user),
+        )
+        .route(
+            "/system/tenant/update-admin-user",
+            axum::routing::put(tenant_admin_update),
+        )
+        .route(
+            "/system/tenant/reset-admin-password",
+            axum::routing::put(tenant_admin_reset_password),
         )
         .route(
             "/system/tenant/update",
@@ -870,7 +879,6 @@ generic_resource_handlers!(
 
 generic_page_handler!("tenant", generic_page_tenant);
 generic_get_handler!("tenant", generic_get_tenant);
-generic_create_handler!("tenant", generic_create_tenant);
 generic_update_handler!("tenant", generic_update_tenant);
 generic_delete_handler!("tenant", generic_delete_tenant);
 generic_delete_list_handler!("tenant", generic_delete_list_tenant);
@@ -1605,24 +1613,267 @@ async fn core_create(
         .bind(payload.get("menuIds").cloned().unwrap_or_else(|| json!([])).to_string())
         .fetch_one(pool)
         .await,
-        "tenant" => sqlx::query_scalar::<_, i64>(
-            "INSERT INTO system_tenant (id, name, contact_name, contact_mobile, status, websites, package_id, expire_time, account_count)
-             VALUES (nextval('system_tenant_seq'),$1,$2,$3,$4,$5,$6,$7::timestamp,$8) RETURNING id",
-        )
-        .bind(str_field(&payload, "name"))
-        .bind(str_field(&payload, "contactName"))
-        .bind(opt_str_field(&payload, "contactMobile"))
-        .bind(i16_field(&payload, "status", 0))
-        .bind(csv_list_field(&payload, "websites"))
-        .bind(i64_field(&payload, "packageId", 0))
-        .bind(str_field_default(&payload, "expireTime", "2099-12-31 23:59:59"))
-        .bind(i32_field(&payload, "accountCount", 100))
-        .fetch_one(pool)
-        .await,
         _ => return Err(AppError::bad_request("unsupported record kind")),
     }
     .map_err(|_| AppError::internal("failed to create record"))?;
     Ok(Json(ApiResponse::new(id.to_string())))
+}
+
+/// 租户创建（专用事务链路，自 rustset 同步）：除建租户行外，还按表单的
+/// 「账号/密码」开通租户管理员——根部门（以租户名命名）+ tenant_admin
+/// 角色（租户内全部数据权限）+ 套餐菜单发放（package_id=0 视为不授菜单，
+/// 后续由超管补授）+ 管理员账号（默认密码 Admin#123456）。
+async fn tenant_create(
+    user: CurrentUser,
+    State(state): State<SystemState>,
+    Json(payload): Json<Value>,
+) -> Result<Json<ApiResponse<String>>, AppError> {
+    require_resource(&user, "tenant", "create")?;
+    let mut transaction = state
+        .pool
+        .begin()
+        .await
+        .map_err(|_| AppError::internal("failed to begin tenant creation"))?;
+    let tenant_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO system_tenant (id, name, contact_name, contact_mobile, status, websites, package_id, expire_time, account_count)
+         VALUES (nextval('system_tenant_seq'),$1,$2,$3,$4,$5,$6,$7::timestamp,$8) RETURNING id",
+    )
+    .bind(str_field(&payload, "name"))
+    .bind(str_field(&payload, "contactName"))
+    .bind(opt_str_field(&payload, "contactMobile"))
+    .bind(i16_field(&payload, "status", 0))
+    .bind(csv_list_field(&payload, "websites"))
+    .bind(i64_field(&payload, "packageId", 0))
+    .bind(str_field_default(&payload, "expireTime", "2099-12-31 23:59:59"))
+    .bind(i32_field(&payload, "accountCount", 100))
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| AppError::bad_request("failed to create tenant"))?;
+
+    // 顶级部门：以租户名命名（随租户归属），管理员直接绑上去——
+    // 租户管理员是普通用户，出现在本租户用户管理的部门树中。
+    let root_dept_id: i64 = sqlx::query_scalar(
+        "INSERT INTO system_dept
+             (id, name, parent_id, sort, phone, email, status, creator, updater, tenant_id)
+         VALUES (nextval('system_dept_seq'), $1, 0, 0, '', '', 0, $2, $2, $3)
+         RETURNING id",
+    )
+    .bind(str_field(&payload, "name"))
+    .bind(&user.username)
+    .bind(tenant_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| AppError::internal("failed to create tenant root dept"))?;
+
+    let admin_username = payload["username"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if !admin_username.is_empty() {
+        // 租户管理员角色（内置，租户内全部数据权限）
+        let role_id: i64 = sqlx::query_scalar(
+            "INSERT INTO system_role
+             (id, name, code, sort, data_scope, data_scope_dept_ids, status, type, remark, creator, updater, tenant_id)
+             VALUES (nextval('system_role_seq'), '租户管理员', 'tenant_admin', 0, 1, '', 0, 1,
+                     '租户开通自动生成', $1, $1, $2)
+             RETURNING id",
+        )
+        .bind(&user.username)
+        .bind(tenant_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|_| AppError::internal("failed to create tenant admin role"))?;
+        // 套餐菜单授予（package_id=0 视为不授菜单，后续由超管补授）
+        let package_id = i64_field(&payload, "packageId", 0);
+        if package_id != 0 {
+            let package_menus: Option<String> = sqlx::query_scalar(
+                "SELECT menu_ids FROM system_tenant_package
+                 WHERE id = $1 AND deleted = 0 AND status = 0",
+            )
+            .bind(package_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|_| AppError::internal("failed to read tenant package"))?;
+            let menu_ids: Vec<i64> = package_menus
+                .and_then(|raw| serde_json::from_str::<Vec<Value>>(&raw).ok())
+                .map(|items| items.iter().filter_map(Value::as_i64).collect::<Vec<_>>())
+                .unwrap_or_default();
+            for menu_id in menu_ids {
+                sqlx::query(
+                    "INSERT INTO system_role_menu (id, role_id, menu_id, deleted)
+                     VALUES (nextval('system_role_menu_seq'), $1, $2, 0)",
+                )
+                .bind(role_id)
+                .bind(menu_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|_| AppError::bad_request("failed to grant package menus"))?;
+            }
+        }
+        // 管理员账号
+        let password = if payload["password"].as_str().unwrap_or("").is_empty() {
+            "Admin#123456"
+        } else {
+            payload["password"].as_str().unwrap_or("")
+        };
+        let password_hash = state
+            .passwords
+            .hash_yudao(password)
+            .map_err(|error| AppError::bad_request(format!("管理员密码：{error}")))?;
+        let admin_user_id: i64 = sqlx::query_scalar(
+            "INSERT INTO system_users
+             (id, username, password, nickname, remark, dept_id, email, mobile, sex, avatar,
+              status, creator, create_time, updater, update_time, deleted, tenant_id)
+             VALUES (nextval('system_users_seq'), $1, $2, $1, '', $5, '', '', 1, '',
+                     0, $3, now(), $3, now(), 0, $4)
+             RETURNING id",
+        )
+        .bind(&admin_username)
+        .bind(password_hash)
+        .bind(&user.username)
+        .bind(tenant_id)
+        .bind(root_dept_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|_| AppError::bad_request("管理员账号已存在"))?;
+        sqlx::query(
+            "INSERT INTO system_user_role
+             (id, user_id, role_id, creator, create_time, updater, update_time, deleted, tenant_id)
+             VALUES (nextval('system_user_role_seq'), $1, $2, $3, now(), $3, now(), 0, $4)",
+        )
+        .bind(admin_user_id)
+        .bind(role_id)
+        .bind(&user.username)
+        .bind(tenant_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| AppError::internal("failed to grant tenant admin role"))?;
+    }
+    transaction
+        .commit()
+        .await
+        .map_err(|_| AppError::internal("failed to commit tenant creation"))?;
+    crate::cache::invalidate_all_current_users(&state).await;
+    Ok(Json(ApiResponse::new(tenant_id.to_string())))
+}
+
+async fn tenant_admin_id(pool: &PgPool, tenant_id: i64) -> Result<i64, AppError> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT MIN(u.id) FROM system_users u
+         JOIN system_user_role ur ON ur.user_id = u.id AND ur.deleted = 0
+         JOIN system_role r ON r.id = ur.role_id AND r.deleted = 0
+              AND r.code = 'tenant_admin' AND r.tenant_id = u.tenant_id
+         WHERE u.deleted = 0 AND u.tenant_id = $1",
+    )
+    .bind(tenant_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| AppError::internal("failed to read tenant admin"))?
+    .ok_or_else(|| AppError::not_found("tenant admin not found"))
+}
+
+/// 判断被删用户是否是租户开通时的引导管理员（tenant_admin 最早持有人）：
+/// 该账号是租户的救援通道，禁止删除。
+async fn is_bootstrap_tenant_admin(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user_id: i64,
+) -> Result<bool, AppError> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(
+             SELECT 1 FROM system_users u
+             WHERE u.id = $1 AND u.deleted = 0
+               AND u.id = (
+                   SELECT MIN(u2.id) FROM system_users u2
+                   JOIN system_user_role ur ON ur.user_id = u2.id AND ur.deleted = 0
+                   JOIN system_role r ON r.id = ur.role_id AND r.deleted = 0
+                        AND r.code = 'tenant_admin' AND r.tenant_id = u2.tenant_id
+                   WHERE u2.tenant_id = u.tenant_id AND u2.deleted = 0
+               )
+         )",
+    )
+    .bind(user_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(|_| AppError::internal("failed to check bootstrap tenant admin"))
+}
+
+/// 查询租户管理员账号信息。
+async fn tenant_admin_user(
+    user: CurrentUser,
+    State(state): State<SystemState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
+    require(&user, "system:tenant:query")?;
+    let tenant_id = parse_i64_param(&params, "tenantId")?;
+    let admin_id = tenant_admin_id(&state.pool, tenant_id).await?;
+    let row = sqlx::query_scalar::<_, Value>(
+        "SELECT jsonb_build_object(
+             'id', id, 'username', username, 'nickname', nickname,
+             'mobile', COALESCE(mobile, ''), 'email', COALESCE(email, ''), 'status', status
+         )
+         FROM system_users WHERE id = $1 AND deleted = 0",
+    )
+    .bind(admin_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|_| AppError::internal("failed to read tenant admin"))?;
+    Ok(Json(ApiResponse::new(row)))
+}
+
+/// 更新租户管理员的昵称/联系方式/状态。
+async fn tenant_admin_update(
+    user: CurrentUser,
+    State(state): State<SystemState>,
+    Json(payload): Json<Value>,
+) -> Result<Json<ApiResponse<()>>, AppError> {
+    require(&user, "system:tenant:update")?;
+    let tenant_id = parse_i64_value(&payload["tenantId"])?;
+    let admin_id = tenant_admin_id(&state.pool, tenant_id).await?;
+    sqlx::query(
+        "UPDATE system_users SET nickname=$2, mobile=$3, email=$4, status=$5, updater=$6, update_time=now()
+         WHERE id=$1 AND deleted=0",
+    )
+    .bind(admin_id)
+    .bind(str_field(&payload, "nickname"))
+    .bind(str_field(&payload, "mobile"))
+    .bind(str_field(&payload, "email"))
+    .bind(i16_field(&payload, "status", 0))
+    .bind(&user.username)
+    .execute(&state.pool)
+    .await
+    .map_err(|_| AppError::internal("failed to update tenant admin"))?;
+    Ok(Json(ApiResponse::new(())))
+}
+
+/// 重置租户管理员密码（平台救援通道）。
+async fn tenant_admin_reset_password(
+    user: CurrentUser,
+    State(state): State<SystemState>,
+    Json(payload): Json<Value>,
+) -> Result<Json<ApiResponse<()>>, AppError> {
+    require(&user, "system:tenant:update-password")?;
+    let tenant_id = parse_i64_value(&payload["tenantId"])?;
+    let admin_id = tenant_admin_id(&state.pool, tenant_id).await?;
+    let password = payload["password"].as_str().unwrap_or("");
+    if password.is_empty() {
+        return Err(AppError::bad_request("password is required"));
+    }
+    let password_hash = state
+        .passwords
+        .hash_yudao(password)
+        .map_err(|error| AppError::bad_request(error.to_string()))?;
+    sqlx::query(
+        "UPDATE system_users SET password=$2, updater=$3, update_time=now()
+         WHERE id=$1 AND deleted=0",
+    )
+    .bind(admin_id)
+    .bind(password_hash)
+    .bind(&user.username)
+    .execute(&state.pool)
+    .await
+    .map_err(|_| AppError::internal("failed to reset tenant admin password"))?;
+    Ok(Json(ApiResponse::new(())))
 }
 
 async fn core_update(
@@ -2074,15 +2325,9 @@ async fn user_create(
     )
     .await
     .map_err(|_| AppError::bad_request("post does not exist"))?;
-    super::user_relations::replace_roles(
-        &mut transaction,
-        id,
-        &role_ids,
-        &user.username,
-        tenant_id,
-    )
-    .await
-    .map_err(|_| AppError::bad_request("role does not exist"))?;
+    super::user_relations::replace_roles(&mut transaction, Some(&user), id, &role_ids, tenant_id)
+        .await
+        .map_err(|_| AppError::bad_request("role does not exist"))?;
     transaction
         .commit()
         .await
@@ -2102,6 +2347,15 @@ async fn user_update(
         .or_else(|| payload["displayName"].as_str())
         .unwrap_or("");
     let tenant_id = current_tenant_id(&user)?;
+    let previous_dept: Option<i64> = sqlx::query_scalar(
+        "SELECT dept_id FROM system_users WHERE id=$1 AND deleted=0 AND tenant_id=$2",
+    )
+    .bind(id)
+    .bind(tenant_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| AppError::internal("failed to read user department"))?
+    .flatten();
     let mut transaction = state
         .pool
         .begin()
@@ -2148,13 +2402,34 @@ async fn user_update(
     if payload.get("roleIds").is_some() {
         super::user_relations::replace_roles(
             &mut transaction,
+            Some(&user),
             id,
             &i64_vec_field(&payload, "roleIds"),
-            &user.username,
             tenant_id,
         )
         .await
         .map_err(|_| AppError::bad_request("role does not exist"))?;
+    } else {
+        // 调动部门但未同时重配角色：现有挂载角色必须仍覆盖新部门。
+        let next_dept: Option<i64> = sqlx::query_scalar(
+            "SELECT dept_id FROM system_users WHERE id=$1 AND deleted=0 AND tenant_id=$2",
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| AppError::internal("failed to read user department"))?
+        .flatten();
+        if next_dept != previous_dept {
+            super::role_binding::ensure_roles_cover_dept(
+                &mut transaction,
+                id,
+                next_dept,
+                tenant_id,
+            )
+            .await
+            .map_err(|error| AppError::bad_request(error.message()))?;
+        }
     }
     transaction
         .commit()
@@ -2259,6 +2534,9 @@ async fn user_delete(
         .begin()
         .await
         .map_err(|_| AppError::internal("failed to begin user deletion"))?;
+    if is_bootstrap_tenant_admin(&mut transaction, id).await? {
+        return Err(AppError::bad_request("不能删除租户引导管理员账号"));
+    }
     let deleted = sqlx::query(
         "UPDATE system_users SET deleted=1, update_time=now()
          WHERE id = $1 AND tenant_id = $2 AND deleted = 0",
@@ -2339,11 +2617,35 @@ async fn role_page(
 async fn role_list(
     user: CurrentUser,
     State(state): State<SystemState>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<ApiResponse<Vec<Value>>>, AppError> {
     require(&user, "system:role:query")?;
-    Ok(Json(ApiResponse::new(
-        role_values(&state.pool, current_tenant_id(&user)?).await?,
-    )))
+    let tenant_id = current_tenant_id(&user)?;
+    let mut values = role_values(&state.pool, tenant_id).await?;
+    // assignableDeptId：只返回可分配给该部门的角色（挂载规则双侧过滤），
+    // includeUserHeld：并集该用户已持有的角色（编辑视图不出现幽灵 id）。
+    if let Some(dept_raw) = params.get("assignableDeptId")
+        && let Ok(dept_id) = dept_raw.trim().parse::<i64>()
+    {
+        let held_user_id = params
+            .get("includeUserHeld")
+            .and_then(|raw| raw.trim().parse::<i64>().ok());
+        let mut conn = state
+            .pool
+            .acquire()
+            .await
+            .map_err(|_| AppError::internal("failed to read roles"))?;
+        let allowed = super::role_binding::assignable_role_ids(
+            &mut conn,
+            &user,
+            (dept_id != 0).then_some(dept_id),
+            held_user_id,
+            tenant_id,
+        )
+        .await?;
+        values.retain(|value| value["id"].as_i64().is_some_and(|id| allowed.contains(&id)));
+    }
+    Ok(Json(ApiResponse::new(values)))
 }
 
 async fn role_get(
@@ -2369,10 +2671,18 @@ async fn role_create(
     require(&user, "system:role:create")?;
     let tenant_id = current_tenant_id(&user)?;
     let data_scope_dept_ids = string_list_field(&payload, "dataScopeDeptIds");
+    let dept_id = opt_i64_field(&payload, "deptId").unwrap_or(0);
+    let mut conn = state
+        .pool
+        .acquire()
+        .await
+        .map_err(|_| AppError::internal("failed to read dept"))?;
+    super::role_binding::validate_role_mount(&mut conn, Some(&user), dept_id, tenant_id).await?;
+    drop(conn);
     let id = sqlx::query_scalar::<_, i64>(
         "INSERT INTO system_role
-         (id, code, name, sort, data_scope, data_scope_dept_ids, status, type, remark, creator, updater, tenant_id)
-         VALUES (nextval('system_role_seq'), $1, $2, $3, $4, $5, $6, 2, $7, $8, $8, $9)
+         (id, code, name, sort, data_scope, data_scope_dept_ids, status, type, remark, creator, updater, tenant_id, dept_id)
+         VALUES (nextval('system_role_seq'), $1, $2, $3, $4, $5, $6, 2, $7, $8, $8, $9, $10)
          RETURNING id",
     )
     .bind(payload["code"].as_str().unwrap_or(""))
@@ -2384,6 +2694,7 @@ async fn role_create(
     .bind(opt_str_field(&payload, "remark"))
     .bind(&user.username)
     .bind(tenant_id)
+    .bind(dept_id)
     .fetch_one(&state.pool)
     .await
     .map_err(|_| AppError::bad_request("role code already exists"))?;
@@ -2396,17 +2707,42 @@ async fn role_update(
     Json(payload): Json<Value>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
     require(&user, "system:role:update")?;
-    role_update_unchecked(&state, payload, current_tenant_id(&user)?).await
+    role_update_unchecked(&state, Some(&user), payload, current_tenant_id(&user)?).await
 }
 
 async fn role_update_unchecked(
     state: &SystemState,
+    operator: Option<&CurrentUser>,
     payload: Value,
     tenant_id: i64,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
     let id = parse_i64_value(&payload["id"])?;
     let data_scope_dept_ids = string_list_field(&payload, "dataScopeDeptIds");
-    let updated = sqlx::query("UPDATE system_role SET name=$2, code=$3, sort=$4, data_scope=$5, status=$6, remark=$7, data_scope_dept_ids=$8, update_time=now() WHERE id=$1 AND deleted=0 AND tenant_id=$9")
+    let dept_id = opt_i64_field(&payload, "deptId").unwrap_or(0);
+    let mut conn = state
+        .pool
+        .acquire()
+        .await
+        .map_err(|_| AppError::internal("failed to read dept"))?;
+    super::role_binding::validate_role_mount(&mut conn, operator, dept_id, tenant_id).await?;
+    if dept_id != 0 {
+        let previous_dept: i64 = sqlx::query_scalar(
+            "SELECT dept_id FROM system_role WHERE id=$1 AND deleted=0 AND tenant_id=$2",
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|_| AppError::internal("failed to read role"))?
+        .unwrap_or(0);
+        if dept_id != previous_dept {
+            // 改挂载点：现有分配者的部门必须都落在新子树内，不产生孤儿分配。
+            super::role_binding::ensure_holders_within_mount(&mut conn, id, dept_id, tenant_id)
+                .await?;
+        }
+    }
+    drop(conn);
+    let updated = sqlx::query("UPDATE system_role SET name=$2, code=$3, sort=$4, data_scope=$5, status=$6, remark=$7, data_scope_dept_ids=$8, dept_id=$9, update_time=now() WHERE id=$1 AND deleted=0 AND tenant_id=$10")
         .bind(id)
         .bind(payload["name"].as_str().unwrap_or(""))
         .bind(payload["code"].as_str().unwrap_or(""))
@@ -2415,6 +2751,7 @@ async fn role_update_unchecked(
         .bind(i16_field(&payload, "status", 0))
         .bind(opt_str_field(&payload, "remark"))
         .bind(data_scope_dept_ids)
+        .bind(dept_id)
         .bind(tenant_id)
         .execute(&state.pool)
         .await
@@ -2529,7 +2866,7 @@ async fn permission_assign_user_roles(
     .fetch_one(&mut *tx)
     .await
     .map_err(|_| AppError::not_found("user not found"))?;
-    super::user_relations::replace_roles(&mut tx, user_id, &role_ids, &user.username, tenant_id)
+    super::user_relations::replace_roles(&mut tx, Some(&user), user_id, &role_ids, tenant_id)
         .await
         .map_err(|_| AppError::bad_request("role does not exist"))?;
     tx.commit()

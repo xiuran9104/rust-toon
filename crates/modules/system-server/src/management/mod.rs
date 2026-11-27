@@ -1,9 +1,10 @@
-mod compat;
+pub mod compat;
 mod compat_fields;
 mod data_scope;
 mod excel;
 mod messaging;
 mod notify;
+pub mod role_binding;
 mod shared;
 mod user_relations;
 
