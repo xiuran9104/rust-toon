@@ -7,8 +7,10 @@ import {
   SystemDataScopeEnum,
 } from '@vben/constants';
 import { getDictOptions } from '@vben/hooks';
+import { handleTree } from '@vben/utils';
 
 import { z } from '#/adapter/form';
+import { getDeptList } from '#/api/system/dept';
 import { getRangePickerDefaultProps } from '#/utils';
 
 /** 新增/修改的表单 */
@@ -39,6 +41,26 @@ export function useFormSchema(): VbenFormSchema[] {
         placeholder: '请输入角色标识',
       },
       rules: 'required',
+    },
+    {
+      fieldName: 'deptId',
+      label: '归属级别',
+      component: 'ApiTreeSelect',
+      componentProps: {
+        api: async () => {
+          const data = await getDeptList();
+          // 公司级 = 虚拟租户根（id=0）：SaaS 下部门树可能为空或多顶级森林，
+          // 真实根节点表达不了「覆盖全租户」，统一用 0 表示公司级。
+          return [{ id: 0, name: '公司级（整个租户）' }, ...handleTree(data)];
+        },
+        labelField: 'name',
+        valueField: 'id',
+        childrenField: 'children',
+        placeholder: '请选择归属级别',
+        treeDefaultExpandAll: true,
+      },
+      rules: 'required',
+      help: '公司级：可分配给租户内任何用户，但仅公司级管理员可发放。挂载到某部门：只能分配给该部门及其子树内的用户，且仅该子树内的管理员可发放。数据权限仍由「权限范围」独立控制。',
     },
     {
       fieldName: 'sort',
@@ -229,6 +251,12 @@ export function useGridColumns(): VxeTableGridOptions['columns'] {
       field: 'code',
       title: '角色标识',
       minWidth: 200,
+    },
+    {
+      field: 'deptName',
+      title: '归属级别',
+      minWidth: 140,
+      formatter: ({ cellValue }) => (cellValue ? cellValue : '公司级'),
     },
     {
       field: 'sort',

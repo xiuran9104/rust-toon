@@ -13,6 +13,9 @@ export namespace SystemRoleApi {
     type: number;
     dataScope: number;
     dataScopeDeptIds: number[];
+    /** 挂载部门：0/未填 = 公司级（整个租户） */
+    deptId?: number;
+    deptName?: string;
     createTime?: Date;
   }
 }
@@ -26,8 +29,12 @@ export function getRolePage(params: PageParam) {
 }
 
 /** 查询角色（精简)列表 */
-export function getSimpleRoleList() {
-  return requestClient.get<SystemRoleApi.Role[]>('/system/role/simple-list');
+export function getSimpleRoleList(
+  params?: { assignableDeptId?: number; includeUserHeld?: number },
+) {
+  return requestClient.get<SystemRoleApi.Role[]>('/system/role/simple-list', {
+    params,
+  });
 }
 
 /** 查询角色详情 */

@@ -48,6 +48,8 @@ pub struct QueryParams {
     value: Option<String>,
     #[serde(default, rename = "dictType")]
     dict_type: Option<String>,
+    #[serde(default, rename = "deptId")]
+    dept_id: Option<i64>,
 }
 
 pub fn routes() -> axum::Router<SystemState> {
@@ -2616,10 +2618,23 @@ async fn role_page(
     Query(params): Query<QueryParams>,
 ) -> Result<Json<ApiResponse<Page<Value>>>, AppError> {
     require(&user, "system:role:query")?;
-    Ok(Json(ApiResponse::new(paginate(
-        role_values(&state.pool, current_tenant_id(&user)?).await?,
-        params,
-    ))))
+    let tenant_id = current_tenant_id(&user)?;
+    let mut values = role_values(&state.pool, tenant_id).await?;
+    // 左树挂载部门过滤：公司级（dept_id=0）角色始终可见；挂载角色仅当
+    // 落在所选部门的子树内才展示（与角色挂载规则同源）。
+    if let Some(dept_id) = params.dept_id.filter(|id| *id > 0) {
+        let mut conn = state
+            .pool
+            .acquire()
+            .await
+            .map_err(|_| AppError::internal("failed to read roles"))?;
+        let subtree = super::role_binding::dept_subtree_ids(&mut conn, dept_id, tenant_id).await?;
+        values.retain(|value| match value["deptId"].as_i64() {
+            Some(0) | None => true,
+            Some(mount) => subtree.contains(&mount),
+        });
+    }
+    Ok(Json(ApiResponse::new(paginate(values, params))))
 }
 
 async fn role_list(
@@ -2811,20 +2826,24 @@ async fn role_delete_list(
 async fn role_values(pool: &PgPool, tenant_id: i64) -> Result<Vec<Value>, AppError> {
     sqlx::query_scalar::<_, Value>(
         "SELECT jsonb_build_object(
-            'id', id,
-            'name', name,
-            'code', code,
-            'sort', sort,
-            'status', status,
-            'type', type,
-            'remark', remark,
-            'dataScope', data_scope,
-            'dataScopeDeptIds', COALESCE(NULLIF(data_scope_dept_ids, ''), '[]')::jsonb,
-            'createTime', create_time
+            'id', system_role.id,
+            'name', system_role.name,
+            'code', system_role.code,
+            'sort', system_role.sort,
+            'status', system_role.status,
+            'type', system_role.type,
+            'remark', system_role.remark,
+            'dataScope', system_role.data_scope,
+            'dataScopeDeptIds', COALESCE(NULLIF(system_role.data_scope_dept_ids, ''), '[]')::jsonb,
+            'deptId', system_role.dept_id,
+            'deptName', COALESCE(dept.name, ''),
+            'createTime', system_role.create_time
          )
          FROM system_role
-         WHERE deleted = 0 AND tenant_id = $1
-         ORDER BY type, sort, id",
+         LEFT JOIN system_dept dept
+           ON dept.id = system_role.dept_id AND dept.deleted = 0
+         WHERE system_role.deleted = 0 AND system_role.tenant_id = $1
+         ORDER BY system_role.type, system_role.sort, system_role.id",
     )
     .bind(tenant_id)
     .fetch_all(pool)

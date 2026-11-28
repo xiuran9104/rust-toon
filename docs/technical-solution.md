@@ -115,6 +115,15 @@ gateway 全局挂 `authenticate_from_database`（`system-server/src/database_aut
 
 - `system_role.dept_id`：0 = 公司级角色（虚拟租户根，可分配给租户内任何用户，仅公司级管理员可发放），非 0 = 挂载到部门树节点。分配前双侧校验（`management/role_binding.rs`）：规则一——角色只能分配给「挂载节点子树内」的用户；规则二——非公司级管理员（super_admin / 任一角色 data_scope=1 之外）只能发放「挂载节点落在自己部门子树内」的角色，发放权不逆向流。校验点覆盖用户创建/更新（`replace_roles`）、调动部门（`ensure_roles_cover_dept`）、角色改挂载点（`ensure_holders_within_mount`）、角色下拉过滤（`assignable_role_ids` + `assignableDeptId`/`includeUserHeld` 参数）。数据权限（data_scope 1-5）语义不变。
 - 租户创建为专用事务链路（`tenant_create`）：租户行 + 根部门（以租户名命名）+ tenant_admin 角色（data_scope=1）+ 套餐菜单发放（package_id=0 跳过）+ 管理员账号（payload 可选 `username`/`password`，默认 `Admin#123456`）。tenant_admin 的菜单在 `authorized_menus` 中直接由 `package.menu_ids` 推导（单一数据源，套餐调整即时生效）；0032 对存量租户补根部门/管理员部门绑定/role_menu 增量。救援通道：`system:tenant:update-password`（菜单 1273）+ `/system/tenant/reset-admin-password`；引导管理员（tenant_admin 最早持有人）禁止删除。
+- 前端角色页与挂载规则同源：新建/编辑表单带「归属级别」`ApiTreeSelect`（虚拟根「公司级（整个租户）」id=0 + 真实部门树），列表带「归属级别」列（`deptName`，空渲染「公司级」），左侧 `DeptTreeSelect` 按挂载部门子树过滤（`/system/role/page?deptId=`，公司级角色始终可见）。
+
+**国密 identity 集成**（自 rustset 同步，0033 + `crates/framework/gm`）：
+
+- 身份：`system_users.identity_uuid`（SM3(`"rust-toon-user:" || id`) 派生，唯一索引）。API 层的用户 id 全部是该 UUID：JWT `sub`、`CurrentUser.user_id`、缓存键、token/审计/菜单/数据范围/通知等 SQL 的 join 键——迁移前以 `md5('yudao-user:'||id)` 现算的表达式全部切换为读列。基线 admin 由 0033 写入字面量；运行期用户由三条创建路径（用户创建/租户管理员/Excel 导入）直接写入，另有网关启动兜底回填（`bootstrap::ensure_identity_uuids`）。
+- 业务表 uuid 重映射：与 rustset 不同，本仓库六张业务表把 API uuid 存成了数据（`media.assets.owner_user_id`、`toon.projects.owner_user_id`、`toonflow.projects.user_id` 为 uuid；`ai.chat_roles`/`ai.chat_conversations`/`ai.images.user_id` 为 text）。启动时 `bootstrap::remap_business_user_uuids` 把 md5 时代的存量行跟随属主迁到 SM3 identity（幂等）。
+- 密码：PBKDF2-HMAC-SM3（`$sm3$16384$salt$digest`，`framework/security/password.rs` 委托 gm crate），**无旧格式回退**——bcrypt/Argon2 存量哈希验证失败，需重置密码；0033 将基线 admin 的 bcrypt 字面量替换为 SM3（明文 admin123 不变）。
+- JWT：自实现 HMAC-SM3 JWS（header 固定 `{"alg":"HMAC-SM3","typ":"JWT"}`，常量时间签名比较，jsonwebtoken 依赖移除）。切换后存量登录态全部失效（重新登录即可）。
+- 落库密封：`framework/security/secret.rs` 的 `seal_secret` 改用 SM4-CBC（`enc:sm4:v2:`，密钥仍取 `SECRET_ENCRYPTION_KEY`）；`enc:v1:`/`enc:v2:` 旧密文原样保留——全仓从不解密密封值（读取一律打码），故无需迁移。gm crate 同时提供 `sm4_open`/`legacy_v1_open` 供未来显式迁移通道使用；rustset 的 v3 主密钥环/KMS/SDF 层未同步。
 
 ### 5.2 infra（`crates/modules/infra-server`）
 

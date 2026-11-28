@@ -1,5 +1,6 @@
 <script lang="ts" setup>
 import type { VxeTableGridOptions } from '#/adapter/vxe-table';
+import type { SystemDeptApi } from '#/api/system/dept';
 import type { SystemRoleApi } from '#/api/system/role';
 
 import { ref } from 'vue';
@@ -7,7 +8,7 @@ import { ref } from 'vue';
 import { confirm, DocAlert, Page, useVbenModal } from '@vben/common-ui';
 import { downloadFileFromBlobPart, isEmpty } from '@vben/utils';
 
-import { message } from 'ant-design-vue';
+import { Card, message } from 'ant-design-vue';
 
 import { ACTION_ICON, TableAction, useVbenVxeGrid } from '#/adapter/vxe-table';
 import {
@@ -17,6 +18,7 @@ import {
   getRolePage,
 } from '#/api/system/role';
 import { $t } from '#/locales';
+import { DeptTreeSelect } from '#/views/system/dept/components';
 
 import { useGridColumns, useGridFormSchema } from './data';
 import AssignDataPermissionForm from './modules/assign-data-permission-form.vue';
@@ -42,6 +44,13 @@ const [AssignMenuFormModel, assignMenuFormApi] = useVbenModal({
 /** 刷新表格 */
 function handleRefresh() {
   gridApi.query();
+}
+
+/** 选择部门（左侧树）：按挂载部门子树过滤角色 */
+const searchDeptId = ref<number | undefined>(undefined);
+async function handleDeptSelect(dept?: SystemDeptApi.Dept) {
+  searchDeptId.value = dept?.id;
+  handleRefresh();
 }
 
 /** 导出表格 */
@@ -126,6 +135,7 @@ const [Grid, gridApi] = useVbenVxeGrid({
             pageNo: page.currentPage,
             pageSize: page.pageSize,
             ...formValues,
+            deptId: searchDeptId.value,
           });
         },
       },
@@ -159,7 +169,15 @@ const [Grid, gridApi] = useVbenVxeGrid({
     <FormModal @success="handleRefresh" />
     <AssignDataPermissionFormModel @success="handleRefresh" />
     <AssignMenuFormModel @success="handleRefresh" />
-    <Grid table-title="角色列表">
+
+    <div class="flex h-full w-full">
+      <!-- 左侧部门树：按挂载部门过滤 -->
+      <Card class="mr-4 h-full w-1/6">
+        <DeptTreeSelect @select="handleDeptSelect" />
+      </Card>
+      <!-- 右侧角色列表 -->
+      <div class="w-5/6">
+        <Grid table-title="角色列表">
       <template #toolbar-tools>
         <TableAction
           :actions="[
@@ -228,5 +246,7 @@ const [Grid, gridApi] = useVbenVxeGrid({
         />
       </template>
     </Grid>
+      </div>
+    </div>
   </Page>
 </template>
