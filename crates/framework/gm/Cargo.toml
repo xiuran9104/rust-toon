@@ -1,0 +1,12 @@
+[package]
+name = "rust-toon-framework-gm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+base64.workspace = true
+hex.workspace = true
+libsm = "0.6"
+rand.workspace = true

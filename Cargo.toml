@@ -4,6 +4,7 @@ members = [
     "crates/framework/common",
     "crates/framework/dynamic-config",
     "crates/framework/database",
+    "crates/framework/gm",
     "crates/framework/jobs",
     "crates/framework/mq",
     "crates/framework/redis",
@@ -37,14 +38,12 @@ repository = "https://example.com/rust-toon"
 anyhow = "1.0"
 async-nats = { version = "0.50", default-features = false, features = ["jetstream", "nkeys", "ring", "server_2_10"] }
 async-trait = "0.1"
-argon2 = "0.5"
 base64 = "0.22"
-bcrypt = "0.17"
 axum = { version = "0.8", features = ["multipart"] }
 calamine = "0.38"
 chrono = { version = "0.4", features = ["serde"] }
 croner = "3.0.1"
-jsonwebtoken = "9.3"
+libsm = "0.6"
 nacos-sdk = { version = "0.8.1", default-features = false, features = ["auth-by-http", "config"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 futures-util = "0.3"
@@ -54,14 +53,14 @@ opentelemetry = { version = "0.32", default-features = false, features = ["trace
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "grpc-tonic", "tls-webpki-roots"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] }
 prometheus-client = "0.25"
-rand_core = { version = "0.6", features = ["getrandom"] }
-ring = "0.17"
+rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 redis = { version = "0.32", default-features = false, features = ["aio", "tokio-comp"] }
 rust_xlsxwriter = "0.96"
 rust-toon-framework-common = { path = "crates/framework/common" }
 rust-toon-framework-dynamic-config = { path = "crates/framework/dynamic-config" }
 rust-toon-framework-database = { path = "crates/framework/database" }
+rust-toon-framework-gm = { path = "crates/framework/gm" }
 rust-toon-framework-jobs = { path = "crates/framework/jobs" }
 rust-toon-framework-mq = { path = "crates/framework/mq" }
 rust-toon-framework-redis = { path = "crates/framework/redis" }

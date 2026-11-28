@@ -1,14 +1,8 @@
-use std::env;
+use std::{env, fmt};
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
-use ring::{
-    aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey},
-    digest::{SHA256, digest},
-    rand::{SecureRandom, SystemRandom},
+use rust_toon_framework_gm::{
+    LEGACY_AES_SEALED_PREFIX, LEGACY_SEALED_PREFIX, SM4_SEALED_PREFIX, sm4_seal,
 };
-
-const PREFIX: &str = "enc:v2:";
-const NONCE_LEN: usize = 12;
 
 #[derive(Debug)]
 pub enum SecretSealError {
@@ -16,8 +10,8 @@ pub enum SecretSealError {
     Encryption,
 }
 
-impl std::fmt::Display for SecretSealError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for SecretSealError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingKey => formatter.write_str("SECRET_ENCRYPTION_KEY is required"),
             Self::Encryption => formatter.write_str("failed to encrypt secret"),
@@ -27,35 +21,24 @@ impl std::fmt::Display for SecretSealError {
 
 impl std::error::Error for SecretSealError {}
 
-/// Encrypts a database secret with AES-256-GCM. Existing envelopes are kept
-/// intact so released `enc:v1` rows remain readable during rolling upgrades;
-/// saving the plaintext again upgrades the row to `enc:v2`.
+/// Encrypts a database secret with SM4-CBC (国密). Existing envelopes are kept
+/// intact so released `enc:v1:`/`enc:v2:` rows remain untouched during rolling
+/// upgrades; saving the plaintext again upgrades the row to `enc:sm4:v2:`.
+/// Sealed values are never decrypted anywhere in the codebase (reads mask
+/// them), so no open path lives here.
 pub fn seal_secret(value: &str) -> Result<String, SecretSealError> {
-    if value.is_empty() || value.starts_with("enc:v1:") || value.starts_with(PREFIX) {
+    if value.is_empty()
+        || value.starts_with(LEGACY_SEALED_PREFIX)
+        || value.starts_with(LEGACY_AES_SEALED_PREFIX)
+        || value.starts_with(SM4_SEALED_PREFIX)
+    {
         return Ok(value.to_owned());
     }
     let source_key = env::var("SECRET_ENCRYPTION_KEY")
         .ok()
         .filter(|key| key.len() >= 32)
         .ok_or(SecretSealError::MissingKey)?;
-    // ring::digest 接收具体的 &[u8]，String 必须显式转字节切片；
-    // needless_as_bytes 在这里是误报。
-    #[allow(clippy::needless_as_bytes)]
-    let key_material = digest(&SHA256, source_key.as_bytes());
-    let key = UnboundKey::new(&AES_256_GCM, key_material.as_ref())
-        .map_err(|_| SecretSealError::Encryption)?;
-    let key = LessSafeKey::new(key);
-    let mut nonce_bytes = [0_u8; NONCE_LEN];
-    SystemRandom::new()
-        .fill(&mut nonce_bytes)
-        .map_err(|_| SecretSealError::Encryption)?;
-    let nonce = Nonce::assume_unique_for_key(nonce_bytes);
-    let mut ciphertext = value.as_bytes().to_vec();
-    key.seal_in_place_append_tag(nonce, Aad::from(PREFIX.as_bytes()), &mut ciphertext)
-        .map_err(|_| SecretSealError::Encryption)?;
-    let mut envelope = nonce_bytes.to_vec();
-    envelope.extend_from_slice(&ciphertext);
-    Ok(format!("{PREFIX}{}", STANDARD.encode(envelope)))
+    sm4_seal(value, &source_key).map_err(|_| SecretSealError::Encryption)
 }
 
 #[cfg(test)]
@@ -66,5 +49,20 @@ mod tests {
     fn preserves_existing_envelopes_without_needing_a_key() {
         assert_eq!(seal_secret("enc:v1:legacy").unwrap(), "enc:v1:legacy");
         assert_eq!(seal_secret("enc:v2:current").unwrap(), "enc:v2:current");
+        assert_eq!(
+            seal_secret("enc:sm4:v2:sealed").unwrap(),
+            "enc:sm4:v2:sealed"
+        );
+    }
+
+    #[test]
+    fn requires_the_encryption_key_for_plaintext() {
+        // The key is read from the environment; in its absence sealing fails
+        // closed instead of writing plaintext. The SM4 seal/open roundtrip is
+        // covered by the gm crate's own tests.
+        assert!(matches!(
+            seal_secret("plain-value").unwrap_err(),
+            SecretSealError::MissingKey
+        ));
     }
 }
