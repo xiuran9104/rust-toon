@@ -12,6 +12,7 @@ calamine.workspace = true
 chrono.workspace = true
 rust-toon-framework-common.workspace = true
 rust-toon-framework-database.workspace = true
+rust-toon-framework-gm.workspace = true
 rust-toon-framework-redis.workspace = true
 rust-toon-framework-security.workspace = true
 rust-toon-framework-web.workspace = true

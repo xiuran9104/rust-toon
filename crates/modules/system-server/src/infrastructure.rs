@@ -5,6 +5,16 @@ use rust_toon_framework_security::{CurrentUser, DataScope, Permission, Permissio
 use sqlx::FromRow;
 use uuid::Uuid;
 
+/// SM3-derived identity UUID for a numeric user id (国密 replacement for the
+/// retired md5 mapping). Stored in `system_users.identity_uuid`; all API
+/// surfaces present this UUID as the user id.
+pub fn identity_uuid_for(user_id: i64) -> Uuid {
+    Uuid::from_bytes(rust_toon_framework_gm::sm3_uuid_bytes(&format!(
+        "{}{user_id}",
+        rust_toon_framework_gm::IDENTITY_DOMAIN
+    )))
+}
+
 #[derive(Debug, FromRow)]
 pub struct UserAccount {
     pub id: Uuid,
@@ -21,7 +31,7 @@ pub async fn find_account_by_username(
     tenant_id: Option<i64>,
 ) -> anyhow::Result<Option<UserAccount>> {
     sqlx::query_as::<_, UserAccount>(
-        "SELECT md5('yudao-user:' || source.id::text)::uuid AS id,
+        "SELECT source.identity_uuid AS id,
                 source.username, source.password AS password_hash,
                 source.tenant_id::text AS tenant_id,
                 CASE source.status WHEN 0 THEN 'active' ELSE 'disabled' END AS status,
@@ -53,13 +63,13 @@ pub async fn find_account_by_id(
     user_id: Uuid,
 ) -> anyhow::Result<Option<UserAccount>> {
     sqlx::query_as::<_, UserAccount>(
-        "SELECT md5('yudao-user:' || source.id::text)::uuid AS id,
+        "SELECT source.identity_uuid AS id,
                 source.username, source.password AS password_hash,
                 source.tenant_id::text AS tenant_id,
                 CASE source.status WHEN 0 THEN 'active' ELSE 'disabled' END AS status,
                 source.locked_until
          FROM system_users source
-         WHERE md5('yudao-user:' || source.id::text)::uuid = $1
+         WHERE source.identity_uuid = $1
            AND source.deleted = 0
          ORDER BY source.id
          LIMIT 1",
@@ -102,7 +112,7 @@ pub async fn record_failed_login(
                  ELSE NULL
              END,
              update_time = now()
-         WHERE md5('yudao-user:' || source.id::text)::uuid = $1
+         WHERE source.identity_uuid = $1
            AND source.deleted = 0
            AND (source.locked_until IS NULL OR source.locked_until <= now())",
     )
@@ -122,7 +132,7 @@ pub async fn record_successful_login(pool: &PgPool, user_id: Uuid) -> anyhow::Re
              failed_login_attempts = 0,
              locked_until = NULL,
              update_time = now()
-         WHERE md5('yudao-user:' || source.id::text)::uuid = $1
+         WHERE source.identity_uuid = $1
            AND source.deleted = 0
            AND (source.locked_until IS NULL OR source.locked_until <= now())",
     )
@@ -173,7 +183,7 @@ pub async fn load_current_user(
                      WHERE allowed.menu_id::bigint = m.id
                  )
              )
-         WHERE md5('yudao-user:' || u.id::text)::uuid = $1
+         WHERE u.identity_uuid = $1
            AND u.deleted = 0 AND u.status = 0
          ORDER BY r.code, m.permission",
     )
@@ -241,7 +251,7 @@ mod tests {
     use sqlx::postgres::PgPoolOptions;
     use uuid::Uuid;
 
-    use super::{record_failed_login, record_successful_login, widest_scope};
+    use super::{identity_uuid_for, record_failed_login, record_successful_login, widest_scope};
 
     #[test]
     fn combines_multiple_roles_using_the_widest_data_scope() {
@@ -271,21 +281,23 @@ mod tests {
             .connect(&url)
             .await
             .expect("connect lockout test database");
-        let user_id: Uuid = sqlx::query_scalar(
-            "SELECT md5('yudao-user:' || id::text)::uuid
+        // Baseline admin (id=1): the migration 0033 literal must match the
+        // Rust derivation.
+        let user_id = identity_uuid_for(1);
+        let stored: Option<Uuid> = sqlx::query_scalar(
+            "SELECT identity_uuid
              FROM system_users
-             WHERE deleted = 0
-             ORDER BY id
-             LIMIT 1",
+             WHERE id = 1 AND deleted = 0",
         )
         .fetch_one(&pool)
         .await
         .expect("baseline user");
+        assert_eq!(stored, Some(user_id), "admin identity literal drifted");
 
         sqlx::query(
             "UPDATE system_users
              SET failed_login_attempts = 0, locked_until = NULL
-             WHERE md5('yudao-user:' || id::text)::uuid = $1",
+             WHERE identity_uuid = $1",
         )
         .bind(user_id)
         .execute(&pool)
@@ -306,7 +318,7 @@ mod tests {
         let (attempts, locked_until): (i32, Option<DateTime<Utc>>) = sqlx::query_as(
             "SELECT failed_login_attempts, locked_until
              FROM system_users
-             WHERE md5('yudao-user:' || id::text)::uuid = $1",
+             WHERE identity_uuid = $1",
         )
         .bind(user_id)
         .fetch_one(&pool)
@@ -324,7 +336,7 @@ mod tests {
         let unchanged: (i32, Option<DateTime<Utc>>) = sqlx::query_as(
             "SELECT failed_login_attempts, locked_until
              FROM system_users
-             WHERE md5('yudao-user:' || id::text)::uuid = $1",
+             WHERE identity_uuid = $1",
         )
         .bind(user_id)
         .fetch_one(&pool)
@@ -342,7 +354,7 @@ mod tests {
         sqlx::query(
             "UPDATE system_users
              SET locked_until = now() - interval '1 second'
-             WHERE md5('yudao-user:' || id::text)::uuid = $1",
+             WHERE identity_uuid = $1",
         )
         .bind(user_id)
         .execute(&pool)
@@ -354,7 +366,7 @@ mod tests {
         let fresh_window: (i32, Option<DateTime<Utc>>) = sqlx::query_as(
             "SELECT failed_login_attempts, locked_until
              FROM system_users
-             WHERE md5('yudao-user:' || id::text)::uuid = $1",
+             WHERE identity_uuid = $1",
         )
         .bind(user_id)
         .fetch_one(&pool)
@@ -370,7 +382,7 @@ mod tests {
         let reset: (i32, Option<DateTime<Utc>>) = sqlx::query_as(
             "SELECT failed_login_attempts, locked_until
              FROM system_users
-             WHERE md5('yudao-user:' || id::text)::uuid = $1",
+             WHERE identity_uuid = $1",
         )
         .bind(user_id)
         .fetch_one(&pool)

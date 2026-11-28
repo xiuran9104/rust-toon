@@ -50,7 +50,7 @@ pub async fn record(
          VALUES (
              nextval('system_operate_log_seq'), $1,
              COALESCE((SELECT id FROM system_users
-                       WHERE md5('yudao-user:' || id::text)::uuid = $2 AND deleted = 0), 0),
+                       WHERE identity_uuid = $2 AND deleted = 0), 0),
              2, $3, $4, $5, $6, true, '', '', '', '', '', COALESCE($7, 'system'),
              now(), COALESCE($7, 'system'), now(), 0, COALESCE($8, 0)
          )",
@@ -87,7 +87,7 @@ pub async fn record_login(
                 now(), 0, COALESCE(users.tenant_id, 0)
          FROM (SELECT 1) seed
          LEFT JOIN system_users users
-           ON md5('yudao-user:' || users.id::text)::uuid = $5 AND users.deleted = 0",
+           ON users.identity_uuid = $5 AND users.deleted = 0",
     )
     .bind(log_type)
     .bind(Uuid::new_v4().to_string())

@@ -33,6 +33,7 @@ cargo test -p rust-toon-toon-server \
   toonflow_scene_transitions::tests::existing_transaction_entry_applies_and_rolls_back_track_defaults \
   -- --ignored --nocapture
 cargo test -p rust-toon-system-server login_lockout_database_tests -- --ignored --nocapture
+cargo test -p rust-toon-system-server identity_uuid_database_tests -- --ignored --nocapture
 cargo test -p rust-toon-toon-server gateway_repair_database_tests -- --ignored --nocapture
 cargo test -p rust-toon-toon-server task_pagination_tests -- --ignored --nocapture
 cargo test -p rust-toon-toon-server agent_memory_database_tests -- --ignored --nocapture

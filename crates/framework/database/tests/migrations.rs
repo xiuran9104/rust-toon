@@ -1,5 +1,6 @@
 use rust_toon_framework_database::{DatabaseConfig, connect, migrate};
 use sqlx::Row;
+use uuid::Uuid;
 
 async fn scene_state_revisions(pool: &sqlx::PgPool, ids: [i64; 4]) -> [i32; 4] {
     let revisions: (i32, i32, i32, i32) = sqlx::query_as(
@@ -32,7 +33,7 @@ async fn applies_all_migrations_to_empty_postgres() {
         .fetch_one(&pool)
         .await
         .expect("read migration history");
-    assert_eq!(applied, 32);
+    assert_eq!(applied, 33);
 
     sqlx::raw_sql(include_str!(
         "../../../../sql/postgresql/0022_video_export_timeline.sql"
@@ -1660,6 +1661,24 @@ async fn applies_all_migrations_to_empty_postgres() {
     .await
     .expect("inspect login lockout constraint");
     assert!(lockout_constraint);
+
+    // 0033 国密身份：admin 携带 SM3 派生的 identity_uuid 字面量，且基线密码
+    // 已换 $sm3$（明文 admin123，仅当基线 bcrypt 字面量未被改动时替换）。
+    let (admin_identity, admin_password): (Option<Uuid>, String) = sqlx::query_as(
+        "SELECT identity_uuid, password FROM system_users WHERE id = 1 AND deleted = 0",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect seeded admin identity");
+    assert_eq!(
+        admin_identity,
+        Some(Uuid::parse_str("178d1f4e-ea86-414e-8a65-bbbf89ed94c0").unwrap()),
+        "admin identity_uuid literal drifted from the SM3 derivation",
+    );
+    assert!(
+        admin_password.starts_with("$sm3$16384$"),
+        "seeded admin password should be a PBKDF2-HMAC-SM3 hash"
+    );
 
     let task_id_default: Option<String> = sqlx::query_scalar(
         "SELECT column_default

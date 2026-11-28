@@ -87,13 +87,13 @@ pub async fn record(
     tokio::spawn(async move {
         // CurrentUser uses the stable UUID identity; logs use system_users.id.
         let user_id: Option<i64> = match authenticated_id {
-            Some(id) => sqlx::query_scalar(
-                "SELECT id FROM system_users WHERE md5('yudao-user:' || id::text)::uuid::text=$1",
-            )
-            .bind(id)
-            .fetch_optional(&pool)
-            .await
-            .unwrap_or(None),
+            Some(id) => {
+                sqlx::query_scalar("SELECT id FROM system_users WHERE identity_uuid::text = $1")
+                    .bind(id)
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap_or(None)
+            }
             None => None,
         };
         let user_type: Option<i16> = user_id.map(|_| 2);

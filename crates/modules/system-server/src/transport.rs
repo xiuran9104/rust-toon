@@ -268,7 +268,7 @@ async fn authorized_menus(
                      )
                  )
              )
-         WHERE md5('yudao-user:' || u.id::text)::uuid = $1::uuid
+         WHERE u.identity_uuid = $1::uuid
            AND u.deleted = 0 AND u.status = 0
          ORDER BY m.id",
     )
@@ -287,7 +287,7 @@ async fn permission_info(
                     'id', id, 'nickname', nickname, 'avatar', avatar,
                     'deptId', dept_id, 'username', username, 'email', email)
          FROM system_users
-         WHERE md5('yudao-user:' || id::text)::uuid = $1::uuid AND deleted = 0
+         WHERE identity_uuid = $1::uuid AND deleted = 0
          ORDER BY id
          LIMIT 1",
     )

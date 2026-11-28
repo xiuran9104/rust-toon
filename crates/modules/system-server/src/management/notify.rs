@@ -278,7 +278,7 @@ async fn yudao_user_id(pool: &PgPool, user: &CurrentUser) -> Result<i64, AppErro
         Uuid::parse_str(&user.user_id).map_err(|_| AppError::bad_request("invalid user id"))?;
     sqlx::query_scalar::<_, i64>(
         "SELECT id FROM system_users
-         WHERE md5('yudao-user:' || id::text)::uuid = $1 AND deleted = 0",
+         WHERE identity_uuid = $1 AND deleted = 0",
     )
     .bind(user_uuid)
     .fetch_one(pool)

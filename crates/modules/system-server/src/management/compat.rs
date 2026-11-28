@@ -940,12 +940,8 @@ fn current_tenant_id(user: &CurrentUser) -> Result<i64, AppError> {
         .ok_or_else(|| AppError::forbidden("tenant is required"))
 }
 
-async fn uuid_for_yudao_user_id(pool: &PgPool, user_id: i64) -> Result<Uuid, AppError> {
-    sqlx::query_scalar("SELECT md5('yudao-user:' || $1::text)::uuid")
-        .bind(user_id)
-        .fetch_one(pool)
-        .await
-        .map_err(|_| AppError::internal("failed to resolve user cache key"))
+fn uuid_for_yudao_user_id(user_id: i64) -> Uuid {
+    crate::infrastructure::identity_uuid_for(user_id)
 }
 
 async fn generic_page(
@@ -1737,6 +1733,12 @@ async fn tenant_create(
         .fetch_one(&mut *transaction)
         .await
         .map_err(|_| AppError::bad_request("管理员账号已存在"))?;
+        sqlx::query("UPDATE system_users SET identity_uuid = $2 WHERE id = $1")
+            .bind(admin_user_id)
+            .bind(crate::infrastructure::identity_uuid_for(admin_user_id))
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| AppError::bad_request("管理员账号已存在"))?;
         sqlx::query(
             "INSERT INTO system_user_role
              (id, user_id, role_id, creator, create_time, updater, update_time, deleted, tenant_id)
@@ -2316,6 +2318,12 @@ async fn user_create(
     .fetch_one(&mut *transaction)
     .await
     .map_err(|_| AppError::internal("failed to create user"))?;
+    sqlx::query("UPDATE system_users SET identity_uuid = $2 WHERE id = $1")
+        .bind(id)
+        .bind(crate::infrastructure::identity_uuid_for(id))
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| AppError::internal("failed to create user"))?;
     super::user_relations::replace_posts(
         &mut transaction,
         id,
@@ -2872,9 +2880,7 @@ async fn permission_assign_user_roles(
     tx.commit()
         .await
         .map_err(|_| AppError::internal("failed to assign roles"))?;
-    if let Ok(cache_user_id) = uuid_for_yudao_user_id(&state.pool, user_id).await {
-        crate::cache::invalidate_current_user(&state, cache_user_id).await;
-    }
+    crate::cache::invalidate_current_user(&state, uuid_for_yudao_user_id(user_id)).await;
     Ok(Json(ApiResponse::new(())))
 }
 

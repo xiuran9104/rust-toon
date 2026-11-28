@@ -109,7 +109,7 @@ async fn validate_session(
              JOIN system_users users ON users.id = access.user_id
              WHERE md5(access.access_token) = md5($1)
                AND access.access_token = $1
-               AND md5('yudao-user:' || access.user_id::text)::uuid = $2
+               AND users.identity_uuid = $2
                AND access.deleted = 0
                AND access.expires_time > now()
                AND users.deleted = 0

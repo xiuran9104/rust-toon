@@ -15,7 +15,7 @@ pub async fn visible_user_values(
         "WITH RECURSIVE actor AS (
              SELECT id, dept_id
              FROM system_users
-             WHERE md5('yudao-user:' || id::text)::uuid = $2
+             WHERE identity_uuid = $2
                AND deleted = 0
                AND tenant_id = $1
          ),

@@ -36,7 +36,7 @@ pub async fn create_token_pair(
     let account = sqlx::query_as::<_, (i64, String, i64)>(
         "SELECT id, username, tenant_id
          FROM system_users
-         WHERE md5('yudao-user:' || id::text)::uuid = $1
+         WHERE identity_uuid = $1
            AND deleted = 0",
     )
     .bind(user_id)
@@ -91,7 +91,7 @@ pub async fn create_token_pair(
 
 pub async fn verify_refresh_token(pool: &PgPool, token: &str) -> Result<Uuid, TokenError> {
     sqlx::query_as::<_, RefreshTokenRow>(
-        "SELECT md5('yudao-user:' || token.user_id::text)::uuid AS user_id
+        "SELECT users.identity_uuid AS user_id
          FROM system_oauth2_refresh_token token
          JOIN system_users users ON users.id = token.user_id
          WHERE token.refresh_token = $1

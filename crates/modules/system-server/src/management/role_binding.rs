@@ -24,7 +24,7 @@ pub fn is_company_level(user: &CurrentUser) -> bool {
 }
 
 /// 节点子树 id 集合（含自身）：向下。
-async fn dept_subtree_ids(
+pub(crate) async fn dept_subtree_ids(
     conn: &mut sqlx::PgConnection,
     dept_id: i64,
     tenant_id: i64,
@@ -77,8 +77,8 @@ async fn dept_self_or_ancestors(
 }
 
 /// 操作者（登录态）的归属部门。查不到（无部门/已删除）返回 None。
-/// CurrentUser.user_id 是 `md5('yudao-user:' || id)` 的 UUID 形式
-/// （与 authorized_menus 的映射一致）。
+/// CurrentUser.user_id 是 `system_users.identity_uuid` 的 UUID 形式
+/// （SM3 派生，与 authorized_menus 的映射一致）。
 async fn operator_dept_id(
     conn: &mut sqlx::PgConnection,
     operator: &CurrentUser,
@@ -88,7 +88,7 @@ async fn operator_dept_id(
         .map_err(|_| AppError::bad_request("invalid operator identity"))?;
     sqlx::query_scalar::<_, Option<i64>>(
         "SELECT dept_id FROM system_users
-         WHERE md5('yudao-user:' || id::text)::uuid = $1
+         WHERE identity_uuid = $1
            AND deleted = 0 AND tenant_id = $2",
     )
     .bind(identity_uuid)
@@ -406,15 +406,9 @@ mod role_mount_database_tests {
     }
 
     /// 操作者的 CurrentUser.user_id 必须是 system_users 行的
-    /// md5('yudao-user:'||id) —— 与 authorized_menus 的映射一致。
-    async fn operator_token(pool: &sqlx::PgPool, user_row: i64) -> String {
-        sqlx::query_scalar::<_, String>(
-            "SELECT md5('yudao-user:' || id::text)::text FROM system_users WHERE id = $1",
-        )
-        .bind(user_row)
-        .fetch_one(pool)
-        .await
-        .unwrap()
+    /// identity_uuid（SM3 派生）—— 与 authorized_menus 的映射一致。
+    fn operator_token(user_row: i64) -> String {
+        crate::infrastructure::identity_uuid_for(user_row).to_string()
     }
 
     impl Fixture {
@@ -510,14 +504,16 @@ mod role_mount_database_tests {
             (target_a1, dept_a1, "target_a1"),
             (target_b, dept_b, "target_b"),
         ] {
-            sqlx::query("INSERT INTO public.system_users(id,username,password,nickname,dept_id,status,tenant_id) VALUES($1,$2,'x',$2,$3,0,$4)")
-                .bind(id).bind(username).bind(dept).bind(tenant).execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO public.system_users(id,username,password,nickname,dept_id,status,tenant_id,identity_uuid) VALUES($1,$2,'x',$2,$3,0,$4,$5)")
+                .bind(id).bind(username).bind(dept).bind(tenant)
+                .bind(crate::infrastructure::identity_uuid_for(id))
+                .execute(&pool).await.unwrap();
         }
 
         Fixture {
             tenant,
-            company_operator: current_user(&operator_token(&pool, operator_all).await, true),
-            dept_operator: current_user(&operator_token(&pool, operator_a).await, false),
+            company_operator: current_user(&operator_token(operator_all), true),
+            dept_operator: current_user(&operator_token(operator_a), false),
             root_dept: root,
             dept_a,
             dept_b,
